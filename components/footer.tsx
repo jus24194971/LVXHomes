@@ -45,7 +45,7 @@ export function Footer() {
         <div className="flex flex-col gap-12 md:flex-row md:items-start md:justify-between">
           {/* Brand + tagline */}
           <div className="max-w-sm">
-            <Logo href="/" className="text-3xl text-paper" />
+            <Logo href="/" className="text-3xl text-champagne" />
             <p className="mt-5 font-serif text-xl italic leading-snug text-paper/80">
               {TAGLINES.becomesCinema}
             </p>

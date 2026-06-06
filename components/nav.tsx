@@ -70,7 +70,7 @@ export function Nav() {
           <Logo
             className={cn(
               "text-xl transition-colors duration-500 sm:text-2xl",
-              onDark ? "text-paper" : "text-ink",
+              onDark ? "text-champagne" : "text-ink",
             )}
           />
 
@@ -136,7 +136,7 @@ export function Nav() {
         )}
       >
         <div className="flex h-16 items-center justify-between px-6">
-          <Logo className="text-xl text-paper" />
+          <Logo className="text-xl text-champagne" />
           <button
             type="button"
             onClick={() => setOpen(false)}
