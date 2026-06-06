@@ -1,17 +1,22 @@
 import { ImageResponse } from "next/og";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { CINZEL_600_WOFF_BASE64 } from "@/lib/cinzel-600";
 
-// Branded social card, rendered to a static PNG at build (no runtime needed).
-// The gold Cinzel wordmark reads as a carved inscription — architectural, not glossy.
+// Branded social card. The gold Cinzel wordmark reads as a carved inscription.
+// The font is base64-embedded and decoded in-memory (no fs), so this renders on
+// the Cloudflare Workers runtime as well as at build time.
 export const alt = "LVX Homes — Luxury Real Estate Aerial Cinematography";
 export const size = { width: 1200, height: 630 };
 export const contentType = "image/png";
 
-export default function OpengraphImage() {
-  // Read at build time (static generation) so the OG shows the real wordmark.
-  const cinzel = readFileSync(join(process.cwd(), "assets", "Cinzel-600.woff"));
+// atob + Uint8Array are available on both Node (build) and Workers (runtime).
+function fontData(base64: string): ArrayBuffer {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
 
+export default function OpengraphImage() {
   return new ImageResponse(
     (
       <div
@@ -73,7 +78,14 @@ export default function OpengraphImage() {
     ),
     {
       ...size,
-      fonts: [{ name: "Cinzel", data: cinzel, weight: 600, style: "normal" }],
+      fonts: [
+        {
+          name: "Cinzel",
+          data: fontData(CINZEL_600_WOFF_BASE64),
+          weight: 600,
+          style: "normal",
+        },
+      ],
     },
   );
 }
