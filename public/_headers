@@ -1,0 +1,4 @@
+# Cloudflare static-asset caching. Next fingerprints these files, so they're
+# safe to cache forever.
+/_next/static/*
+  Cache-Control: public, max-age=31536000, immutable
