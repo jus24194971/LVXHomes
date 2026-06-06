@@ -9,7 +9,7 @@ import { StreamHero, StreamPlayer } from "@/components/stream/player";
 import { FEATURED } from "@/data/projects";
 import { PACKAGES } from "@/data/packages";
 import { TESTIMONIALS } from "@/data/testimonials";
-import { HERO_STREAM_UID } from "@/lib/stream";
+import { HERO_STREAM_UID, streamConfigured } from "@/lib/stream";
 import { SITE, TAGLINES } from "@/data/site";
 import { JsonLd } from "@/components/seo/json-ld";
 
@@ -51,33 +51,51 @@ const localBusiness = {
 };
 
 export default function HomePage() {
+  const hasVideo = streamConfigured();
+
   return (
     <>
       <JsonLd data={localBusiness} />
-      {/* 1 — Hero reel */}
+
+      {/* 1 — Hero */}
       <section className="relative flex min-h-dvh items-center justify-center overflow-hidden bg-ink text-paper">
         <StreamHero uid={HERO_STREAM_UID} />
-        {/* legibility scrim */}
-        <div
-          aria-hidden
-          className="absolute inset-0"
-          style={{
-            background:
-              "linear-gradient(to bottom, rgba(33,28,22,0.45) 0%, rgba(33,28,22,0.25) 35%, rgba(33,28,22,0.65) 100%)",
-          }}
-        />
+        {/* Scrim only over the film; the no-video crest stays warm and open. */}
+        {hasVideo && (
+          <div
+            aria-hidden
+            className="absolute inset-0"
+            style={{
+              background:
+                "linear-gradient(to bottom, rgba(33,28,22,0.5) 0%, rgba(33,28,22,0.25) 40%, rgba(33,28,22,0.7) 100%)",
+            }}
+          />
+        )}
         <Container className="relative text-center">
-          <Eyebrow className="text-champagne">
-            Luxury Real Estate Cinematography · Arizona
-          </Eyebrow>
-          <h1 className="mx-auto mt-6 max-w-3xl font-display text-4xl font-normal leading-[1.1] tracking-[0.04em] sm:text-6xl">
+          {!hasVideo && (
+            <div className="mb-10 flex flex-col items-center">
+              <span
+                className="font-display text-5xl leading-none tracking-[0.18em] text-champagne sm:text-6xl"
+                style={{ paddingLeft: "0.18em" }}
+              >
+                LVX
+              </span>
+              <span aria-hidden className="mt-6 h-px w-20 bg-champagne/70" />
+              <Eyebrow className="mt-6 text-champagne/90">
+                Luxury Real Estate Cinematography · Arizona
+              </Eyebrow>
+            </div>
+          )}
+          <h1 className="mx-auto max-w-3xl font-display text-4xl font-normal leading-[1.1] tracking-[0.04em] text-paper sm:text-6xl">
             WIN THE LISTING
             <br />
             BEFORE YOU LIST IT
           </h1>
-          <p className="mx-auto mt-7 max-w-xl font-serif text-xl italic text-paper/85 sm:text-2xl">
-            {TAGLINES.becomesCinema}
-          </p>
+          {hasVideo && (
+            <p className="mx-auto mt-7 max-w-xl font-serif text-xl italic text-paper/85 sm:text-2xl">
+              {TAGLINES.becomesCinema}
+            </p>
+          )}
           <div className="mt-10 flex justify-center">
             <Button href="/contact" variant="light">
               Inquire

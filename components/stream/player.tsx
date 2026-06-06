@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
 
 // Used wherever a real video isn't configured yet — a warm, dark vignette.
 const PLACEHOLDER_BG =
-  "radial-gradient(120% 100% at 50% 0%, rgba(58,48,38,0.65), rgba(33,28,22,1) 75%)";
+  "radial-gradient(120% 90% at 50% 0%, #3a3026 0%, #211c16 70%)";
 
 /**
  * Full-bleed autoplay hero loop. Renders the placeholder vignette until Stream
