@@ -2,17 +2,17 @@
 
 import { Stream } from "@cloudflare/stream-react";
 import { useEffect, useRef, useState } from "react";
-import { streamConfigured, streamPoster } from "@/lib/stream";
+import { streamPoster, streamReady } from "@/lib/stream";
 import { cn } from "@/lib/utils";
 
-// Used wherever a real video isn't configured yet — a warm, dark vignette.
+// Used wherever a real video isn't set yet — a warm, dark vignette.
 const PLACEHOLDER_BG =
   "radial-gradient(120% 90% at 50% 0%, #3a3026 0%, #211c16 70%)";
 
 /**
- * Full-bleed autoplay hero loop. Renders the placeholder vignette until Stream
- * is configured, a static poster under prefers-reduced-motion, and the looping
- * reel otherwise. Meant to sit absolutely inside a positioned hero.
+ * Full-bleed autoplay hero loop. Renders the placeholder vignette until a real
+ * video UID is set, a static poster under prefers-reduced-motion, and the
+ * looping reel otherwise. Meant to sit absolutely inside a positioned hero.
  */
 export function StreamHero({
   uid,
@@ -33,7 +33,7 @@ export function StreamHero({
     return () => mq.removeEventListener("change", update);
   }, []);
 
-  if (!streamConfigured()) {
+  if (!streamReady(uid)) {
     return (
       <div
         aria-hidden
@@ -72,8 +72,7 @@ export function StreamHero({
 
 /**
  * Standard 16:9 player. Lazily mounts the heavy Stream embed only after a click
- * (poster-first), and only fetches the poster once near the viewport — keeping
- * pages with several films fast.
+ * (poster-first), and only fetches the poster once near the viewport.
  */
 export function StreamPlayer({
   uid,
@@ -89,7 +88,7 @@ export function StreamPlayer({
   const ref = useRef<HTMLDivElement>(null);
   const [near, setNear] = useState(false);
   const [play, setPlay] = useState(false);
-  const configured = streamConfigured();
+  const ready = streamReady(uid);
   const posterUrl = poster ?? streamPoster(uid);
 
   useEffect(() => {
@@ -113,16 +112,16 @@ export function StreamPlayer({
       ref={ref}
       className={cn("relative aspect-video overflow-hidden bg-ink", className)}
     >
-      {configured && play ? (
+      {ready && play ? (
         <Stream src={uid} controls autoplay poster={posterUrl} />
       ) : (
         <button
           type="button"
-          onClick={() => configured && setPlay(true)}
-          aria-label={configured ? `Play ${title ?? "film"}` : "Film coming soon"}
+          onClick={() => ready && setPlay(true)}
+          aria-label={ready ? `Play ${title ?? "film"}` : "Film coming soon"}
           className="group absolute inset-0 flex items-center justify-center"
         >
-          {configured && near ? (
+          {ready && near ? (
             // eslint-disable-next-line @next/next/no-img-element
             <img
               src={posterUrl}

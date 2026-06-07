@@ -9,7 +9,7 @@ import { StreamHero, StreamPlayer } from "@/components/stream/player";
 import { FEATURED } from "@/data/projects";
 import { PACKAGES } from "@/data/packages";
 import { TESTIMONIALS } from "@/data/testimonials";
-import { HERO_STREAM_UID, streamConfigured } from "@/lib/stream";
+import { HERO_STREAM_UID, streamReady } from "@/lib/stream";
 import { SITE, TAGLINES } from "@/data/site";
 import { JsonLd } from "@/components/seo/json-ld";
 
@@ -51,7 +51,7 @@ const localBusiness = {
 };
 
 export default function HomePage() {
-  const hasVideo = streamConfigured();
+  const hasVideo = streamReady(HERO_STREAM_UID);
 
   return (
     <>
@@ -170,22 +170,19 @@ export default function HomePage() {
             </Link>
           </Reveal>
 
-          <div className="mt-12 grid gap-8 md:grid-cols-2 lg:grid-cols-3">
+          <div className="mt-12 grid gap-8 sm:grid-cols-2">
             {FEATURED.map((p, i) => (
               <Reveal key={p.slug} delay={i * 90}>
                 <Link href={`/work/${p.slug}`} className="group block">
                   <StreamPlayer uid={p.streamUid} title={p.title} />
-                  <div className="mt-5 flex items-baseline justify-between gap-4">
-                    <h3 className="font-serif text-xl text-paper">
-                      {p.neighborhood}
-                    </h3>
-                    <span className="font-sans text-xs uppercase tracking-[0.16em] text-champagne">
-                      {p.priceTier}
-                    </span>
-                  </div>
-                  <p className="mt-1 font-sans text-sm text-paper/55">
-                    {p.address}
-                  </p>
+                  <h3 className="mt-5 font-serif text-xl text-paper">
+                    {p.title}
+                  </h3>
+                  {p.summary && (
+                    <p className="mt-1 font-sans text-sm text-paper/55">
+                      {p.summary}
+                    </p>
+                  )}
                 </Link>
               </Reveal>
             ))}
