@@ -5,7 +5,7 @@
  */
 export const CF_STREAM_CUSTOMER_CODE =
   process.env.NEXT_PUBLIC_CF_STREAM_CUSTOMER_CODE ||
-  "a61cc14bdbaa22ac7c9a5f73b3670446";
+  "n5hwfs53ea1n75e6";
 
 /** Sentinel for "no real video uploaded yet". */
 export const PLACEHOLDER_STREAM_UID = "TODO_STREAM_UID";
