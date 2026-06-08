@@ -70,16 +70,23 @@ No build variable needed.
 | Name | Kind | Value |
 |------|------|-------|
 | `RESEND_API_KEY` | **Secret** | from resend.com |
-| `CONTACT_TO_EMAIL` | Plaintext | where inquiries land (your Gmail) |
-| `CONTACT_FROM_EMAIL` | Plaintext (optional) | e.g. `LVX Homes <hello@lvxhomes.com>` once the domain is verified in Resend; defaults to `onboarding@resend.dev` |
+| `CONTACT_TO_EMAIL` | **Secret** | where inquiries land (your Gmail) — keep as a Secret, NOT plaintext (see gotcha 3) |
+| `CONTACT_FROM_EMAIL` | `wrangler.jsonc` `vars` | `LVX Homes <hello@lvxhomes.com>` — public, so it lives in config, not the dashboard |
 
-**Two gotchas — both handled in code, but know them:**
+**Three gotchas — all handled now, but know them:**
 1. **OpenNext does NOT expose these on `process.env` at runtime.** The contact
    route reads them via **`getCloudflareContext().env`** (`app/api/contact/route.ts`),
    with a `process.env` fallback for local dev. Read any new runtime secret the
    same way, or it'll read as `undefined` on the Worker.
 2. **Secrets bind at deploy time.** After adding/changing a dashboard secret,
    **redeploy** (push a commit) or the running Worker won't pick it up.
+3. **Plaintext dashboard vars get WIPED on every deploy.** The CI's
+   `wrangler deploy` resets the Worker's plain-text variables to match
+   `wrangler.jsonc`, so a plaintext var set only in the dashboard vanishes on the
+   next push. **Secrets survive** deploys; config `vars` survive (they're in the
+   file). So: private runtime values → **Secrets**; public config → `wrangler.jsonc`
+   `vars`. Never rely on a dashboard *plaintext* var. (This is why
+   `CONTACT_TO_EMAIL` is a Secret and `CONTACT_FROM_EMAIL` is in `wrangler.jsonc`.)
 
 ---
 
@@ -125,7 +132,7 @@ For local email testing, put `RESEND_API_KEY` / `CONTACT_TO_EMAIL` in `.dev.vars
 - [x] Contact form delivers (Resend + secrets via `getCloudflareContext`).
 - [x] Custom domains + SSL (`lvxhomes.com`, `www`, `lvxvip.com` → `/vip`).
 - [x] OG card (static gold PNG).
-- [ ] Verify `lvxhomes.com` in Resend → send from `hello@lvxhomes.com` + auto-reply to inquirers.
+- [x] Resend domain verified → form sends from `hello@lvxhomes.com`. (Optional next: auto-reply a confirmation to the inquirer.)
 - [ ] Replace TODO content: pricing, ≥1 real testimonial, headshot, social handles.
 - [ ] Real `uploadDate` per film in `app/work/[slug]/page.tsx` VideoObject schema.
 - [ ] Optional: a 45–75s hero showreel → set `HERO_STREAM_UID` in `lib/stream.ts`.
