@@ -10,11 +10,8 @@ export const CF_STREAM_CUSTOMER_CODE =
 /** Sentinel for "no real video uploaded yet". */
 export const PLACEHOLDER_STREAM_UID = "TODO_STREAM_UID";
 
-/**
- * Homepage hero reel. Still a placeholder — until a real 45–75s showreel UID is
- * set here, the hero shows the gold LVX title card instead of a video.
- */
-export const HERO_STREAM_UID = PLACEHOLDER_STREAM_UID;
+/** Homepage hero reel — a ~20s silent, looping golden-hour aerial. */
+export const HERO_STREAM_UID = "b6ecab9d00f4e8a6512fca5ebb95c91c";
 
 /** Whether the Stream account is configured (always true now it's baked in). */
 export const streamConfigured = (): boolean => Boolean(CF_STREAM_CUSTOMER_CODE);
