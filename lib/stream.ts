@@ -23,13 +23,23 @@ export const streamConfigured = (): boolean => Boolean(CF_STREAM_CUSTOMER_CODE);
 export const streamReady = (uid: string): boolean =>
   streamConfigured() && Boolean(uid) && uid !== PLACEHOLDER_STREAM_UID;
 
+/**
+ * Per-video poster timestamp overrides. Some clips open on a black/near-black
+ * frame, so the default thumbnail (t=0) is useless — pin a better moment.
+ */
+const POSTER_TIME: Record<string, string> = {
+  // San Tan Valley opens on a black frame; 4s lands on the hero aerial.
+  d0cde33269c8528f1a71ad128aa54310: "4s",
+};
+
 /** Poster/thumbnail URL for a Stream video. */
 export function streamPoster(
   uid: string,
   opts?: { time?: string; height?: number },
 ): string {
+  const time = opts?.time ?? POSTER_TIME[uid];
   const params = new URLSearchParams();
-  if (opts?.time) params.set("time", opts.time);
+  if (time) params.set("time", time);
   if (opts?.height) params.set("height", String(opts.height));
   const qs = params.toString();
   return `https://customer-${CF_STREAM_CUSTOMER_CODE}.cloudflarestream.com/${uid}/thumbnails/thumbnail.jpg${
