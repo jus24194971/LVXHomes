@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
 
 /**
  * Contact inquiry handler. Delivers via Resend's REST API over fetch (no SDK)
@@ -23,6 +24,35 @@ function rateLimited(ip: string): boolean {
 
 function isEmail(s: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+}
+
+type ContactEnv = {
+  RESEND_API_KEY?: string;
+  CONTACT_TO_EMAIL?: string;
+  CONTACT_FROM_EMAIL?: string;
+};
+
+/**
+ * Reads config from the Cloudflare Worker runtime env — where dashboard/CLI
+ * secrets live under OpenNext (they are NOT exposed on process.env at runtime).
+ * Falls back to process.env for local dev (.env / .dev.vars) and other runtimes.
+ */
+function readEnv(): ContactEnv {
+  const fallback: ContactEnv = {
+    RESEND_API_KEY: process.env.RESEND_API_KEY,
+    CONTACT_TO_EMAIL: process.env.CONTACT_TO_EMAIL,
+    CONTACT_FROM_EMAIL: process.env.CONTACT_FROM_EMAIL,
+  };
+  try {
+    const cf = getCloudflareContext().env as unknown as ContactEnv;
+    return {
+      RESEND_API_KEY: cf.RESEND_API_KEY ?? fallback.RESEND_API_KEY,
+      CONTACT_TO_EMAIL: cf.CONTACT_TO_EMAIL ?? fallback.CONTACT_TO_EMAIL,
+      CONTACT_FROM_EMAIL: cf.CONTACT_FROM_EMAIL ?? fallback.CONTACT_FROM_EMAIL,
+    };
+  } catch {
+    return fallback;
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -69,8 +99,9 @@ export async function POST(req: NextRequest) {
     message,
   };
 
-  const apiKey = process.env.RESEND_API_KEY;
-  const to = process.env.CONTACT_TO_EMAIL;
+  const env = readEnv();
+  const apiKey = env.RESEND_API_KEY;
+  const to = env.CONTACT_TO_EMAIL;
 
   if (!apiKey || !to) {
     console.info("[contact] inquiry received (Resend not configured):", fields);
@@ -102,7 +133,7 @@ export async function POST(req: NextRequest) {
       body: JSON.stringify({
         // TODO: use a verified LVX <hello@lvxhomes.com> sender once the domain
         // is verified in Resend; onboarding@resend.dev works to start.
-        from: process.env.CONTACT_FROM_EMAIL || "LVX Homes <onboarding@resend.dev>",
+        from: env.CONTACT_FROM_EMAIL || "LVX Homes <onboarding@resend.dev>",
         to: [to],
         reply_to: fields.email,
         subject,
