@@ -71,7 +71,7 @@ export type ProcessStep = { step: string; detail: string };
 
 export const PROCESS: ProcessStep[] = [
   { step: "Book", detail: "A short call, a date, an address." },
-  { step: "Shoot", detail: "One visit. We fly the home in a single take." },
+  { step: "Shoot", detail: "One visit. We fly the home by hand and bring back what it feels like to move through it." },
   { step: "48-hour delivery", detail: "Graded film and social cuts, ready to post." },
   { step: "You win the listing", detail: "Marketing that makes the agent look premium." },
 ];

@@ -16,15 +16,15 @@ import { JsonLd } from "@/components/seo/json-ld";
 const DIFFERENCE = [
   {
     title: "Angles you can't walk",
-    body: "Over the pool, through the great room, up the stair and out across the grounds — the home from vantage points a person on foot never reaches.",
+    body: "We rise over the roofline, sweep the grounds, slip from room to room — putting your buyer somewhere they could never stand, and letting them feel the whole place at once.",
   },
   {
     title: "The layout, understood",
-    body: "Not a flat gallery, not a fifty-minute walkthrough — a short film that makes the true shape and flow of a home read in seconds.",
+    body: "In one smooth pass, your buyer just gets how the home lives — where the light lands, how the rooms flow into each other, where they'd have their morning coffee.",
   },
   {
     title: "Made to stop the scroll",
-    body: "Cut for how listings actually travel — vertical for social, wide for the portals, a glimpse that pulls a buyer in instead of talking over the house.",
+    body: "Cut for how listings actually travel — vertical for social, wide for the portals — a glimpse that stops the thumb and pulls your buyer in, instead of droning on over the house.",
   },
 ];
 
@@ -113,11 +113,14 @@ export default function HomePage() {
           <Reveal>
             <Eyebrow>What LVX Is</Eyebrow>
             <p className="mt-7 font-serif text-2xl font-light leading-relaxed text-espresso sm:text-[1.95rem] sm:leading-[1.5]">
-              LVX films a home the way you can&apos;t see it on foot — over the
-              water, through the great room, up the stair and out across the
-              grounds. In one short film a buyer grasps how a home actually
-              lives, and wants to be standing in it. Not a gallery, not a
-              fifty-minute tour.
+              Imagine your buyer falling for the home before they ever pull up
+              out front — floating over the pool, through the great room, up the
+              stairs and out over the grounds, like they&apos;re flying it
+              themselves. In one short film they&apos;re not just looking at a
+              listing; they&apos;re already moving in — picturing their morning
+              coffee on the patio, the party they&apos;d throw, the way the light
+              hits at sunset. Photos can&apos;t do that. Neither can a
+              fifty-minute walkthrough.
             </p>
           </Reveal>
         </Container>
@@ -228,7 +231,8 @@ export default function HomePage() {
         </Container>
       </Section>
 
-      {/* 6 — Testimonials */}
+      {/* 6 — Testimonials (hidden until a real one lands) */}
+      {TESTIMONIALS.length > 0 && (
       <Section tone="card" spacing="loose">
         <Container narrow>
           <Reveal className="text-center">
@@ -253,6 +257,7 @@ export default function HomePage() {
           </div>
         </Container>
       </Section>
+      )}
 
       {/* 7 — CTA band */}
       <Section tone="ink" spacing="normal">

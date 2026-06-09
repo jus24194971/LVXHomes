@@ -11,19 +11,7 @@ export type Testimonial = {
   price: string; // listing price for credibility
 };
 
-export const TESTIMONIALS: Testimonial[] = [
-  {
-    quote:
-      "TODO: a real quote from a founding-client agent. Two sentences, specific — what the film did for the listing.",
-    agent: "TODO: Agent Name",
-    brokerage: "TODO: Brokerage",
-    price: "$1,650,000",
-  },
-  {
-    quote:
-      "TODO: a second real quote — ideally one that mentions winning the listing or the buyer response.",
-    agent: "TODO: Agent Name",
-    brokerage: "TODO: Brokerage",
-    price: "$2,400,000",
-  },
-];
+// Empty until real quotes land — the homepage section auto-hides when this is
+// empty, so it never shows placeholder/fake social proof. Re-add entries
+// (quote + agent + brokerage + price) from the founding shoots to bring it back.
+export const TESTIMONIALS: Testimonial[] = [];
