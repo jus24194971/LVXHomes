@@ -2,7 +2,7 @@
 
 import { Stream } from "@cloudflare/stream-react";
 import { useEffect, useRef, useState } from "react";
-import { streamPoster, streamReady } from "@/lib/stream";
+import { CF_STREAM_CUSTOMER_CODE, streamPoster, streamReady } from "@/lib/stream";
 import { cn } from "@/lib/utils";
 
 // Used wherever a real video isn't set yet — a warm, dark vignette.
@@ -57,15 +57,24 @@ export function StreamHero({
     );
   }
 
+  const embedUrl =
+    `https://customer-${CF_STREAM_CUSTOMER_CODE}.cloudflarestream.com/${uid}/iframe` +
+    `?autoplay=true&muted=true&loop=true&controls=false&preload=auto&poster=${encodeURIComponent(
+      posterUrl,
+    )}`;
+
+  // Full-bleed COVER: the Stream player is a fixed 16:9 iframe, so we oversize it
+  // (at least 100% in BOTH axes, locked to 16:9) and clip the overflow. Fills any
+  // screen shape — tall, wide, 4K — with no dark gaps or letterboxing.
   return (
-    <div
-      aria-hidden
-      className={cn(
-        "absolute inset-0 [&_iframe]:!h-full [&_iframe]:!w-full [&_video]:h-full [&_video]:w-full [&_video]:object-cover",
-        className,
-      )}
-    >
-      <Stream src={uid} autoplay muted loop preload="auto" poster={posterUrl} />
+    <div aria-hidden className={cn("absolute inset-0 overflow-hidden", className)}>
+      <iframe
+        src={embedUrl}
+        title="LVX background reel"
+        tabIndex={-1}
+        allow="autoplay; muted; loop; fullscreen"
+        className="pointer-events-none absolute left-1/2 top-1/2 h-[56.25vw] min-h-[100dvh] w-[100vw] min-w-[177.78dvh] max-w-none -translate-x-1/2 -translate-y-1/2 border-0"
+      />
     </div>
   );
 }
