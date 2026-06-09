@@ -14,6 +14,7 @@ export const metadata: Metadata = {
 
 const TRUST = [
   { label: "FAA Part 107", detail: "Certified commercial drone pilot" },
+  { label: "Licensed Pilot", detail: "FAA Part 61 · manned aircraft" },
   { label: "Insured", detail: "Liability coverage" }, // TODO: confirm coverage
   { label: "Arizona based", detail: "Phoenix · Mesa · Scottsdale" },
 ];
@@ -52,8 +53,13 @@ export default function AboutPage() {
             <Reveal delay={90} className="flex flex-col gap-6 font-sans text-base font-light leading-relaxed text-espresso md:pt-2">
               <p>
                 LVX is just me — Justin, the guy behind the sticks. I&apos;ve
-                spent years putting demanding tech in front of demanding people;
-                the drone&apos;s the newest tool, and easily the most fun.
+                spent two decades in tech, the last stretch of it around cameras
+                and drones in public safety — flying search-and-rescue, mapping
+                the damage after a storm, the kind of work where the footage
+                actually mattered. Flying&apos;s in my blood, too: I&apos;m a
+                licensed pilot. Somewhere in there it clicked that the same craft
+                that finds someone in floodwater can make a home look the way it
+                deserves.
               </p>
               <p>
                 FPV flying isn&apos;t the slow, gimbaled orbit you&apos;ve seen a
@@ -68,6 +74,17 @@ export default function AboutPage() {
                 camera actually records — everything else is just where you
                 point it. I find the light in a house, and I move through it.
               </p>
+              <p>
+                So if you&apos;ve got a home worth filming,{" "}
+                <a
+                  href="/contact"
+                  className="text-champagne-dk underline-offset-4 transition-colors hover:underline"
+                >
+                  reach out
+                </a>
+                . Let&apos;s find a date, and I&apos;ll put it in the best light
+                it&apos;s ever seen — I think you&apos;ll be glad you did.
+              </p>
             </Reveal>
           </div>
         </Container>
@@ -76,7 +93,7 @@ export default function AboutPage() {
       {/* Trust signals */}
       <Section tone="sand" spacing="normal">
         <Container>
-          <div className="grid gap-px overflow-hidden border border-paper/0 sm:grid-cols-3">
+          <div className="grid gap-px overflow-hidden border border-paper/0 sm:grid-cols-2 lg:grid-cols-4">
             {TRUST.map((t, i) => (
               <Reveal key={t.label} delay={i * 80} className="bg-sand px-2 py-4 text-center">
                 <p className="font-display text-sm uppercase tracking-[0.18em] text-champagne-dk">
