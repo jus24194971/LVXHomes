@@ -58,9 +58,9 @@ export default function VipPage() {
         <Container narrow className="text-center">
           <Reveal>
             <p className="font-serif text-2xl font-light italic leading-relaxed text-paper/85 sm:text-[1.95rem] sm:leading-[1.5]">
-              A handful of homes each year carry their own gravity. The Estate
-              film is reserved for them — the listings where the marketing has to
-              be as considered as the architecture.
+              A few homes a year just have it — that presence you feel the
+              second you walk in. The Estate film is built for those: the
+              listings where the marketing has to live up to the home itself.
             </p>
           </Reveal>
         </Container>

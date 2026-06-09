@@ -18,7 +18,7 @@ export type Package = {
 export const PACKAGES: Package[] = [
   {
     name: "Signature",
-    tagline: "The aerial film that shows what photos can't.",
+    tagline: "The film that shows what your photos can't.",
     price: 450,
     unit: "per listing",
     features: [
@@ -31,7 +31,7 @@ export const PACKAGES: Package[] = [
   },
   {
     name: "Showcase",
-    tagline: "The full film — interior, grounds, and the approach.",
+    tagline: "The whole story — inside, out, and the drive up.",
     price: 850,
     unit: "per listing",
     featured: true,
@@ -70,10 +70,10 @@ export const ADDONS: AddOn[] = [
 export type ProcessStep = { step: string; detail: string };
 
 export const PROCESS: ProcessStep[] = [
-  { step: "Book", detail: "A short call, a date, an address." },
+  { step: "Book", detail: "A quick call, a date, an address." },
   { step: "Shoot", detail: "One visit. We fly the home by hand and bring back what it feels like to move through it." },
-  { step: "48-hour delivery", detail: "Graded film and social cuts, ready to post." },
-  { step: "You win the listing", detail: "Marketing that makes the agent look premium." },
+  { step: "48-hour delivery", detail: "Your film and social cuts, graded and ready to post." },
+  { step: "You win the listing", detail: "Marketing that makes you look like the only call to make." },
 ];
 
 export const PACKAGES_BY_NAME: Record<Tier, Package> = PACKAGES.reduce(

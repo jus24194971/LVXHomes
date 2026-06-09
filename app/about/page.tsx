@@ -61,23 +61,22 @@ export default function AboutPage() {
 
             <Reveal delay={90} className="flex flex-col gap-6 font-sans text-base font-light leading-relaxed text-espresso md:pt-2">
               <p>
-                LVX is one person behind the sticks: Justin, an FPV pilot who
-                spent years putting demanding technology in front of demanding
-                clients. The drone is simply the newest instrument.
+                LVX is just me — Justin, the guy behind the sticks. I&apos;ve
+                spent years putting demanding tech in front of demanding people;
+                the drone&apos;s the newest tool, and easily the most fun.
               </p>
               <p>
-                FPV flying is hard in a way that gimbals and slow orbits
-                aren&apos;t — it&apos;s hand-flown, no autopilot, threading doorways and
-                dropping over balconies in real time. That skill is the point.
-                It&apos;s what reaches the angles a buyer never gets on foot: over
-                the water, through the great room, up the stair and out across
-                the grounds.
+                FPV flying isn&apos;t the slow, gimbaled orbit you&apos;ve seen a
+                hundred times. It&apos;s hand-flown — no autopilot — threading
+                doorways and diving over balconies in real time. That&apos;s the
+                whole point: it&apos;s how I reach the angles a buyer never gets on
+                foot — over the pool, through the great room, up the stairs and
+                out across the grounds.
               </p>
               <p>
-                The name is a reminder of the job. Light is the only material a
-                cinematographer actually works with; everything else is just
-                where you choose to point it. LVX finds the light in a house —
-                and moves through it.
+                The name&apos;s a reminder of the job. Light is the only thing a
+                camera actually records — everything else is just where you
+                point it. I find the light in a house, and I move through it.
               </p>
             </Reveal>
           </div>

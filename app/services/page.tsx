@@ -26,9 +26,10 @@ export default function ServicesPage() {
               THE WORK, THREE WAYS
             </h1>
             <p className="mx-auto mt-7 max-w-xl font-serif text-xl font-light italic leading-relaxed text-espresso sm:text-2xl">
-              One film, scaled to the home. What changes between them is reach,
-              finish, and how much of the grounds we cover — never the idea:
-              show the home the way a buyer can&apos;t see it on foot.
+              It&apos;s one film, sized to the home — what changes is how much
+              we cover, how much of the grounds, and how far the film travels
+              after. The idea never does: show a buyer the home like they could
+              never see it on foot, and make them want to stand in it.
             </p>
           </Reveal>
         </Container>
@@ -50,7 +51,7 @@ export default function ServicesPage() {
               >
                 {pkg.featured && (
                   <span className="absolute right-0 top-0 bg-champagne px-3 py-1.5 font-sans text-[0.625rem] uppercase tracking-[0.2em] text-ink">
-                    Most chosen
+                    The sweet spot
                   </span>
                 )}
                 <h2 className="font-display text-xl tracking-[0.14em] text-ink">
@@ -100,8 +101,8 @@ export default function ServicesPage() {
 
           <Reveal>
             <p className="mt-8 text-center font-sans text-sm text-taupe">
-              Introductory pricing for our founding partners. Travel within
-              Phoenix, Mesa, and Scottsdale is included.
+              Founding-partner pricing while we build the portfolio — travel
+              anywhere in Phoenix, Mesa, and Scottsdale is on us.
               {/* TODO: confirm travel policy */}
             </p>
           </Reveal>

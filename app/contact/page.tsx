@@ -21,7 +21,8 @@ export default function ContactPage() {
           LET&apos;S FILM IT
         </h1>
         <p className="mt-6 font-serif text-xl font-light italic leading-relaxed text-espresso sm:text-2xl">
-          Tell me about the listing. I reply within one business day.
+          Tell me about the listing — the address, the price, what makes it
+          special. I&apos;ll get back to you within a day.
         </p>
 
         <div className="mt-12">
