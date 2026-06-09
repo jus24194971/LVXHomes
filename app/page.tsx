@@ -98,9 +98,9 @@ export default function HomePage() {
             </div>
           )}
           <h1 className="mx-auto max-w-3xl font-display text-4xl font-normal leading-[1.1] tracking-[0.04em] text-paper sm:text-6xl">
-            WIN THE LISTING
+            THE HOME,
             <br />
-            BEFORE YOU LIST IT
+            IN ITS BEST LIGHT
           </h1>
           {hasVideo && (
             <p className="mx-auto mt-7 max-w-xl font-serif text-xl italic text-paper/85 sm:text-2xl">

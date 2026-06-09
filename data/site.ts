@@ -38,9 +38,9 @@ export const NAV_LINKS = [
 
 export const TAGLINES = {
   lightInMotion: "Light, in motion.",
-  becomesCinema: "Where the listing becomes cinema.",
+  becomesCinema: "Cinematic aerial films for Arizona's finest homes.",
   deserveMore: "For homes that deserve more than photographs.",
-  winTheListing: "Win the listing before you list it.",
+  winTheListing: "Some homes deserve a film. Let's make yours.",
 } as const;
 
 /**
