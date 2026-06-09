@@ -86,6 +86,17 @@ export default function HomePage() {
               </Eyebrow>
             </div>
           )}
+          {hasVideo && (
+            <div className="mb-7 flex flex-col items-center">
+              <span
+                className="font-display text-3xl leading-none tracking-[0.2em] text-champagne sm:text-4xl"
+                style={{ paddingLeft: "0.2em" }}
+              >
+                LVX
+              </span>
+              <span aria-hidden className="mt-5 h-px w-16 bg-champagne/60" />
+            </div>
+          )}
           <h1 className="mx-auto max-w-3xl font-display text-4xl font-normal leading-[1.1] tracking-[0.04em] text-paper sm:text-6xl">
             WIN THE LISTING
             <br />
