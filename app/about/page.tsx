@@ -37,25 +37,15 @@ export default function AboutPage() {
           </Reveal>
 
           <div className="mt-16 grid gap-12 md:grid-cols-[5fr_7fr] md:items-start">
-            {/* Portrait — TODO: swap for a real headshot / on-set still via next/image */}
+            {/* Portrait */}
             <Reveal>
               <div className="relative aspect-[4/5] overflow-hidden border border-sand">
-                <div
-                  aria-hidden
-                  className="absolute inset-0"
-                  style={{
-                    background:
-                      "radial-gradient(120% 90% at 50% 10%, rgba(58,48,38,0.85), rgba(33,28,22,1) 80%)",
-                  }}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/justin.jpg"
+                  alt="Justin, founder and pilot of LVX Homes, in front of a vintage TWA Constellation at night"
+                  className="absolute inset-0 h-full w-full object-cover"
                 />
-                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-paper/70">
-                  <span className="font-display text-3xl tracking-[0.2em]">
-                    LVX
-                  </span>
-                  <span className="font-sans text-[0.625rem] uppercase tracking-[0.22em] text-paper/40">
-                    Portrait — TODO
-                  </span>
-                </div>
               </div>
             </Reveal>
 
