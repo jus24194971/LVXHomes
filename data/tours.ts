@@ -59,9 +59,10 @@ export const TOURS: Tour[] = [
       },
     ],
     // Always-visible windows for engine testing; real tours use timed windows.
+    // (±60°, not ±90 — exactly perpendicular is a degenerate projection angle.)
     hotspots: [
-      { id: "hs-kitchen", label: "Kitchen", start: 0, end: 999, yaw: -90, pitch: -6, panoId: "kitchen" },
-      { id: "hs-suite", label: "Primary Suite", start: 0, end: 999, yaw: 90, pitch: -6, panoId: "suite" },
+      { id: "hs-kitchen", label: "Kitchen", start: 0, end: 999, yaw: -60, pitch: -6, panoId: "kitchen" },
+      { id: "hs-suite", label: "Primary Suite", start: 0, end: 999, yaw: 60, pitch: -6, panoId: "suite" },
     ],
     hidden: true,
   },

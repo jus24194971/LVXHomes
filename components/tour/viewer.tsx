@@ -170,7 +170,11 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
     el.addEventListener(
       "pointerdown",
       (e) => {
-        el.setPointerCapture(e.pointerId);
+        try {
+          el.setPointerCapture(e.pointerId);
+        } catch {
+          /* stale/synthetic pointer — drag still works without capture */
+        }
         pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
         if (pointers.size === 2) {
           const [a, b] = [...pointers.values()];
@@ -267,14 +271,25 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
     );
 
     // ---------- resize ----------
-    const ro = new ResizeObserver(() => {
+    const applySize = () => {
       const w = mount.clientWidth;
       const h = Math.max(mount.clientHeight, 1);
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
-    });
+    };
+    const ro = new ResizeObserver(applySize);
     ro.observe(mount);
+    // Belt-and-suspenders for fullscreen: kick the resize immediately and once
+    // the top-layer layout settles, in case the observer lags the transition.
+    document.addEventListener(
+      "fullscreenchange",
+      () => {
+        applySize();
+        requestAnimationFrame(applySize);
+      },
+      { signal },
+    );
 
     // ---------- render loop ----------
     const hsWorld = new THREE.Vector3();
@@ -326,12 +341,19 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
             490 * Math.sin(phi) * Math.sin(theta),
           );
           hsCam.copy(hsWorld).applyMatrix4(camera.matrixWorldInverse);
-          if (hsCam.z > 0) visible = false; // behind the viewer
-          else {
+          if (hsCam.z > -2) {
+            // Behind or beside the viewer — at ~90° off-axis the projection
+            // divides by ~0 and explodes to astronomic coordinates.
+            visible = false;
+          } else {
             hsWorld.project(camera);
-            const x = (hsWorld.x * 0.5 + 0.5) * w;
-            const y = (-hsWorld.y * 0.5 + 0.5) * h;
-            node.style.transform = `translate(-50%, -50%) translate(${x}px, ${y}px)`;
+            if (Math.abs(hsWorld.x) > 1.15 || Math.abs(hsWorld.y) > 1.15) {
+              visible = false; // outside the viewport (plus a small margin)
+            } else {
+              const x = (hsWorld.x * 0.5 + 0.5) * w;
+              const y = (-hsWorld.y * 0.5 + 0.5) * h;
+              node.style.transform = `translate(-50%, -50%) translate(${x}px, ${y}px)`;
+            }
           }
         }
         node.style.opacity = visible ? "1" : "0";
