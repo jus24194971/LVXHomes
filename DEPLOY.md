@@ -138,6 +138,10 @@ For local email testing, put `RESEND_API_KEY` / `CONTACT_TO_EMAIL` in `.dev.vars
 - [ ] Optional: a 45–75s hero showreel → set `HERO_STREAM_UID` in `lib/stream.ts`.
 - [ ] Run Lighthouse on the live URL (target 95+ perf & a11y).
 
+## 360 tours
+The interactive 360 flight product (media pipeline, R2 + media.lvxhomes.com,
+encoding script, authoring, drone-day runbook) is documented in **TOURS.md**.
+
 ## Notes / future upgrades
 - Contact rate-limiter is in-memory (per-isolate on Workers) — fine for v1;
   upgrade to Cloudflare KV or a Durable Object if you start seeing abuse.
