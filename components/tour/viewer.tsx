@@ -22,14 +22,17 @@ const FRONT_LON = 180;
 
 type Props = {
   src: string;
+  /** Same-origin backup source if the media domain fails. */
+  fallbackSrc?: string;
   /** Extra yaw in degrees added to the initial view (0 = face FRONT). */
   initialYaw?: number;
   className?: string;
 };
 
-export function TourViewer({ src, initialYaw = 0, className }: Props) {
+export function TourViewer({ src, fallbackSrc, initialYaw = 0, className }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const startedRef = useRef(false);
 
   const [started, setStarted] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -56,6 +59,7 @@ export function TourViewer({ src, initialYaw = 0, className }: Props) {
 
     // ---------- video ----------
     const video = document.createElement("video");
+    video.crossOrigin = "anonymous"; // required to use the frames as a WebGL texture
     video.src = src;
     video.loop = true;
     video.muted = true;
@@ -65,7 +69,21 @@ export function TourViewer({ src, initialYaw = 0, className }: Props) {
     videoRef.current = video;
     video.addEventListener("playing", () => setPlaying(true), { signal });
     video.addEventListener("pause", () => setPlaying(false), { signal });
-    video.addEventListener("error", () => setFailed(true), { signal });
+    let triedFallback = false;
+    video.addEventListener(
+      "error",
+      () => {
+        if (fallbackSrc && !triedFallback) {
+          triedFallback = true;
+          video.src = fallbackSrc;
+          video.load();
+          if (startedRef.current) void video.play();
+          return;
+        }
+        setFailed(true);
+      },
+      { signal },
+    );
 
     // ---------- three ----------
     const scene = new THREE.Scene();
@@ -290,6 +308,7 @@ export function TourViewer({ src, initialYaw = 0, className }: Props) {
     setLoading(true);
     try {
       await video.play();
+      startedRef.current = true;
       setStarted(true);
       setHint(true);
       setTimeout(() => setHint(false), 4500);

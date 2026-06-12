@@ -33,7 +33,8 @@ export default function TourTestPage() {
 
         <div className="mt-10 overflow-hidden border border-paper/15">
           <TourViewer
-            src="/tours/lvx-360-test.mp4"
+            src="https://media.lvxhomes.com/tours/lvx-360-test.mp4?v=1"
+            fallbackSrc="/tours/lvx-360-test.mp4"
             className="aspect-[4/5] w-full sm:aspect-video"
           />
         </div>
