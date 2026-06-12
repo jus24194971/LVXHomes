@@ -68,13 +68,34 @@ media.lvxhomes.com  (R2 lvx-media) all media: flight MP4s, pano JPGs, posters
   resolution ÷ 4 ≈ perceived quality. 4K equirect ≈ 1080p feel — that's the
   *floor*, which is why the 5.7K tier exists.
 
+## Plans — the living minimap (floor AND site/grounds)
+
+`data/plans.ts` defines per-tour plans rendered as a minimap panel in the
+player ("Plan" button). A plan has SHEETS — each either a `floor` ("Main
+Floor", "Suite 200") or a `site` ("Grounds") — so residential interiors,
+commercial suites, and estate grounds are all first-class. Zones are brand-
+styled polygons (`room | structure | outdoor | water | hardscape`) that link
+into the flight: `videoTime` (tap → seek) or `panoId` (tap → step into the
+still 360). The zone you're standing in highlights champagne while in a pano.
+
+Authoring for now: hand-edit `data/plans.ts` (coordinates are arbitrary plan
+units; the renderer fits to viewport). The Floorplan Studio editor (draw,
+snap, trace over any reference image) is Phase B; SLAM-extracted flight paths
+and wall-evidence underlays are Phase D.
+
 ## Status / roadmap
 
 - [x] Phase 1 — sphere engine (drag/inertia, zoom, keys, iOS gyro), R2 +
       media.lvxhomes.com proven (206 + CORS), synthetic 4K test world.
 - [x] Phase 2 — hotspots → pano stops → resume; tour data model;
       `?author=1` click-to-place authoring; verified on PC + iPhone.
-- [ ] Phase 3 — polish + integration: HEVC/4K tier switching, intro animation,
-      tours on Work pages + packages ("The 360 Flight" add-on), public tours in
-      the sitemap, real-footage tuning.
-- [ ] Phase 4 — per-room analytics for agents, floorplan minimap, WebXR.
+- [x] Plan Phase A — living minimap: floor + site sheets, zone→seek and
+      zone→pano links, hidden test tour only.
+- [ ] Plan Phase B — Floorplan Studio editor (draw / snap / trace mode).
+- [ ] Plan Phase C — you-are-here path + view cone on the plan.
+- [ ] Plan Phase D — SLAM pipeline (camera path + wall evidence from 360
+      masters; GPS telemetry for outdoor sheets).
+- [ ] Tour Phase 3 — polish + integration: HEVC/4K tier switching, intro
+      animation, tours on Work pages + packages ("The 360 Flight" add-on),
+      public tours in the sitemap, real-footage tuning.
+- [ ] Tour Phase 4 — per-room analytics for agents, WebXR.
