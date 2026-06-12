@@ -509,11 +509,13 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
     }
   };
 
+  // Sizes use container-query units so the UI keeps the same visual weight
+  // whether the player is a 400px embed or a fullscreen 4K monitor.
   const ctl =
-    "flex h-10 w-10 items-center justify-center rounded-full border border-paper/40 text-paper/90 backdrop-blur-sm transition-colors hover:border-champagne hover:text-champagne";
+    "flex h-[clamp(2.5rem,3cqw,4.25rem)] w-[clamp(2.5rem,3cqw,4.25rem)] items-center justify-center rounded-full border border-paper/40 text-[clamp(0.875rem,1cqw,1.35rem)] text-paper/90 backdrop-blur-sm transition-colors hover:border-champagne hover:text-champagne";
 
   return (
-    <div className={cn("relative overflow-hidden bg-ink", className)}>
+    <div className={cn("relative overflow-hidden bg-ink [container-type:inline-size]", className)}>
       <div
         ref={mountRef}
         tabIndex={0}
@@ -531,21 +533,21 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
               if (node) hotspotEls.current.set(hs.id, node);
               else hotspotEls.current.delete(hs.id);
             }}
-            className="absolute left-0 top-0 flex flex-col items-center gap-2 opacity-0 transition-opacity duration-300"
+            className="absolute left-0 top-0 flex flex-col items-center gap-[clamp(0.5rem,0.7cqw,1rem)] opacity-0 transition-opacity duration-300"
             style={{ pointerEvents: "none" }}
           >
             <button
               type="button"
               onClick={() => void enterPano(hs.panoId)}
               aria-label={`Step into ${hs.label}`}
-              className="group relative flex h-12 w-12 items-center justify-center"
+              className="group relative flex h-[clamp(3rem,4.5cqw,7.5rem)] w-[clamp(3rem,4.5cqw,7.5rem)] items-center justify-center"
             >
               <span className="absolute inset-0 rounded-full border border-champagne/50 motion-safe:animate-ping" />
-              <span className="relative flex h-9 w-9 items-center justify-center rounded-full border border-champagne bg-ink/40 text-champagne backdrop-blur-sm transition-transform duration-300 group-hover:scale-110">
-                <span className="h-1.5 w-1.5 rounded-full bg-champagne" />
+              <span className="relative flex h-[72%] w-[72%] items-center justify-center rounded-full border border-champagne bg-ink/40 text-champagne backdrop-blur-sm transition-transform duration-300 group-hover:scale-110">
+                <span className="h-[14%] w-[14%] rounded-full bg-champagne" />
               </span>
             </button>
-            <span className="rounded-full bg-ink/60 px-3 py-1 font-sans text-[0.625rem] uppercase tracking-[0.18em] text-paper/90 backdrop-blur-sm">
+            <span className="rounded-full bg-ink/60 px-[1.3em] py-[0.45em] font-sans text-[clamp(0.625rem,1cqw,1.25rem)] uppercase tracking-[0.18em] text-paper/90 backdrop-blur-sm">
               {hs.label}
             </span>
           </div>
@@ -565,7 +567,7 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
       {pano && !fading && (
         <>
           <div className="pointer-events-none absolute inset-x-0 top-0 flex justify-center p-4">
-            <span className="rounded-full bg-ink/60 px-4 py-2 font-sans text-[0.6875rem] uppercase tracking-[0.2em] text-champagne backdrop-blur-sm">
+            <span className="rounded-full bg-ink/60 px-[1.5em] py-[0.65em] font-sans text-[clamp(0.6875rem,0.95cqw,1.125rem)] uppercase tracking-[0.2em] text-champagne backdrop-blur-sm">
               {pano.label} · Still 360
             </span>
           </div>
@@ -573,7 +575,7 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
             <button
               type="button"
               onClick={() => void resumeFlight()}
-              className="rounded-full border border-paper/40 bg-ink/40 px-4 py-2 font-sans text-[0.6875rem] uppercase tracking-[0.18em] text-paper/90 backdrop-blur-sm transition-colors hover:border-champagne hover:text-champagne"
+              className="rounded-full border border-paper/40 bg-ink/40 px-[1.5em] py-[0.65em] font-sans text-[clamp(0.6875rem,0.95cqw,1.125rem)] uppercase tracking-[0.18em] text-paper/90 backdrop-blur-sm transition-colors hover:border-champagne hover:text-champagne"
             >
               ← Resume the flight
             </button>
@@ -589,16 +591,16 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
           disabled={loading || failed}
           className="group absolute inset-0 flex flex-col items-center justify-center gap-5 bg-ink/60"
         >
-          <span className="flex h-20 w-20 items-center justify-center rounded-full border border-champagne/70 text-champagne transition-transform duration-300 group-hover:scale-105">
+          <span className="flex h-[clamp(5rem,7cqw,9rem)] w-[clamp(5rem,7cqw,9rem)] items-center justify-center rounded-full border border-champagne/70 text-[clamp(1.375rem,1.9cqw,2.5rem)] text-champagne transition-transform duration-300 group-hover:scale-105">
             {loading ? (
-              <span className="h-6 w-6 animate-spin rounded-full border-2 border-champagne/30 border-t-champagne" />
+              <span className="h-[30%] w-[30%] animate-spin rounded-full border-2 border-champagne/30 border-t-champagne" />
             ) : (
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <svg width="1em" height="1em" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                 <path d="M8 5v14l11-7z" />
               </svg>
             )}
           </span>
-          <span className="font-sans text-xs uppercase tracking-[0.22em] text-paper/80">
+          <span className="font-sans text-[clamp(0.75rem,0.95cqw,1.125rem)] uppercase tracking-[0.22em] text-paper/80">
             {failed ? "Couldn't start the flight" : "Take the flight"}
           </span>
         </button>
@@ -612,7 +614,7 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
           hint && !pano ? "opacity-100" : "opacity-0",
         )}
       >
-        <span className="rounded-full bg-ink/60 px-4 py-2 font-sans text-[0.6875rem] uppercase tracking-[0.2em] text-paper/85 backdrop-blur-sm">
+        <span className="rounded-full bg-ink/60 px-[1.5em] py-[0.65em] font-sans text-[clamp(0.6875rem,0.95cqw,1.125rem)] uppercase tracking-[0.2em] text-paper/85 backdrop-blur-sm">
           Drag to look · tap a gold ring to step inside
         </span>
       </div>
@@ -624,11 +626,11 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
             {!pano && (
               <button type="button" onClick={togglePlay} aria-label={playing ? "Pause" : "Play"} className={ctl}>
                 {playing ? (
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                  <svg width="1em" height="1em" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                     <path d="M6 4h4v16H6zM14 4h4v16h-4z" />
                   </svg>
                 ) : (
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                  <svg width="1em" height="1em" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                     <path d="M8 5v14l11-7z" />
                   </svg>
                 )}
@@ -642,14 +644,14 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
                 onClick={toggleMotion}
                 aria-pressed={motionOn}
                 aria-label="Toggle device motion"
-                className={cn(ctl, "w-auto gap-2 px-4", motionOn && "border-champagne text-champagne")}
+                className={cn(ctl, "w-auto gap-2 px-[1.4em]", motionOn && "border-champagne text-champagne")}
               >
-                <span className="font-sans text-[0.625rem] uppercase tracking-[0.18em]">Motion</span>
+                <span className="font-sans text-[clamp(0.625rem,0.8cqw,1rem)] uppercase tracking-[0.18em]">Motion</span>
               </button>
             )}
             {fsAvail && (
               <button type="button" onClick={toggleFullscreen} aria-label="Fullscreen" className={ctl}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
                   <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
                 </svg>
               </button>
