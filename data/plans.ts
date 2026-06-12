@@ -26,6 +26,8 @@ export type PlanZone = {
   kind: PlanZoneKind;
   /** Polygon in plan units. */
   points: [number, number][];
+  /** Flight chapter this zone seeks into (defaults to the first chapter). */
+  chapterId?: string;
   videoTime?: number;
   panoId?: string;
 };
@@ -90,11 +92,13 @@ export const PLANS: Plan[] = [
           ],
         ],
         zones: [
-          { id: "residence", label: "Residence", kind: "structure", points: [[45, 25], [95, 25], [95, 60], [45, 60]], videoTime: 0 },
-          { id: "lawn", label: "North Lawn", kind: "outdoor", points: [[10, 10], [40, 10], [40, 90], [10, 90]], videoTime: 10 },
-          { id: "court", label: "Motor Court", kind: "hardscape", points: [[95, 10], [130, 10], [130, 40], [95, 40]], videoTime: 2 },
-          { id: "patio", label: "Courtyard", kind: "hardscape", points: [[45, 60], [95, 60], [95, 75], [45, 75]], videoTime: 6 },
-          { id: "pool", label: "Pool", kind: "water", points: [[100, 65], [125, 65], [125, 85], [100, 85]], videoTime: 8 },
+          // Grounds zones live in the "grounds" flight chapter — tapping one
+          // switches chapters and seeks, proving cross-chapter plan links.
+          { id: "residence", label: "Residence", kind: "structure", points: [[45, 25], [95, 25], [95, 60], [45, 60]], chapterId: "grounds", videoTime: 0 },
+          { id: "lawn", label: "North Lawn", kind: "outdoor", points: [[10, 10], [40, 10], [40, 90], [10, 90]], chapterId: "grounds", videoTime: 10 },
+          { id: "court", label: "Motor Court", kind: "hardscape", points: [[95, 10], [130, 10], [130, 40], [95, 40]], chapterId: "grounds", videoTime: 2 },
+          { id: "patio", label: "Courtyard", kind: "hardscape", points: [[45, 60], [95, 60], [95, 75], [45, 75]], chapterId: "grounds", videoTime: 6 },
+          { id: "pool", label: "Pool", kind: "water", points: [[100, 65], [125, 65], [125, 85], [100, 85]], chapterId: "grounds", videoTime: 8 },
         ],
       },
     ],

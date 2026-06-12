@@ -25,7 +25,7 @@ const FRONT_LON = 180;
 const norm180 = (d: number) => ((((d + 180) % 360) + 360) % 360) - 180;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-type AuthorMark = { time: number; yaw: number; pitch: number };
+type AuthorMark = { chapter: string; time: number; yaw: number; pitch: number };
 
 type Engine = {
   camera: THREE.PerspectiveCamera;
@@ -66,14 +66,20 @@ export function TourViewer({
   const [copied, setCopied] = useState(false);
   const [planOpen, setPlanOpen] = useState(false);
   const [activeSheetId, setActiveSheetId] = useState(plan?.sheets[0]?.id ?? "");
+  const [chapterIdx, setChapterIdx] = useState(0);
 
   const startedRef = useRef(false);
   const motionOnRef = useRef(false);
   const panoRef = useRef<TourPano | null>(null);
   const authorRef = useRef(false);
+  const chapterIdxRef = useRef(0);
+  /** Each chapter remembers where the viewer left it. */
+  const chapterTimesRef = useRef<Record<string, number>>({});
+  const triedFallbackRef = useRef(false);
   motionOnRef.current = motionOn;
   panoRef.current = pano;
   authorRef.current = author;
+  chapterIdxRef.current = chapterIdx;
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -90,7 +96,7 @@ export function TourViewer({
     // ---------- video ----------
     const video = document.createElement("video");
     video.crossOrigin = "anonymous"; // required to use the frames as a WebGL texture
-    video.src = tour.video.src;
+    video.src = tour.chapters[0].video.src;
     video.loop = true;
     video.muted = true;
     video.playsInline = true;
@@ -99,13 +105,13 @@ export function TourViewer({
     videoRef.current = video;
     video.addEventListener("playing", () => setPlaying(true), { signal });
     video.addEventListener("pause", () => setPlaying(false), { signal });
-    let triedFallback = false;
     video.addEventListener(
       "error",
       () => {
-        if (tour.video.fallbackSrc && !triedFallback) {
-          triedFallback = true;
-          video.src = tour.video.fallbackSrc;
+        const chapter = tour.chapters[chapterIdxRef.current];
+        if (chapter.video.fallbackSrc && !triedFallbackRef.current) {
+          triedFallbackRef.current = true;
+          video.src = chapter.video.fallbackSrc;
           video.load();
           if (startedRef.current && !panoRef.current) void video.play();
           return;
@@ -245,6 +251,7 @@ export function TourViewer({
         setMarks((prev) => [
           ...prev,
           {
+            chapter: tour.chapters[chapterIdxRef.current].id,
             time: Math.round(video.currentTime * 10) / 10,
             yaw: Math.round(norm180(lon - FRONT_LON) * 10) / 10,
             pitch: Math.round(lat * 10) / 10,
@@ -306,6 +313,9 @@ export function TourViewer({
     // ---------- render loop ----------
     const hsWorld = new THREE.Vector3();
     const hsCam = new THREE.Vector3();
+    const flatHotspots = tour.chapters.flatMap((ch, ci) =>
+      ch.hotspots.map((hs) => ({ ci, hs, key: `${ch.id}:${hs.id}` })),
+    );
     renderer.setAnimationLoop(() => {
       if (!look.dragging) {
         look.lon += look.vLon;
@@ -340,10 +350,14 @@ export function TourViewer({
       const h = mount.clientHeight;
       const t = video.currentTime;
       const inVideo = startedRef.current && !panoRef.current;
-      for (const hs of tour.hotspots) {
-        const node = hotspotEls.current.get(hs.id);
+      for (const { ci, hs, key } of flatHotspots) {
+        const node = hotspotEls.current.get(key);
         if (!node) continue;
-        let visible = inVideo && t >= hs.start && t <= hs.end;
+        let visible =
+          inVideo &&
+          ci === chapterIdxRef.current &&
+          t >= hs.start &&
+          t <= hs.end;
         if (visible) {
           const phi = THREE.MathUtils.degToRad(90 - hs.pitch);
           const theta = THREE.MathUtils.degToRad(FRONT_LON + hs.yaw);
@@ -461,22 +475,71 @@ export function TourViewer({
     setFading(false);
   }, []);
 
-  /** Jump the flight to a moment (leaving a pano first if needed). */
+  /**
+   * Switch flight chapters behind the ink fade. The chapter being left
+   * remembers its position; the new one resumes where it was last left
+   * (or at seekT / its start).
+   */
+  const switchChapter = useCallback(
+    async (idx: number, seekT?: number) => {
+      const engine = engineRef.current;
+      const chapter = tour.chapters[idx];
+      if (!engine || !chapter || idx === chapterIdxRef.current) return;
+      setFading(true);
+      await sleep(350);
+      const leaving = tour.chapters[chapterIdxRef.current];
+      if (leaving) chapterTimesRef.current[leaving.id] = engine.video.currentTime;
+      if (panoRef.current) {
+        engine.material.map = engine.videoTexture;
+        engine.material.needsUpdate = true;
+        setPano(null);
+      }
+      triedFallbackRef.current = false;
+      const target = seekT ?? chapterTimesRef.current[chapter.id] ?? 0;
+      const v = engine.video;
+      v.src = chapter.video.src;
+      v.load();
+      if (target > 0) {
+        v.addEventListener(
+          "loadedmetadata",
+          () => {
+            v.currentTime = target;
+          },
+          { once: true },
+        );
+      }
+      setChapterIdx(idx);
+      chapterIdxRef.current = idx;
+      await v.play().catch(() => undefined);
+      setFading(false);
+    },
+    [tour.chapters],
+  );
+
+  /** Jump the flight to a moment (switching chapter / leaving a pano first). */
   const seekFlight = useCallback(
-    async (t: number) => {
+    async (t: number, chapterId?: string) => {
       const engine = engineRef.current;
       if (!engine) return;
+      if (chapterId) {
+        const idx = tour.chapters.findIndex((c) => c.id === chapterId);
+        if (idx >= 0 && idx !== chapterIdxRef.current) {
+          await switchChapter(idx, t);
+          return;
+        }
+      }
       if (panoRef.current) await resumeFlight();
       engine.video.currentTime = t;
       void engine.video.play();
     },
-    [resumeFlight],
+    [resumeFlight, switchChapter, tour.chapters],
   );
 
   const handleZoneClick = useCallback(
     (zone: PlanZone) => {
       if (zone.panoId) void enterPano(zone.panoId);
-      else if (zone.videoTime !== undefined) void seekFlight(zone.videoTime);
+      else if (zone.videoTime !== undefined)
+        void seekFlight(zone.videoTime, zone.chapterId);
     },
     [enterPano, seekFlight],
   );
@@ -556,14 +619,17 @@ export function TourViewer({
         className="absolute inset-0 outline-none"
       />
 
-      {/* Hotspots — projected into the world each frame */}
+      {/* Hotspots — projected into the world each frame (all chapters; only
+          the active chapter's are made visible by the render loop) */}
       <div aria-hidden={!started} className="pointer-events-none absolute inset-0">
-        {tour.hotspots.map((hs) => (
+        {tour.chapters.flatMap((ch) =>
+          ch.hotspots.map((hs) => (
           <div
-            key={hs.id}
+            key={`${ch.id}:${hs.id}`}
             ref={(node) => {
-              if (node) hotspotEls.current.set(hs.id, node);
-              else hotspotEls.current.delete(hs.id);
+              const key = `${ch.id}:${hs.id}`;
+              if (node) hotspotEls.current.set(key, node);
+              else hotspotEls.current.delete(key);
             }}
             className="absolute left-0 top-0 flex flex-col items-center gap-[clamp(0.5rem,0.7cqw,1rem)] opacity-0 transition-opacity duration-300"
             style={{ pointerEvents: "none" }}
@@ -583,7 +649,8 @@ export function TourViewer({
               {hs.label}
             </span>
           </div>
-        ))}
+          )),
+        )}
       </div>
 
       {/* Ink fade for scene transitions */}
@@ -654,6 +721,30 @@ export function TourViewer({
       {/* Controls */}
       {started && (
         <div className="absolute inset-x-0 bottom-0 flex items-center justify-between p-4">
+          {/* Chapter switcher — only when the tour has multiple flight chapters */}
+          {tour.chapters.length > 1 && !pano && (
+            <div className="absolute left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-paper/30 bg-ink/40 px-2 py-1 backdrop-blur-sm">
+              <button
+                type="button"
+                onClick={() => void switchChapter((chapterIdx - 1 + tour.chapters.length) % tour.chapters.length)}
+                aria-label="Previous chapter"
+                className="px-[0.6em] font-sans text-[clamp(0.75rem,0.9cqw,1.125rem)] text-paper/70 transition-colors hover:text-champagne"
+              >
+                ‹
+              </button>
+              <span className="min-w-[7em] text-center font-sans text-[clamp(0.625rem,0.8cqw,1rem)] uppercase tracking-[0.16em] text-champagne">
+                {tour.chapters[chapterIdx]?.label}
+              </span>
+              <button
+                type="button"
+                onClick={() => void switchChapter((chapterIdx + 1) % tour.chapters.length)}
+                aria-label="Next chapter"
+                className="px-[0.6em] font-sans text-[clamp(0.75rem,0.9cqw,1.125rem)] text-paper/70 transition-colors hover:text-champagne"
+              >
+                ›
+              </button>
+            </div>
+          )}
           <div>
             {!pano && (
               <button type="button" onClick={togglePlay} aria-label={playing ? "Pause" : "Play"} className={ctl}>
