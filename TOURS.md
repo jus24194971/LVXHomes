@@ -78,10 +78,19 @@ styled polygons (`room | structure | outdoor | water | hardscape`) that link
 into the flight: `videoTime` (tap → seek) or `panoId` (tap → step into the
 still 360). The zone you're standing in highlights champagne while in a pano.
 
-Authoring for now: hand-edit `data/plans.ts` (coordinates are arbitrary plan
-units; the renderer fits to viewport). The Floorplan Studio editor (draw,
-snap, trace over any reference image) is Phase B; SLAM-extracted flight paths
-and wall-evidence underlays are Phase D.
+**Authoring: the Floorplan Studio** at `/studio/plan` (unlinked, noindex) —
+draw zones (click vertices, Enter or click-the-first-dot closes), draw walls,
+drag vertices/zones, **trace mode** (dim any reference image — builder plan,
+sketch, CubiCasa export — and draw over it), multi-sheet floors + grounds,
+link zones to chapters/times/panos, then **Export JSON** and paste into
+`data/plans.ts`. Load an existing plan to edit it. Ctrl+Z undoes; Del removes.
+SLAM-extracted flight paths and wall-evidence underlays land in Phase D.
+
+**Chapters:** tours are now one or more flight chapters ("Main Floor",
+"Grounds"…), each its own video + hotspots; chapters remember where the viewer
+left them, plan zones can target a chapter (`chapterId`), and the player shows
+a ‹ › chapter switcher. Encode one file per chapter
+(`tours/<slug>/<chapter>-4k.mp4`).
 
 ## Status / roadmap
 
@@ -91,7 +100,8 @@ and wall-evidence underlays are Phase D.
       `?author=1` click-to-place authoring; verified on PC + iPhone.
 - [x] Plan Phase A — living minimap: floor + site sheets, zone→seek and
       zone→pano links, hidden test tour only.
-- [ ] Plan Phase B — Floorplan Studio editor (draw / snap / trace mode).
+- [x] Plan Phase B — Floorplan Studio editor at /studio/plan (draw / snap /
+      trace / multi-sheet / import-export); chaptered flights shipped with it.
 - [ ] Plan Phase C — you-are-here path + view cone on the plan.
 - [ ] Plan Phase D — SLAM pipeline (camera path + wall evidence from 360
       masters; GPS telemetry for outdoor sheets).

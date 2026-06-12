@@ -8,8 +8,8 @@ import { cn } from "@/lib/utils";
  * style and lets the viewer tap a zone to jump the flight there.
  */
 
-// Zone fills per kind, tuned for the cream plan card.
-const ZONE_FILL: Record<PlanZone["kind"], string> = {
+// Zone fills per kind, tuned for the cream plan card. (Shared with the Studio.)
+export const ZONE_FILL: Record<PlanZone["kind"], string> = {
   room: "#F5F0E6",
   structure: "#EFE8D8",
   outdoor: "#E5DAC6",
