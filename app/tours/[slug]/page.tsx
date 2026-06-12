@@ -4,6 +4,7 @@ import { TourViewer } from "@/components/tour/viewer";
 import { Container } from "@/components/ui/container";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { Section } from "@/components/ui/section";
+import { getPlan } from "@/data/plans";
 import { getTour, TOURS } from "@/data/tours";
 
 export function generateStaticParams() {
@@ -53,7 +54,11 @@ export default async function TourPage({
         </p>
 
         <div className="mt-10 overflow-hidden border border-paper/15">
-          <TourViewer tour={tour} className="aspect-[4/5] w-full sm:aspect-video" />
+          <TourViewer
+            tour={tour}
+            plan={getPlan(tour.slug)}
+            className="aspect-[4/5] w-full sm:aspect-video"
+          />
         </div>
 
         <p className="mt-6 font-sans text-xs uppercase tracking-[0.16em] text-paper/40">

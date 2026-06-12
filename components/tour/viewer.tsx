@@ -2,7 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
+import type { Plan, PlanZone } from "@/data/plans";
 import type { Tour, TourPano } from "@/data/tours";
+import { PlanPanel } from "@/components/tour/plan";
 import { cn } from "@/lib/utils";
 
 /**
@@ -33,7 +35,15 @@ type Engine = {
   video: HTMLVideoElement;
 };
 
-export function TourViewer({ tour, className }: { tour: Tour; className?: string }) {
+export function TourViewer({
+  tour,
+  plan,
+  className,
+}: {
+  tour: Tour;
+  plan?: Plan;
+  className?: string;
+}) {
   const mountRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const engineRef = useRef<Engine | null>(null);
@@ -54,6 +64,8 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
   const [author, setAuthor] = useState(false);
   const [marks, setMarks] = useState<AuthorMark[]>([]);
   const [copied, setCopied] = useState(false);
+  const [planOpen, setPlanOpen] = useState(false);
+  const [activeSheetId, setActiveSheetId] = useState(plan?.sheets[0]?.id ?? "");
 
   const startedRef = useRef(false);
   const motionOnRef = useRef(false);
@@ -449,6 +461,26 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
     setFading(false);
   }, []);
 
+  /** Jump the flight to a moment (leaving a pano first if needed). */
+  const seekFlight = useCallback(
+    async (t: number) => {
+      const engine = engineRef.current;
+      if (!engine) return;
+      if (panoRef.current) await resumeFlight();
+      engine.video.currentTime = t;
+      void engine.video.play();
+    },
+    [resumeFlight],
+  );
+
+  const handleZoneClick = useCallback(
+    (zone: PlanZone) => {
+      if (zone.panoId) void enterPano(zone.panoId);
+      else if (zone.videoTime !== undefined) void seekFlight(zone.videoTime);
+    },
+    [enterPano, seekFlight],
+  );
+
   // ---------- basic controls ----------
   const start = async () => {
     const video = videoRef.current;
@@ -638,6 +670,17 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
             )}
           </div>
           <div className="flex items-center gap-3">
+            {plan && (
+              <button
+                type="button"
+                onClick={() => setPlanOpen((o) => !o)}
+                aria-pressed={planOpen}
+                aria-label="Toggle plan"
+                className={cn(ctl, "w-auto gap-2 px-[1.4em]", planOpen && "border-champagne text-champagne")}
+              >
+                <span className="font-sans text-[clamp(0.625rem,0.8cqw,1rem)] uppercase tracking-[0.18em]">Plan</span>
+              </button>
+            )}
             {motionAvail && (
               <button
                 type="button"
@@ -657,6 +700,26 @@ export function TourViewer({ tour, className }: { tour: Tour; className?: string
               </button>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Living minimap */}
+      {plan && started && planOpen && (
+        <div className="absolute bottom-[clamp(4.5rem,6cqw,7rem)] right-4">
+          <PlanPanel
+            plan={plan}
+            activeSheetId={activeSheetId}
+            onSheetChange={setActiveSheetId}
+            activeZoneId={
+              pano
+                ? plan.sheets
+                    .flatMap((s) => s.zones)
+                    .find((z) => z.panoId === pano.id)?.id
+                : undefined
+            }
+            onZoneClick={handleZoneClick}
+            onClose={() => setPlanOpen(false)}
+          />
         </div>
       )}
 
