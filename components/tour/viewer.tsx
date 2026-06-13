@@ -34,7 +34,17 @@ type Engine = {
   camera: THREE.PerspectiveCamera;
   material: THREE.MeshBasicMaterial;
   videoTexture: THREE.VideoTexture;
-  look: { lon: number; lat: number; vLon: number; vLat: number; fov: number; dragging: boolean };
+  look: {
+    lon: number;
+    lat: number;
+    /** Manual pan offset added on top of the gyro (persists between drags). */
+    mlon: number;
+    mlat: number;
+    vLon: number;
+    vLat: number;
+    fov: number;
+    dragging: boolean;
+  };
   video: HTMLVideoElement;
 };
 
@@ -63,6 +73,10 @@ export function TourViewer({
   const [calibMsg, setCalibMsg] = useState<null | "hold" | "done">(null);
   const [motionNudge, setMotionNudge] = useState(false);
   const [fsAvail, setFsAvail] = useState(false);
+  /** iOS Safari has no element Fullscreen API — fall back to a CSS overlay. */
+  const [pseudoFs, setPseudoFs] = useState(false);
+  /** True while the real Fullscreen API is active (drives the exit icon). */
+  const [fsActive, setFsActive] = useState(false);
   const [failed, setFailed] = useState(false);
   const [fading, setFading] = useState(false);
   const [pano, setPano] = useState<TourPano | null>(null);
@@ -92,6 +106,15 @@ export function TourViewer({
   /** Each chapter remembers where the viewer left it. */
   const chapterTimesRef = useRef<Record<string, number>>({});
   const triedFallbackRef = useRef(false);
+  /** Device/browser capabilities, detected once on mount. */
+  const capsRef = useRef({
+    isIOS: false,
+    isAndroid: false,
+    isMobile: false,
+    browser: "other" as "safari" | "chrome" | "firefox" | "samsung" | "edge" | "other",
+    hasOrientation: false,
+    needsMotionPermission: false,
+  });
   motionOnRef.current = motionOn;
   panoRef.current = pano;
   authorRef.current = author;
@@ -105,9 +128,42 @@ export function TourViewer({
     const { signal } = ac;
 
     // ---------- capability detection ----------
-    const isTouch = "ontouchstart" in window || navigator.maxTouchPoints > 0;
-    setMotionAvail(isTouch && "DeviceOrientationEvent" in window);
-    setFsAvail(Boolean(document.fullscreenEnabled));
+    const ua = navigator.userAgent;
+    const isIOS =
+      /iP(hone|od|ad)/.test(ua) ||
+      // iPadOS 13+ reports as desktop Safari — sniff touch on a "Mac".
+      (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const isAndroid = /Android/.test(ua);
+    const coarse = window.matchMedia?.("(pointer: coarse)")?.matches ?? false;
+    const isMobile = isIOS || isAndroid || (coarse && navigator.maxTouchPoints > 0);
+    const browser: (typeof capsRef.current)["browser"] = /SamsungBrowser/.test(ua)
+      ? "samsung"
+      : /Edg/.test(ua)
+        ? "edge"
+        : /(CriOS|Chrome)/.test(ua)
+          ? "chrome"
+          : /(FxiOS|Firefox)/.test(ua)
+            ? "firefox"
+            : /Safari/.test(ua)
+              ? "safari"
+              : "other";
+    const hasOrientation = "DeviceOrientationEvent" in window;
+    const needsMotionPermission =
+      hasOrientation &&
+      typeof (DeviceOrientationEvent as unknown as { requestPermission?: unknown })
+        .requestPermission === "function";
+    capsRef.current = {
+      isIOS,
+      isAndroid,
+      isMobile,
+      browser,
+      hasOrientation,
+      needsMotionPermission,
+    };
+    // Motion is a phone affordance; fullscreen shows on mobile (real API or the
+    // CSS overlay) and on any desktop that supports the Fullscreen API.
+    setMotionAvail(isMobile && hasOrientation);
+    setFsAvail(isMobile || Boolean(document.fullscreenEnabled));
     setAuthor(new URLSearchParams(window.location.search).has("author"));
 
     // ---------- video ----------
@@ -162,7 +218,7 @@ export function TourViewer({
     scene.add(new THREE.Mesh(geometry, material));
 
     // ---------- look state ----------
-    const look = { lon: FRONT_LON, lat: 0, vLon: 0, vLat: 0, fov: 75, dragging: false };
+    const look = { lon: FRONT_LON, lat: 0, mlon: 0, mlat: 0, vLon: 0, vLat: 0, fov: 75, dragging: false };
     engineRef.current = { camera, material, videoTexture, look, video };
     const pointers = new Map<number, { x: number; y: number }>();
     let pinchDist = 0;
@@ -221,6 +277,10 @@ export function TourViewer({
 
         const phase = calibPhaseRef.current;
         if (phase === "kickoff") {
+          look.mlon = 0; // a new calibration clears any prior finger pan
+          look.mlat = 0;
+          look.vLon = 0;
+          look.vLat = 0;
           captureCalibration(); // provisional zero — no jump on engage
           calibPhaseRef.current = "waiting";
           calibDeadline = performance.now() + 8000;
@@ -252,6 +312,18 @@ export function TourViewer({
       },
       { signal },
     );
+
+    // Portrait↔landscape: the screen-angle term in the gyro math flips, so the
+    // captured reference no longer reads level. Silently re-run the few-second
+    // calibration for the new orientation ("a cal for each") whenever motion is
+    // live. Harmless when it isn't.
+    const onOrientationChange = () => {
+      if (!motionOnRef.current) return;
+      calibPhaseRef.current = "kickoff";
+      setCalibMsg("hold");
+    };
+    window.addEventListener("orientationchange", onOrientationChange, { signal });
+    screen.orientation?.addEventListener("change", onOrientationChange, { signal });
 
     // ---------- pointer controls ----------
     const el = renderer.domElement;
@@ -298,11 +370,19 @@ export function TourViewer({
         }
         const dx = cur.x - prev.x;
         const dy = cur.y - prev.y;
-        look.lon -= dx * DRAG_SPEED;
-        look.lat += dy * DRAG_SPEED;
         look.vLon = -dx * DRAG_SPEED;
         look.vLat = dy * DRAG_SPEED;
-        clampLat();
+        if (motionOnRef.current) {
+          // Gyro is live: the finger pans ON TOP of it. The offset persists, so
+          // releasing picks up exactly where you left off — the gyro keeps
+          // tracking relative to your nudge instead of fighting it.
+          look.mlon += look.vLon;
+          look.mlat = Math.max(-80, Math.min(80, look.mlat + look.vLat));
+        } else {
+          look.lon += look.vLon;
+          look.lat += look.vLat;
+          clampLat();
+        }
       },
       { signal },
     );
@@ -377,6 +457,7 @@ export function TourViewer({
     document.addEventListener(
       "fullscreenchange",
       () => {
+        setFsActive(Boolean(document.fullscreenElement));
         applySize();
         requestAnimationFrame(applySize);
       },
@@ -391,21 +472,29 @@ export function TourViewer({
     );
     renderer.setAnimationLoop(() => {
       const gyro = motionOnRef.current && orient.has;
-      if (!look.dragging && !gyro) {
-        look.lon += look.vLon;
-        look.lat += look.vLat;
+      // Inertia after a flick. In gyro mode it decays the MANUAL offset (the
+      // gyro itself is absolute); in drag mode it decays the view directly.
+      if (!look.dragging) {
+        if (gyro) {
+          look.mlon += look.vLon;
+          look.mlat = Math.max(-80, Math.min(80, look.mlat + look.vLat));
+        } else {
+          look.lon += look.vLon;
+          look.lat += look.vLat;
+          clampLat();
+        }
         look.vLon *= 0.92;
         look.vLat *= 0.92;
-        clampLat();
       }
       camera.fov += (look.fov - camera.fov) * 0.2;
       camera.updateProjectionMatrix();
 
       if (gyro) {
         // Horizon-locked gyro: take the device's forward vector, convert to
-        // lon/lat, subtract the calibration offsets on BOTH axes, then render
-        // through the same lookAt path as drag. Roll is intentionally dropped
-        // so the horizon stays flat — comfortable, and standard for 360 tours.
+        // lon/lat, subtract the calibration offsets on BOTH axes, then ADD the
+        // manual pan offset, and render through the same lookAt path as drag.
+        // Roll is intentionally dropped so the horizon stays flat — comfortable,
+        // and standard for 360 tours.
         euler.set(orient.beta, orient.alpha, -orient.gamma, "YXZ");
         qDevice.setFromEuler(euler);
         qDevice.multiply(qWorld);
@@ -413,8 +502,8 @@ export function TourViewer({
         fwd.set(0, 0, -1).applyQuaternion(qDevice);
         const latDev = (Math.asin(Math.max(-1, Math.min(1, fwd.y))) * 180) / Math.PI;
         const lonDev = (Math.atan2(fwd.z, fwd.x) * 180) / Math.PI;
-        look.lon = lonDev - calibLonRef.current;
-        look.lat = Math.max(-85, Math.min(85, latDev - calibLatRef.current));
+        look.lon = lonDev - calibLonRef.current + look.mlon;
+        look.lat = Math.max(-85, Math.min(85, latDev - calibLatRef.current + look.mlat));
       }
       const phi = THREE.MathUtils.degToRad(90 - look.lat);
       const theta = THREE.MathUtils.degToRad(look.lon);
@@ -590,6 +679,22 @@ export function TourViewer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tour.slug]);
 
+  // CSS pseudo-fullscreen (iOS): lock body scroll and allow Esc to exit while
+  // the overlay is up. The real Fullscreen API handles both itself.
+  useEffect(() => {
+    if (!pseudoFs) return;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setPseudoFs(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [pseudoFs]);
+
   // ---------- pano transitions ----------
   const loadPano = useCallback((p: TourPano): Promise<THREE.Texture> => {
     const cached = panoCache.current.get(p.id);
@@ -719,31 +824,98 @@ export function TourViewer({
   );
 
   // ---------- basic controls ----------
-  const start = async () => {
+
+  /**
+   * Go immersive on the Play tap. Android + desktop use the real Fullscreen
+   * API; iOS Safari has none for non-video elements, so it gets a CSS overlay
+   * that fills the viewport (pseudoFs). Orientation lock is best-effort.
+   */
+  const enterImmersive = () => {
+    const caps = capsRef.current;
+    const host = mountRef.current?.parentElement;
+    if (!host) return;
+    const useApi =
+      !caps.isIOS &&
+      document.fullscreenEnabled &&
+      typeof host.requestFullscreen === "function";
+    if (useApi) {
+      host.requestFullscreen().then(
+        () => {
+          const so = screen.orientation as unknown as {
+            lock?: (o: string) => Promise<void>;
+            type?: string;
+          };
+          if (so?.lock && so.type) so.lock(so.type).catch(() => {});
+        },
+        () => setPseudoFs(true), // API rejected → fall back to the overlay
+      );
+    } else if (caps.isMobile) {
+      setPseudoFs(true);
+    }
+  };
+
+  const exitImmersive = () => {
+    if (document.fullscreenElement) void document.exitFullscreen();
+    setPseudoFs(false);
+    (screen.orientation as unknown as { unlock?: () => void })?.unlock?.();
+  };
+
+  /**
+   * The single entry gesture. One tap means the phone is in the orientation the
+   * viewer wants, so we: request iOS motion permission (must be IN the gesture),
+   * play the video, go fullscreen on mobile, then auto-engage Motion and run the
+   * few-second calibration. Every gesture-gated call fires synchronously — no
+   * await between them — to preserve iOS's transient user activation.
+   */
+  const start = () => {
     const video = videoRef.current;
+    const caps = capsRef.current;
     if (!video) return;
     setLoading(true);
-    try {
-      await video.play();
-      startedRef.current = true;
-      setStarted(true);
-      setHint(true);
-      setTimeout(() => setHint(false), 4500);
-      // A few seconds in, nudge phone users toward Motion (iOS requires the
-      // tap — sensors can't auto-start without a user gesture).
-      if (motionAvail) {
+
+    // 1. iOS motion permission — synchronous, first, inside the gesture.
+    const doe = DeviceOrientationEvent as unknown as {
+      requestPermission?: () => Promise<string>;
+    };
+    const permP: Promise<boolean> =
+      caps.needsMotionPermission && doe.requestPermission
+        ? doe.requestPermission().then((r) => r === "granted").catch(() => false)
+        : Promise.resolve(caps.hasOrientation);
+
+    // 2. play the video, and 3. go fullscreen on mobile — still in the gesture.
+    const playP = video.play();
+    if (caps.isMobile) enterImmersive();
+
+    playP.then(
+      () => {
+        startedRef.current = true;
+        setStarted(true);
+        setLoading(false);
+        setHint(true);
+        setTimeout(() => setHint(false), 4500);
+      },
+      () => {
+        setFailed(true);
+        setLoading(false);
+      },
+    );
+
+    // 4. once permission settles, auto-engage Motion + calibrate (mobile only).
+    permP.then((granted) => {
+      if (granted && caps.isMobile) {
+        setMotionNudge(false);
+        calibPhaseRef.current = "kickoff";
+        setMotionOn(true);
+      } else if (caps.isMobile && caps.hasOrientation) {
+        // Sensors exist but were declined — fall back to drag, nudge later.
         setTimeout(() => {
           if (!motionOnRef.current) {
             setMotionNudge(true);
             setTimeout(() => setMotionNudge(false), 5000);
           }
-        }, 5000);
+        }, 4000);
       }
-    } catch {
-      setFailed(true);
-    } finally {
-      setLoading(false);
-    }
+    });
   };
 
   const togglePlay = () => {
@@ -760,8 +932,9 @@ export function TourViewer({
       setCalibMsg(null);
       return;
     }
-    type IOSOrientation = { requestPermission?: () => Promise<string> };
-    const doe = DeviceOrientationEvent as unknown as IOSOrientation;
+    const doe = DeviceOrientationEvent as unknown as {
+      requestPermission?: () => Promise<string>;
+    };
     try {
       if (typeof doe.requestPermission === "function") {
         const res = await doe.requestPermission();
@@ -776,10 +949,18 @@ export function TourViewer({
   };
 
   const toggleFullscreen = () => {
+    if (document.fullscreenElement || pseudoFs) {
+      exitImmersive();
+      return;
+    }
+    const caps = capsRef.current;
     const host = mountRef.current?.parentElement;
     if (!host) return;
-    if (document.fullscreenElement) void document.exitFullscreen();
-    else void host.requestFullscreen();
+    if (!caps.isIOS && document.fullscreenEnabled && host.requestFullscreen) {
+      void host.requestFullscreen();
+    } else {
+      setPseudoFs(true);
+    }
   };
 
   const copyMarks = async () => {
@@ -830,7 +1011,14 @@ export function TourViewer({
     "flex h-[clamp(2.5rem,3cqw,4.25rem)] w-[clamp(2.5rem,3cqw,4.25rem)] items-center justify-center rounded-full border border-paper/40 text-[clamp(0.875rem,1cqw,1.35rem)] text-paper/90 backdrop-blur-sm transition-colors hover:border-champagne hover:text-champagne";
 
   return (
-    <div className={cn("relative overflow-hidden bg-ink [container-type:inline-size]", className)}>
+    <div
+      className={cn(
+        "relative overflow-hidden bg-ink [container-type:inline-size]",
+        // iOS pseudo-fullscreen: fill the viewport above the page chrome.
+        pseudoFs && "fixed inset-0 z-[60] !rounded-none",
+        className,
+      )}
+    >
       <div
         ref={mountRef}
         tabIndex={0}
@@ -945,7 +1133,9 @@ export function TourViewer({
               ? "Calibrated"
               : motionNudge
                 ? "Steer with your phone — tap Motion"
-                : "Drag to look · tap a gold ring to step inside"}
+                : motionOn
+                  ? "Move your phone to look · drag to pan · tap a gold ring"
+                  : "Drag to look · tap a gold ring to step inside"}
         </span>
       </div>
 
@@ -1015,9 +1205,18 @@ export function TourViewer({
               </button>
             )}
             {fsAvail && (
-              <button type="button" onClick={toggleFullscreen} aria-label="Fullscreen" className={ctl}>
+              <button
+                type="button"
+                onClick={toggleFullscreen}
+                aria-label={fsActive || pseudoFs ? "Exit fullscreen" : "Fullscreen"}
+                className={cn(ctl, (fsActive || pseudoFs) && "border-champagne text-champagne")}
+              >
                 <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-                  <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+                  {fsActive || pseudoFs ? (
+                    <path d="M9 5v3a1 1 0 0 1-1 1H5m14 0h-3a1 1 0 0 1-1-1V5m0 14v-3a1 1 0 0 1 1-1h3M5 15h3a1 1 0 0 1 1 1v3" />
+                  ) : (
+                    <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+                  )}
                 </svg>
               </button>
             )}
