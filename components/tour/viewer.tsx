@@ -489,6 +489,10 @@ export function TourViewer({
     // ---------- render loop ----------
     const hsWorld = new THREE.Vector3();
     const hsCam = new THREE.Vector3();
+    // Smoothed on-screen pixel position per hotspot, so a fast-moving ring
+    // glides to its spot instead of jittering — a calmer, easier tap target.
+    const hsScreen = new Map<string, { x: number; y: number; set: boolean }>();
+    const EDGE = 0.86; // pin off-screen rings to ±86% of the frame, still tappable
     const flatHotspots = tour.chapters.flatMap((ch, ci) =>
       ch.hotspots.map((hs) => ({ ci, hs, key: `${ch.id}:${hs.id}` })),
     );
@@ -615,7 +619,7 @@ export function TourViewer({
           yawDeg = norm180(bearing - worldPose.heading);
           pitchDeg =
             (Math.atan2((hs.anchor.h ?? 1) - CAMERA_HEIGHT_M, Math.max(dist, 0.1)) * 180) / Math.PI;
-          ringScale = Math.min(1.15, Math.max(0.42, 2.6 / Math.max(dist, 0.4)));
+          ringScale = Math.min(1.15, Math.max(0.62, 2.6 / Math.max(dist, 0.4)));
           visible = inChapter && gated;
         } else if (hs.yaw !== undefined && hs.pitch !== undefined) {
           // Legacy timed mode: fixed frame-relative direction in a window.
@@ -632,21 +636,53 @@ export function TourViewer({
             490 * Math.sin(phi) * Math.sin(theta),
           );
           hsCam.copy(hsWorld).applyMatrix4(camera.matrixWorldInverse);
-          if (hsCam.z > -2) {
-            // Behind or beside the viewer — at ~90° off-axis the projection
-            // divides by ~0 and explodes to astronomic coordinates.
-            visible = false;
-          } else {
+
+          // Resolve a target NDC position, pinning to a frame edge rather than
+          // vanishing when the room is off-screen or behind — so every room
+          // stays a reachable tap target the whole flight.
+          let nx: number;
+          let ny: number;
+          let clamped = false;
+          if (hsCam.z < -2) {
             hsWorld.project(camera);
-            if (Math.abs(hsWorld.x) > 1.15 || Math.abs(hsWorld.y) > 1.15) {
-              visible = false; // outside the viewport (plus a small margin)
-            } else {
-              const x = (hsWorld.x * 0.5 + 0.5) * w;
-              const y = (-hsWorld.y * 0.5 + 0.5) * h;
-              node.style.transform = `translate(-50%, -50%) translate(${x}px, ${y}px)`;
-              node.style.scale = String(ringScale);
+            nx = hsWorld.x;
+            ny = hsWorld.y;
+            if (Math.abs(nx) > EDGE || Math.abs(ny) > EDGE) {
+              const k = EDGE / Math.max(Math.abs(nx), Math.abs(ny));
+              nx *= k;
+              ny *= k;
+              clamped = true;
             }
+          } else {
+            // Beside/behind: projection is degenerate, so pin to the edge on the
+            // room's side (camera-space x/y carry the true direction).
+            nx = (hsCam.x >= 0 ? 1 : -1) * EDGE;
+            ny = Math.max(-EDGE, Math.min(EDGE, (hsCam.y / Math.max(Math.abs(hsCam.x), 1)) * EDGE));
+            clamped = true;
           }
+
+          const tx = (nx * 0.5 + 0.5) * w;
+          const ty = (-ny * 0.5 + 0.5) * h;
+          // Glide to the target; snap on first show or a big jump (edge flip).
+          let sm = hsScreen.get(key);
+          if (!sm) {
+            sm = { x: tx, y: ty, set: true };
+            hsScreen.set(key, sm);
+          } else if (!sm.set || Math.hypot(tx - sm.x, ty - sm.y) > Math.max(w, h) * 0.5) {
+            sm.x = tx;
+            sm.y = ty;
+            sm.set = true;
+          } else {
+            sm.x += (tx - sm.x) * 0.22;
+            sm.y += (ty - sm.y) * 0.22;
+          }
+          node.style.transform = `translate(-50%, -50%) translate(${sm.x}px, ${sm.y}px)`;
+          // Scale the VISUAL ring only (via --rs); the button keeps a fixed,
+          // generous tap area. Edge-pinned rings hold a steady, easy size.
+          node.style.setProperty("--rs", String(clamped ? 0.7 : ringScale));
+        } else {
+          const sm = hsScreen.get(key);
+          if (sm) sm.set = false; // re-snap cleanly next time it appears
         }
         node.style.opacity = visible ? "1" : "0";
         node.style.pointerEvents = visible ? "auto" : "none";
@@ -1046,7 +1082,12 @@ export function TourViewer({
         tabIndex={0}
         role="application"
         aria-label="360 degree flight viewer. Drag, use arrow keys, or enable motion to look around."
-        className="absolute inset-0 outline-none"
+        className={cn(
+          "absolute inset-0 outline-none transition-[transform,filter] duration-300 ease-out",
+          // Warp: the scene pushes in + softens behind the ink during a
+          // transition (enter a room, resume, switch chapter), then settles.
+          fading ? "scale-[1.06] blur-[1.5px]" : "scale-100 blur-0",
+        )}
       />
 
       {/* Hotspots — projected into the world each frame (all chapters; only
@@ -1068,11 +1109,15 @@ export function TourViewer({
               type="button"
               onClick={() => void enterPano(hs.panoId)}
               aria-label={`Step into ${hs.label}`}
-              className="group relative flex h-[clamp(3rem,4.5cqw,7.5rem)] w-[clamp(3rem,4.5cqw,7.5rem)] items-center justify-center"
+              className="group relative flex h-[clamp(3.5rem,5cqw,7.5rem)] w-[clamp(3.5rem,5cqw,7.5rem)] items-center justify-center"
             >
-              <span className="absolute inset-0 rounded-full border border-champagne/50 motion-safe:animate-ping" />
-              <span className="relative flex h-[72%] w-[72%] items-center justify-center rounded-full border border-champagne bg-ink/40 text-champagne backdrop-blur-sm transition-transform duration-300 group-hover:scale-110">
-                <span className="h-[14%] w-[14%] rounded-full bg-champagne" />
+              {/* Only the ring visual scales with distance (--rs, set by the
+                  render loop); the button above stays a fixed, easy tap target. */}
+              <span className="relative flex h-full w-full items-center justify-center [scale:var(--rs,1)]">
+                <span className="absolute inset-0 rounded-full border border-champagne/50 motion-safe:animate-ping" />
+                <span className="relative flex h-[72%] w-[72%] items-center justify-center rounded-full border border-champagne bg-ink/40 text-champagne backdrop-blur-sm transition-transform duration-300 group-hover:scale-110">
+                  <span className="h-[14%] w-[14%] rounded-full bg-champagne" />
+                </span>
               </span>
             </button>
             <span className="rounded-full bg-ink/60 px-[1.3em] py-[0.45em] font-sans text-[clamp(0.625rem,1cqw,1.25rem)] uppercase tracking-[0.18em] text-paper/90 backdrop-blur-sm">

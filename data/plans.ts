@@ -91,11 +91,13 @@ export const PLANS: Plan[] = [
           [[12, 0], [12, 2.5]],
         ],
         zones: [
-          { id: "foyer", label: "Grand Foyer", kind: "room", points: [[1.5, 6], [7, 6], [7, 10], [1.5, 10]], videoTime: 1 },
-          { id: "kitchen", label: "Kitchen", kind: "room", points: [[0, 0], [7, 0], [7, 6], [0, 6]], videoTime: 5 },
+          // Rooms carry a panoId → a floorplan tap warps into the static 360
+          // (pausing the flight). videoTime stays as a fallback + dot anchor.
+          { id: "foyer", label: "Grand Foyer", kind: "room", points: [[1.5, 6], [7, 6], [7, 10], [1.5, 10]], panoId: "foyer", videoTime: 1 },
+          { id: "kitchen", label: "Kitchen", kind: "room", points: [[0, 0], [7, 0], [7, 6], [0, 6]], panoId: "kitchen", videoTime: 5 },
           { id: "hall", label: "Hall", kind: "room", points: [[7, 2], [9.5, 2], [9.5, 4], [7, 4]], videoTime: 11 },
-          { id: "bath", label: "Master Bath", kind: "room", points: [[9.5, 0], [12, 0], [12, 2.5], [9.5, 2.5]], videoTime: 15.5 },
-          { id: "suite", label: "Primary Suite", kind: "room", points: [[9.5, 2.5], [12, 2.5], [12, 0], [16, 0], [16, 7], [9.5, 7]], videoTime: 19 },
+          { id: "bath", label: "Master Bath", kind: "room", points: [[9.5, 0], [12, 0], [12, 2.5], [9.5, 2.5]], panoId: "bath", videoTime: 15.5 },
+          { id: "suite", label: "Primary Suite", kind: "room", points: [[9.5, 2.5], [12, 2.5], [12, 0], [16, 0], [16, 7], [9.5, 7]], panoId: "suite", videoTime: 19 },
           // furniture footprints — visual detail only
           { id: "island", label: "", kind: "structure", points: [[2.3, 2.45], [4.7, 2.45], [4.7, 3.55], [2.3, 3.55]] },
           { id: "bed", label: "", kind: "structure", points: [[11.9, 4.6], [14.1, 4.6], [14.1, 6.6], [11.9, 6.6]] },
