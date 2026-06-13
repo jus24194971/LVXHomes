@@ -84,8 +84,9 @@ export function TourViewer({
   const chapterIdxRef = useRef(0);
   const activeSheetIdRef = useRef("");
   const planIndicatorRef = useRef<SVGGElement | null>(null);
-  /** Heading reference captured at gyro calibration (degrees, lon-space). */
-  const calibLonRef = useRef(FRONT_LON);
+  /** Heading + pitch offsets captured at gyro calibration (degrees). */
+  const calibLonRef = useRef(0);
+  const calibLatRef = useRef(0);
   /** Gyro calibration phase: request → provisional zero → steady lock. */
   const calibPhaseRef = useRef<"off" | "kickoff" | "waiting" | "done">("off");
   /** Each chapter remembers where the viewer left it. */
@@ -176,8 +177,8 @@ export function TourViewer({
     const euler = new THREE.Euler();
     const qScreen = new THREE.Quaternion();
     const qWorld = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
-    const qYaw = new THREE.Quaternion();
-    const yAxis = new THREE.Vector3(0, 1, 0);
+    const qDevice = new THREE.Quaternion();
+    const fwd = new THREE.Vector3();
     const screenAngle = () =>
       THREE.MathUtils.degToRad(
         (screen.orientation?.angle ??
@@ -199,11 +200,13 @@ export function TourViewer({
       calQ.multiply(qWorld);
       calQ.multiply(qScreen.setFromAxisAngle(zee, -screenAngle()));
       calV.set(0, 0, -1).applyQuaternion(calQ);
+      const latDev = (Math.asin(Math.max(-1, Math.min(1, calV.y))) * 180) / Math.PI;
       const lonDev = (Math.atan2(calV.z, calV.x) * 180) / Math.PI;
-      // With qYaw built against this reference, the final view lon equals
-      // look.lon at the capture instant — engage/recalibrate never jumps.
-      calibLonRef.current = lonDev;
-      look.lon = FRONT_LON + norm180(look.lon - FRONT_LON); // keep lon tidy
+      // Heading offset preserves the current view lon (no horizontal jump on
+      // engage); pitch offset zeroes against THIS pose so the rest position
+      // reads level on any device — the fix for Android's floor-facing tilt.
+      calibLonRef.current = lonDev - look.lon;
+      calibLatRef.current = latDev;
     };
     const steadyBuf: { t: number; a: number; b: number; g: number }[] = [];
     let calibDeadline = 0;
@@ -387,7 +390,8 @@ export function TourViewer({
       ch.hotspots.map((hs) => ({ ci, hs, key: `${ch.id}:${hs.id}` })),
     );
     renderer.setAnimationLoop(() => {
-      if (!look.dragging) {
+      const gyro = motionOnRef.current && orient.has;
+      if (!look.dragging && !gyro) {
         look.lon += look.vLon;
         look.lat += look.vLat;
         look.vLon *= 0.92;
@@ -397,25 +401,28 @@ export function TourViewer({
       camera.fov += (look.fov - camera.fov) * 0.2;
       camera.updateProjectionMatrix();
 
-      if (motionOnRef.current && orient.has) {
+      if (gyro) {
+        // Horizon-locked gyro: take the device's forward vector, convert to
+        // lon/lat, subtract the calibration offsets on BOTH axes, then render
+        // through the same lookAt path as drag. Roll is intentionally dropped
+        // so the horizon stays flat — comfortable, and standard for 360 tours.
         euler.set(orient.beta, orient.alpha, -orient.gamma, "YXZ");
-        camera.quaternion.setFromEuler(euler);
-        camera.quaternion.multiply(qWorld);
-        camera.quaternion.multiply(qScreen.setFromAxisAngle(zee, -screenAngle()));
-        qYaw.setFromAxisAngle(
-          yAxis,
-          THREE.MathUtils.degToRad(-(look.lon - calibLonRef.current)),
-        );
-        camera.quaternion.premultiply(qYaw);
-      } else {
-        const phi = THREE.MathUtils.degToRad(90 - look.lat);
-        const theta = THREE.MathUtils.degToRad(look.lon);
-        camera.lookAt(
-          500 * Math.sin(phi) * Math.cos(theta),
-          500 * Math.cos(phi),
-          500 * Math.sin(phi) * Math.sin(theta),
-        );
+        qDevice.setFromEuler(euler);
+        qDevice.multiply(qWorld);
+        qDevice.multiply(qScreen.setFromAxisAngle(zee, -screenAngle()));
+        fwd.set(0, 0, -1).applyQuaternion(qDevice);
+        const latDev = (Math.asin(Math.max(-1, Math.min(1, fwd.y))) * 180) / Math.PI;
+        const lonDev = (Math.atan2(fwd.z, fwd.x) * 180) / Math.PI;
+        look.lon = lonDev - calibLonRef.current;
+        look.lat = Math.max(-85, Math.min(85, latDev - calibLatRef.current));
       }
+      const phi = THREE.MathUtils.degToRad(90 - look.lat);
+      const theta = THREE.MathUtils.degToRad(look.lon);
+      camera.lookAt(
+        500 * Math.sin(phi) * Math.cos(theta),
+        500 * Math.cos(phi),
+        500 * Math.sin(phi) * Math.sin(theta),
+      );
       camera.updateMatrixWorld();
 
       // Project hotspots into the viewport (video mode only).
