@@ -39,6 +39,9 @@ export function PinStudio() {
   const [duration, setDuration] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [fps, setFps] = useState(30);
+  const fpsRef = useRef(30);
+  fpsRef.current = fps;
 
   const [phase, setPhase] = useState<Phase>("start");
   const [confirmed, setConfirmed] = useState<string[]>([]);
@@ -162,6 +165,45 @@ export function PinStudio() {
     if (v.paused) void v.play();
     else v.pause();
   }, []);
+  // Step exactly N frames, snapped to the frame grid (pauses first so the frame
+  // holds). The +half-frame nudge lands inside the target frame, not on its
+  // ambiguous boundary, so each press reliably advances one frame.
+  const stepFrames = useCallback((n: number) => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (!v.paused) v.pause();
+    const f = fpsRef.current || 30;
+    const idx = Math.round(v.currentTime * f);
+    // Land just inside the target frame (1ms past its boundary) so the decoder
+    // shows that frame; small enough to stay reversible across ←/→.
+    const target = (idx + n) / f + 0.001;
+    v.currentTime = Math.max(0, Math.min(v.duration || target, target));
+  }, []);
+
+  // Keyboard scrubbing: ←/→ step one frame, Shift+←/→ jump 10, Space plays.
+  // Ignored while typing a room name so those arrows still move the caret.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = document.activeElement as HTMLElement | null;
+      const tag = el?.tagName;
+      const inField =
+        (tag === "INPUT" && (el as HTMLInputElement).type !== "range") ||
+        tag === "TEXTAREA" ||
+        el?.isContentEditable === true;
+      if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+        if (inField) return;
+        e.preventDefault();
+        const dir = e.key === "ArrowRight" ? 1 : -1;
+        stepFrames(dir * (e.shiftKey ? 10 : 1));
+      } else if (e.code === "Space") {
+        if (inField || tag === "BUTTON") return;
+        e.preventDefault();
+        togglePlay();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [stepFrames, togglePlay]);
 
   // ---------- guided flow ----------
   const newId = () =>
@@ -373,12 +415,33 @@ export function PinStudio() {
         <button type="button" onClick={togglePlay} className={ctl} aria-label={playing ? "Pause" : "Play"}>
           {playing ? "❚❚" : "►"}
         </button>
-        <button type="button" onClick={() => seek(time - 1 / 30)} className={ctl}>‹ frame</button>
-        <button type="button" onClick={() => seek(time + 1 / 30)} className={ctl}>frame ›</button>
+        <button type="button" onClick={() => stepFrames(-1)} className={ctl} aria-label="Previous frame">‹ frame</button>
+        <button type="button" onClick={() => stepFrames(1)} className={ctl} aria-label="Next frame">frame ›</button>
         <span className="ml-1 font-mono text-xs tabular-nums text-paper/60">
           {fmt(time)} / {fmt(duration || 0)}
         </span>
+        <div className="ml-auto flex items-center gap-1">
+          <span className="font-sans text-[0.65rem] uppercase tracking-[0.14em] text-paper/40">fps</span>
+          {[24, 30, 60].map((f) => (
+            <button
+              key={f}
+              type="button"
+              onClick={() => setFps(f)}
+              className={cn(
+                "rounded-full border px-2 py-1 font-mono text-[0.7rem] transition-colors",
+                fps === f ? "border-champagne text-champagne" : "border-paper/25 text-paper/60 hover:text-paper",
+              )}
+            >
+              {f}
+            </button>
+          ))}
+        </div>
       </div>
+      <p className="mt-1.5 font-sans text-[0.7rem] text-paper/40">
+        <kbd className="text-paper/60">←</kbd> / <kbd className="text-paper/60">→</kbd> step a frame ·{" "}
+        <kbd className="text-paper/60">Shift</kbd> + arrows jump 10 ·{" "}
+        <kbd className="text-paper/60">Space</kbd> play/pause
+      </p>
       <div className="relative mt-2">
         <input
           type="range"
