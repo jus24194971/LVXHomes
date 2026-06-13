@@ -190,11 +190,14 @@ export function PinStudio() {
         (tag === "INPUT" && (el as HTMLInputElement).type !== "range") ||
         tag === "TEXTAREA" ||
         el?.isContentEditable === true;
-      if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+      // ←/→ or ,/. (the NLE convention) step frames. e.code is layout-stable,
+      // so Shift+,/. (which yield </>) still register.
+      const fwd = e.key === "ArrowRight" || e.code === "Period";
+      const back = e.key === "ArrowLeft" || e.code === "Comma";
+      if (fwd || back) {
         if (inField) return;
         e.preventDefault();
-        const dir = e.key === "ArrowRight" ? 1 : -1;
-        stepFrames(dir * (e.shiftKey ? 10 : 1));
+        stepFrames((fwd ? 1 : -1) * (e.shiftKey ? 10 : 1));
       } else if (e.code === "Space") {
         if (inField || tag === "BUTTON") return;
         e.preventDefault();
@@ -438,8 +441,9 @@ export function PinStudio() {
         </div>
       </div>
       <p className="mt-1.5 font-sans text-[0.7rem] text-paper/40">
-        <kbd className="text-paper/60">←</kbd> / <kbd className="text-paper/60">→</kbd> step a frame ·{" "}
-        <kbd className="text-paper/60">Shift</kbd> + arrows jump 10 ·{" "}
+        <kbd className="text-paper/60">←</kbd> <kbd className="text-paper/60">→</kbd> or{" "}
+        <kbd className="text-paper/60">,</kbd> <kbd className="text-paper/60">.</kbd> step a frame ·{" "}
+        <kbd className="text-paper/60">Shift</kbd> jumps 10 ·{" "}
         <kbd className="text-paper/60">Space</kbd> play/pause
       </p>
       <div className="relative mt-2">
