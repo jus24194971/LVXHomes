@@ -919,11 +919,11 @@ export function TourViewer({
   };
 
   /**
-   * The single entry gesture. One tap means the phone is in the orientation the
-   * viewer wants, so we: request iOS motion permission (must be IN the gesture),
-   * play the video, go fullscreen on mobile, then auto-engage Motion and run the
-   * few-second calibration. Every gesture-gated call fires synchronously — no
-   * await between them — to preserve iOS's transient user activation.
+   * The entry gesture: play the video and go fullscreen on mobile. Thumb-drag
+   * is the default way to look around — far less fiddly than gyro for actually
+   * steering. VR/motion stays OPT-IN behind its button (which requests the iOS
+   * permission in its own gesture), so we neither prompt nor engage it here; we
+   * just surface a gentle one-time hint that the option exists.
    */
   const start = () => {
     const video = videoRef.current;
@@ -931,16 +931,7 @@ export function TourViewer({
     if (!video) return;
     setLoading(true);
 
-    // 1. iOS motion permission — synchronous, first, inside the gesture.
-    const doe = DeviceOrientationEvent as unknown as {
-      requestPermission?: () => Promise<string>;
-    };
-    const permP: Promise<boolean> =
-      caps.needsMotionPermission && doe.requestPermission
-        ? doe.requestPermission().then((r) => r === "granted").catch(() => false)
-        : Promise.resolve(caps.hasOrientation);
-
-    // 2. play the video, and 3. go fullscreen on mobile — still in the gesture.
+    // Both gesture-gated; fire synchronously so mobile honors the activation.
     const playP = video.play();
     if (caps.isMobile) enterImmersive();
 
@@ -951,29 +942,21 @@ export function TourViewer({
         setLoading(false);
         setHint(true);
         setTimeout(() => setHint(false), 4500);
+        // One-time nudge that VR/motion is available — drag remains default.
+        if (caps.isMobile && caps.hasOrientation) {
+          setTimeout(() => {
+            if (!motionOnRef.current) {
+              setMotionNudge(true);
+              setTimeout(() => setMotionNudge(false), 5000);
+            }
+          }, 5000);
+        }
       },
       () => {
         setFailed(true);
         setLoading(false);
       },
     );
-
-    // 4. once permission settles, auto-engage Motion + calibrate (mobile only).
-    permP.then((granted) => {
-      if (granted && caps.isMobile) {
-        setMotionNudge(false);
-        calibPhaseRef.current = "kickoff";
-        setMotionOn(true);
-      } else if (caps.isMobile && caps.hasOrientation) {
-        // Sensors exist but were declined — fall back to drag, nudge later.
-        setTimeout(() => {
-          if (!motionOnRef.current) {
-            setMotionNudge(true);
-            setTimeout(() => setMotionNudge(false), 5000);
-          }
-        }, 4000);
-      }
-    });
   };
 
   const togglePlay = () => {
@@ -1199,7 +1182,7 @@ export function TourViewer({
             : calibMsg === "done"
               ? "Calibrated"
               : motionNudge
-                ? "Steer with your phone — tap Motion"
+                ? "Prefer to look by moving your phone? Tap VR"
                 : motionOn
                   ? "Move your phone to look · drag to pan · tap a gold ring"
                   : "Drag to look · tap a gold ring to step inside"}
@@ -1265,10 +1248,13 @@ export function TourViewer({
                 type="button"
                 onClick={toggleMotion}
                 aria-pressed={motionOn}
-                aria-label="Toggle device motion"
+                aria-label={motionOn ? "Disable VR motion view" : "Enable VR motion view — move your phone to look around"}
                 className={cn(ctl, "w-auto gap-2 px-[1.4em]", motionOn && "border-champagne text-champagne")}
               >
-                <span className="font-sans text-[clamp(0.625rem,0.8cqw,1rem)] uppercase tracking-[0.18em]">Motion</span>
+                <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+                  <path d="M3 9.5A2.5 2.5 0 0 1 5.5 7h13A2.5 2.5 0 0 1 21 9.5v5a2.5 2.5 0 0 1-2.5 2.5h-3.2a2 2 0 0 1-1.6-.8l-.9-1.2a1 1 0 0 0-1.6 0l-.9 1.2a2 2 0 0 1-1.6.8H5.5A2.5 2.5 0 0 1 3 14.5z" />
+                </svg>
+                <span className="font-sans text-[clamp(0.625rem,0.8cqw,1rem)] uppercase tracking-[0.18em]">VR</span>
               </button>
             )}
             {fsAvail && (
