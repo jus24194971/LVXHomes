@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import type { Plan, PlanZone } from "@/data/plans";
-import type { Tour, TourPano } from "@/data/tours";
+import type { Tour, TourPano, TourHotspot } from "@/data/tours";
 import { PlanPanel } from "@/components/tour/plan";
 import { cn } from "@/lib/utils";
 
@@ -28,7 +28,6 @@ const CAMERA_HEIGHT_M = 1.35;
 const norm180 = (d: number) => ((((d + 180) % 360) + 360) % 360) - 180;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-type AuthorMark = { chapter: string; time: number; yaw: number; pitch: number };
 
 type Engine = {
   camera: THREE.PerspectiveCamera;
@@ -81,7 +80,11 @@ export function TourViewer({
   const [fading, setFading] = useState(false);
   const [pano, setPano] = useState<TourPano | null>(null);
   const [author, setAuthor] = useState(false);
-  const [marks, setMarks] = useState<AuthorMark[]>([]);
+  /** Keyframed flight rings being authored (?author=1). */
+  const [rings, setRings] = useState<TourHotspot[]>([]);
+  const [activeRing, setActiveRing] = useState<string | null>(null);
+  const [authTime, setAuthTime] = useState(0);
+  const [authDur, setAuthDur] = useState(0);
   const [pathMarks, setPathMarks] = useState<
     Record<string, Record<string, { t: number; x: number; y: number }[]>>
   >({});
@@ -95,6 +98,8 @@ export function TourViewer({
   const motionOnRef = useRef(false);
   const panoRef = useRef<TourPano | null>(null);
   const authorRef = useRef(false);
+  const ringsRef = useRef<TourHotspot[]>([]);
+  const activeRingRef = useRef<string | null>(null);
   const chapterIdxRef = useRef(0);
   const activeSheetIdRef = useRef("");
   const planIndicatorRef = useRef<SVGGElement | null>(null);
@@ -118,6 +123,8 @@ export function TourViewer({
   motionOnRef.current = motionOn;
   panoRef.current = pano;
   authorRef.current = author;
+  ringsRef.current = rings;
+  activeRingRef.current = activeRing;
   chapterIdxRef.current = chapterIdx;
   activeSheetIdRef.current = activeSheetId;
 
@@ -178,6 +185,10 @@ export function TourViewer({
     videoRef.current = video;
     video.addEventListener("playing", () => setPlaying(true), { signal });
     video.addEventListener("pause", () => setPlaying(false), { signal });
+    // Author scrub readout (cheap; only surfaced in the authoring panel).
+    video.addEventListener("timeupdate", () => setAuthTime(video.currentTime), { signal });
+    video.addEventListener("seeked", () => setAuthTime(video.currentTime), { signal });
+    video.addEventListener("loadedmetadata", () => setAuthDur(video.duration || 0), { signal });
     video.addEventListener(
       "error",
       () => {
@@ -423,15 +434,28 @@ export function TourViewer({
         const v = new THREE.Vector3(ndcX, ndcY, 0.5).unproject(camera).normalize();
         const lat = 90 - THREE.MathUtils.radToDeg(Math.acos(Math.max(-1, Math.min(1, v.y))));
         const lon = THREE.MathUtils.radToDeg(Math.atan2(v.z, v.x));
-        setMarks((prev) => [
-          ...prev,
-          {
-            chapter: tour.chapters[chapterIdxRef.current].id,
-            time: Math.round(video.currentTime * 10) / 10,
-            yaw: Math.round(norm180(lon - FRONT_LON) * 10) / 10,
-            pitch: Math.round(lat * 10) / 10,
-          },
-        ]);
+        // Drop/replace a keyframe for the active ring at the current time.
+        const ringId = activeRingRef.current;
+        if (ringId) {
+          const tt = Math.round(video.currentTime * 100) / 100;
+          const yaw = Math.round(norm180(lon - FRONT_LON) * 10) / 10;
+          const pitch = Math.round(lat * 10) / 10;
+          setRings((prev) => {
+            const next = prev.map((r) => {
+              if (r.id !== ringId) return r;
+              const keys = (r.keys ?? []).filter((k) => Math.abs(k.t - tt) > 0.12);
+              keys.push({ t: tt, yaw, pitch });
+              keys.sort((a, b) => a.t - b.t);
+              return { ...r, keys };
+            });
+            try {
+              localStorage.setItem(`lvx-rings:${tour.slug}`, JSON.stringify(next));
+            } catch {
+              /* storage unavailable */
+            }
+            return next;
+          });
+        }
       }
       pointers.delete(e.pointerId);
       if (pointers.size < 2) pinchDist = 0;
@@ -451,6 +475,7 @@ export function TourViewer({
     mount.addEventListener(
       "keydown",
       (e) => {
+        if (authorRef.current) return; // arrows step frames while authoring
         const step = 4;
         if (e.key === "ArrowLeft") look.lon -= step;
         else if (e.key === "ArrowRight") look.lon += step;
@@ -620,8 +645,22 @@ export function TourViewer({
         ty: number;
         scale: number;
         dist: number;
+        opacity: number;
       }[] = [];
-      for (const { ci, hs, key } of flatHotspots) {
+      // In author mode the rings being authored preview live alongside any the
+      // tour already ships, so you see the fade + tracking as you scrub.
+      const authoring = authorRef.current;
+      const liveHotspots =
+        authoring && ringsRef.current.length
+          ? flatHotspots.concat(
+              ringsRef.current.map((r) => ({
+                ci: chapterIdxRef.current,
+                hs: r,
+                key: `auth:${r.id}`,
+              })),
+            )
+          : flatHotspots;
+      for (const { ci, hs, key } of liveHotspots) {
         const node = hotspotEls.current.get(key);
         if (!node) continue;
         const inChapter = inVideo && ci === chapterIdxRef.current;
@@ -633,7 +672,37 @@ export function TourViewer({
         let pitchDeg = 0;
         let ringScale = 1;
         let dist = 999;
-        if (hs.anchor && worldPose) {
+        let opacity = 1;
+        if (hs.keys && hs.keys.length) {
+          // Keyframed flight ring: track the amenity across its window, fading
+          // in on approach and out as you pass — never persistent. The window
+          // is the keyframe span; yaw/pitch interpolate (shortest-arc yaw).
+          const ks = hs.keys;
+          const t0 = ks[0].t;
+          const tn = ks[ks.length - 1].t;
+          if (inChapter && t >= t0 && t <= tn) {
+            let yk = ks[0].yaw;
+            let pk = ks[0].pitch;
+            for (let i = 0; i < ks.length - 1; i++) {
+              if (t >= ks[i].t && t <= ks[i + 1].t) {
+                const span = ks[i + 1].t - ks[i].t;
+                const f = span <= 0 ? 0 : (t - ks[i].t) / span;
+                yk = ks[i].yaw + (((ks[i + 1].yaw - ks[i].yaw + 540) % 360) - 180) * f;
+                pk = ks[i].pitch + (ks[i + 1].pitch - ks[i].pitch) * f;
+                break;
+              }
+            }
+            yawDeg = yk;
+            pitchDeg = pk;
+            const fd = hs.fade ?? 0.6;
+            const fin = fd > 0 ? Math.min(1, (t - t0) / fd) : 1;
+            const fout = fd > 0 ? Math.min(1, (tn - t) / fd) : 1;
+            opacity = Math.max(0, Math.min(fin, fout));
+            visible = opacity > 0.02;
+            ringScale = 1;
+            dist = 4;
+          }
+        } else if (hs.anchor && worldPose) {
           // World-anchored: direction + distance from the live camera pose —
           // the ring is wherever the room actually is, from wherever you are.
           const dx = hs.anchor.x - worldPose.x;
@@ -697,6 +766,7 @@ export function TourViewer({
           ty: (-ny * 0.5 + 0.5) * h,
           scale: clamped ? 0.7 : ringScale,
           dist,
+          opacity,
         });
       }
 
@@ -750,8 +820,10 @@ export function TourViewer({
         v.node.style.transform = `translate(-50%, -50%) translate(${sm.x}px, ${sm.y}px)`;
         v.node.style.setProperty("--rs", String(v.scale));
         v.node.style.zIndex = String(Math.round(1000 - Math.min(v.dist, 99) * 8));
-        v.node.style.opacity = "1";
-        v.node.style.pointerEvents = "auto";
+        v.node.style.opacity = String(v.opacity);
+        // While authoring, let clicks fall through to the canvas (to drop
+        // keyframes) instead of being caught by a ring.
+        v.node.style.pointerEvents = authoring ? "none" : v.opacity > 0.5 ? "auto" : "none";
       }
 
       // You-are-here: the displayed sheet's path for this chapter.
@@ -818,6 +890,63 @@ export function TourViewer({
       window.removeEventListener("keydown", onKey);
     };
   }, [pseudoFs]);
+
+  // Author transport helpers (used by the keyboard effect + the panel).
+  const authSeek = useCallback((t: number) => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.currentTime = Math.max(0, Math.min(v.duration || t, t));
+  }, []);
+  const authStep = useCallback((n: number) => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (!v.paused) v.pause();
+    const fps = 30; // flight is 30fps
+    const idx = Math.round(v.currentTime * fps);
+    v.currentTime = Math.max(0, Math.min(v.duration || 0, (idx + n) / fps + 0.001));
+  }, []);
+
+  // Load authored rings for this tour (author mode), once per tour.
+  useEffect(() => {
+    if (!author) return;
+    let loaded: TourHotspot[] = [];
+    try {
+      const raw = localStorage.getItem(`lvx-rings:${tour.slug}`);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) loaded = parsed;
+      }
+    } catch {
+      /* ignore */
+    }
+    setRings(loaded);
+    setActiveRing(loaded[0]?.id ?? null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [author, tour.slug]);
+
+  // Author transport: ←/→ or ,/. step a frame (Shift = 10), Space play/pause.
+  useEffect(() => {
+    if (!author) return;
+    const onKey = (e: KeyboardEvent) => {
+      const el = document.activeElement as HTMLElement | null;
+      const tag = el?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || el?.isContentEditable) return;
+      const v = videoRef.current;
+      if (!v) return;
+      const fwd = e.key === "ArrowRight" || e.code === "Period";
+      const back = e.key === "ArrowLeft" || e.code === "Comma";
+      if (fwd || back) {
+        e.preventDefault();
+        authStep((fwd ? 1 : -1) * (e.shiftKey ? 10 : 1));
+      } else if (e.code === "Space") {
+        e.preventDefault();
+        if (v.paused) void v.play();
+        else v.pause();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [author, authStep]);
 
   // ---------- pano transitions ----------
   const loadPano = useCallback((p: TourPano): Promise<THREE.Texture> => {
@@ -1070,15 +1199,61 @@ export function TourViewer({
     }
   };
 
-  const copyMarks = async () => {
+  // ---------- ring authoring ----------
+  const newRingId = () =>
+    typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID().slice(0, 6)
+      : String(Math.floor(performance.now()));
+  // Persist on every mutation (so a reload/HMR doesn't lose authoring work);
+  // load is the only path that sets state without saving, avoiding a clobber.
+  const saveRings = (next: TourHotspot[]) => {
     try {
-      await navigator.clipboard.writeText(JSON.stringify(marks, null, 2));
+      localStorage.setItem(`lvx-rings:${tour.slug}`, JSON.stringify(next));
+    } catch {
+      /* storage unavailable */
+    }
+  };
+  const mutateRings = (updater: (prev: TourHotspot[]) => TourHotspot[]) =>
+    setRings((prev) => {
+      const next = updater(prev);
+      saveRings(next);
+      return next;
+    });
+  const addRing = () => {
+    const id = newRingId();
+    mutateRings((prev) => [
+      ...prev,
+      { id, label: tour.panos[0]?.label ?? "Amenity", panoId: tour.panos[0]?.id ?? "", keys: [], fade: 0.6 },
+    ]);
+    setActiveRing(id);
+  };
+  const removeRing = (id: string) => {
+    mutateRings((prev) => prev.filter((r) => r.id !== id));
+    setActiveRing((cur) => (cur === id ? null : cur));
+    hotspotEls.current.delete(`auth:${id}`);
+  };
+  const updateRing = (id: string, patch: Partial<TourHotspot>) =>
+    mutateRings((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  const removeRingKey = (id: string, kt: number) =>
+    mutateRings((prev) =>
+      prev.map((r) => (r.id === id ? { ...r, keys: (r.keys ?? []).filter((k) => k.t !== kt) } : r)),
+    );
+  const copyRings = async () => {
+    // Clean hotspot JSON for data/tours.ts (only rings with keyframes).
+    const out = rings
+      .filter((r) => (r.keys?.length ?? 0) > 0)
+      .map((r) => ({ id: `hs-${r.id}`, label: r.label, panoId: r.panoId, fade: r.fade ?? 0.6, keys: r.keys }));
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(out, null, 2));
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
       /* clipboard unavailable */
     }
   };
+  const activeR = rings.find((r) => r.id === activeRing) ?? null;
+  const fmtT = (s: number) =>
+    `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}.${Math.floor((s % 1) * 10)}`;
 
   /** Author mode: a click on the plan drops a timed path keyframe. */
   const recordPathMark = useCallback(
@@ -1151,7 +1326,7 @@ export function TourViewer({
               if (node) hotspotEls.current.set(key, node);
               else hotspotEls.current.delete(key);
             }}
-            className="absolute left-0 top-0 flex flex-col items-center gap-[clamp(0.5rem,0.7cqw,1rem)] opacity-0 transition-opacity duration-300"
+            className="absolute left-0 top-0 flex flex-col items-center gap-[clamp(0.5rem,0.7cqw,1rem)] opacity-0 transition-opacity duration-150"
             style={{ pointerEvents: "none" }}
           >
             <button
@@ -1175,6 +1350,31 @@ export function TourViewer({
           </div>
           )),
         )}
+        {/* Live preview of the rings being authored (?author=1). */}
+        {author &&
+          rings.map((r) => (
+            <div
+              key={`auth:${r.id}`}
+              ref={(node) => {
+                const key = `auth:${r.id}`;
+                if (node) hotspotEls.current.set(key, node);
+                else hotspotEls.current.delete(key);
+              }}
+              className="absolute left-0 top-0 flex flex-col items-center gap-[clamp(0.5rem,0.7cqw,1rem)] opacity-0 transition-opacity duration-150"
+              style={{ pointerEvents: "none" }}
+            >
+              <span className="relative flex h-[clamp(3.5rem,5cqw,7.5rem)] w-[clamp(3.5rem,5cqw,7.5rem)] items-center justify-center [scale:var(--rs,1)]">
+                <span className="absolute inset-0 rounded-full border border-champagne/50" />
+                <span className="relative flex h-[72%] w-[72%] items-center justify-center rounded-full border border-champagne bg-ink/40 backdrop-blur-sm">
+                  <span className="h-[14%] w-[14%] rounded-full bg-champagne" />
+                </span>
+              </span>
+              <span className="rounded-full bg-ink/60 px-[1.3em] py-[0.45em] font-sans text-[clamp(0.625rem,1cqw,1.25rem)] uppercase tracking-[0.18em] text-paper/90 backdrop-blur-sm">
+                {r.label || "Ring"}
+                {r.id === activeRing ? " ●" : ""}
+              </span>
+            </div>
+          ))}
       </div>
 
       {/* Ink fade for scene transitions */}
@@ -1366,77 +1566,122 @@ export function TourViewer({
         </div>
       )}
 
-      {/* Authoring overlay */}
+      {/* Ring editor (?author=1) */}
       {author && started && (
-        <div className="absolute right-4 top-4 w-64 rounded border border-champagne/40 bg-ink/85 p-4 font-sans text-xs text-paper backdrop-blur">
+        <div className="absolute right-3 top-3 flex max-h-[80vh] w-80 flex-col overflow-auto rounded-lg border border-champagne/40 bg-ink/90 p-3.5 font-sans text-xs text-paper backdrop-blur">
           <p className="font-display text-[0.6875rem] uppercase tracking-[0.2em] text-champagne">
-            Authoring
+            Ring Editor
           </p>
-          <p className="mt-2 leading-relaxed text-paper/70">
-            Click anywhere in the world to mark a hotspot.
-          </p>
-          <p className="mt-2 tabular-nums text-champagne/90">
-            <span ref={readoutRef} />
-          </p>
-          {marks.length > 0 && (
-            <ul className="mt-3 flex max-h-40 flex-col gap-1 overflow-auto border-t border-paper/15 pt-3 tabular-nums">
-              {marks.map((m, i) => (
-                <li key={i} className="flex items-center justify-between gap-2">
-                  <span>
-                    t{m.time}s · y{m.yaw}° · p{m.pitch}°
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setMarks((prev) => prev.filter((_, j) => j !== i))}
-                    aria-label="Remove mark"
-                    className="text-paper/50 hover:text-champagne"
-                  >
-                    ✕
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-          <div className="mt-3 flex gap-2">
-            <button
-              type="button"
-              onClick={() => void copyMarks()}
-              disabled={marks.length === 0}
-              className="flex-1 rounded border border-champagne/60 px-2 py-1.5 uppercase tracking-[0.14em] text-champagne transition-colors hover:bg-champagne hover:text-ink disabled:opacity-40"
-            >
-              {copied ? "Copied" : "Copy JSON"}
+
+          {/* transport */}
+          <div className="mt-2.5 flex items-center gap-1.5">
+            <button type="button" onClick={togglePlay} aria-label={playing ? "Pause" : "Play"} className="rounded border border-paper/30 px-2 py-1 hover:border-champagne hover:text-champagne">
+              {playing ? "❚❚" : "►"}
             </button>
-            <button
-              type="button"
-              onClick={() => setMarks([])}
-              disabled={marks.length === 0}
-              className="rounded border border-paper/30 px-2 py-1.5 uppercase tracking-[0.14em] text-paper/70 transition-colors hover:border-paper/60 disabled:opacity-40"
-            >
-              Clear
-            </button>
+            <button type="button" onClick={() => authStep(-1)} aria-label="Back a frame" className="rounded border border-paper/30 px-2 py-1 hover:border-champagne hover:text-champagne">‹</button>
+            <button type="button" onClick={() => authStep(1)} aria-label="Forward a frame" className="rounded border border-paper/30 px-2 py-1 hover:border-champagne hover:text-champagne">›</button>
+            <span className="ml-auto font-mono tabular-nums text-champagne/90">{fmtT(authTime)} / {fmtT(authDur || 0)}</span>
           </div>
-          <div className="mt-4 border-t border-paper/15 pt-3">
-            <p className="text-paper/70">
-              Path keys: <span className="tabular-nums text-champagne">{pathMarkCount}</span>
-              <span className="text-paper/40"> — open the Plan, fly, click your position</span>
+          <div className="relative mt-1.5">
+            <input
+              type="range" min={0} max={authDur || 0} step={0.01} value={authTime}
+              onChange={(e) => authSeek(parseFloat(e.target.value))}
+              className="w-full accent-champagne" aria-label="Scrub"
+            />
+            {activeR && authDur > 0 && (
+              <div className="pointer-events-none absolute inset-x-0 top-1/2">
+                {(activeR.keys ?? []).map((k) => (
+                  <span key={k.t} className="absolute h-2 w-0.5 -translate-y-1/2 bg-champagne" style={{ left: `${(k.t / authDur) * 100}%` }} />
+                ))}
+              </div>
+            )}
+          </div>
+          <p className="mt-1 flex justify-between text-[0.65rem] text-paper/40">
+            <span>← → or , . frame · Shift = 10 · Space play</span>
+            <span ref={readoutRef} className="font-mono text-champagne/70" />
+          </p>
+
+          {/* rings */}
+          <div className="mt-2.5 flex items-center justify-between border-t border-paper/15 pt-2.5">
+            <span className="uppercase tracking-[0.16em] text-paper/50">Rings ({rings.length})</span>
+            <button type="button" onClick={addRing} className="rounded border border-paper/30 px-2 py-1 uppercase tracking-[0.12em] hover:border-champagne hover:text-champagne">+ Add</button>
+          </div>
+          {rings.length === 0 && (
+            <p className="mt-2 leading-relaxed text-paper/40">
+              Add a ring, scrub to where its amenity appears, and click it in the 360. Click again as you
+              pass — the ring tracks it and fades in/out across the window.
             </p>
-            <div className="mt-2 flex gap-2">
-              <button
-                type="button"
-                onClick={() => void copyPathMarks()}
-                disabled={pathMarkCount === 0}
-                className="flex-1 rounded border border-champagne/60 px-2 py-1.5 uppercase tracking-[0.14em] text-champagne transition-colors hover:bg-champagne hover:text-ink disabled:opacity-40"
-              >
+          )}
+          <div className="mt-2 flex flex-col gap-2">
+            {rings.map((r) => {
+              const isA = r.id === activeRing;
+              const ks = r.keys ?? [];
+              return (
+                <div key={r.id} className={cn("rounded-lg border p-2", isA ? "border-champagne/60 bg-champagne/5" : "border-paper/15")}>
+                  <div className="flex items-center gap-1.5">
+                    <button type="button" onClick={() => setActiveRing(r.id)} aria-label="Select ring"
+                      className={cn("h-3 w-3 shrink-0 rounded-full border", isA ? "border-champagne bg-champagne" : "border-paper/40")} />
+                    <select
+                      value={r.panoId}
+                      onChange={(e) => {
+                        const p = tour.panos.find((x) => x.id === e.target.value);
+                        updateRing(r.id, { panoId: e.target.value, label: p?.label ?? r.label });
+                      }}
+                      onFocus={() => setActiveRing(r.id)}
+                      className="min-w-0 flex-1 rounded bg-ink/60 px-1 py-0.5 text-paper outline-none"
+                    >
+                      {tour.panos.map((p) => (<option key={p.id} value={p.id}>{p.label}</option>))}
+                    </select>
+                    <span className="font-mono text-[0.65rem] text-paper/40">{ks.length}k</span>
+                    <button type="button" onClick={() => removeRing(r.id)} aria-label="Delete ring" className="text-paper/40 hover:text-red-400">✕</button>
+                  </div>
+                  {isA && (
+                    <>
+                      <p className="mt-1.5 text-[0.65rem] leading-relaxed text-champagne/80">
+                        {ks.length === 0
+                          ? "① Scrub to where it appears, then click it in the 360."
+                          : ks.length === 1
+                            ? "② Now scrub to where it leaves view and click it again."
+                            : "③ Tracked. Add a mid-pass click if it drifts — it fades in/out automatically."}
+                      </p>
+                      {ks.length > 0 && (
+                        <div className="mt-1.5 flex flex-wrap gap-1">
+                          {ks.map((k) => (
+                            <span key={k.t} className="inline-flex items-center overflow-hidden rounded border border-paper/20">
+                              <button type="button" onClick={() => authSeek(k.t)} className="px-1 py-0.5 font-mono text-[0.65rem] hover:text-champagne" title={`yaw ${k.yaw}° · pitch ${k.pitch}°`}>{fmtT(k.t)}</button>
+                              <button type="button" onClick={() => removeRingKey(r.id, k.t)} aria-label="Delete keyframe" className="border-l border-paper/20 px-1 py-0.5 text-[0.65rem] text-paper/40 hover:text-red-400">✕</button>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      <label className="mt-1.5 flex items-center gap-2 text-[0.65rem] text-paper/60">
+                        Fade
+                        <input type="number" min={0} max={3} step={0.1} value={r.fade ?? 0.6}
+                          onChange={(e) => updateRing(r.id, { fade: Math.max(0, parseFloat(e.target.value) || 0) })}
+                          className="w-14 rounded bg-ink/60 px-1 py-0.5 text-paper outline-none" />
+                        s
+                      </label>
+                    </>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <button type="button" onClick={() => void copyRings()} disabled={rings.every((r) => !(r.keys?.length))}
+            className="mt-3 rounded border border-champagne/60 px-2 py-1.5 uppercase tracking-[0.14em] text-champagne transition-colors hover:bg-champagne hover:text-ink disabled:opacity-40">
+            {copied ? "Copied ✓" : "Copy rings JSON"}
+          </button>
+
+          {/* path keys (for the dot) */}
+          <div className="mt-3 border-t border-paper/15 pt-2.5">
+            <p className="text-paper/60">Path keys: <span className="tabular-nums text-champagne">{pathMarkCount}</span> <span className="text-paper/40">— Plan → fly → click your spot</span></p>
+            <div className="mt-1.5 flex gap-2">
+              <button type="button" onClick={() => void copyPathMarks()} disabled={pathMarkCount === 0}
+                className="flex-1 rounded border border-champagne/60 px-2 py-1 uppercase tracking-[0.12em] text-champagne hover:bg-champagne hover:text-ink disabled:opacity-40">
                 {copiedPaths ? "Copied" : "Copy paths"}
               </button>
-              <button
-                type="button"
-                onClick={() => setPathMarks({})}
-                disabled={pathMarkCount === 0}
-                className="rounded border border-paper/30 px-2 py-1.5 uppercase tracking-[0.14em] text-paper/70 transition-colors hover:border-paper/60 disabled:opacity-40"
-              >
-                Clear
-              </button>
+              <button type="button" onClick={() => setPathMarks({})} disabled={pathMarkCount === 0}
+                className="rounded border border-paper/30 px-2 py-1 uppercase tracking-[0.12em] text-paper/70 hover:border-paper/60 disabled:opacity-40">Clear</button>
             </div>
           </div>
         </div>

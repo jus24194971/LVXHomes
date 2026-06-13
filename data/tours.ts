@@ -8,9 +8,21 @@
  * hotspot should hang, then copy the JSON from the panel into this file.
  */
 
+/** A keyframe for a tracked flight ring: at `t` seconds the amenity sits at
+ *  `yaw` degrees from frame FRONT and `pitch` degrees above the horizon. */
+export type RingKey = { t: number; yaw: number; pitch: number };
+
 export type TourHotspot = {
   id: string;
   label: string;
+  /**
+   * Keyframed flight ring (preferred for real flights). The ring TRACKS its
+   * amenity by interpolating these keys, and only appears during their time
+   * span — fading in as you approach and out as you pass. Map-independent.
+   */
+  keys?: RingKey[];
+  /** Fade in/out duration in seconds for keyframed rings (default 0.6). */
+  fade?: number;
   /**
    * World anchor (plan units = meters; plan y = world z; h = height in m).
    * When set, the ring is computed live from the camera's plan-path pose —
