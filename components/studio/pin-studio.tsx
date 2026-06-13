@@ -3,28 +3,35 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PROJECTS } from "@/data/projects";
 import { streamHls } from "@/lib/stream";
-import { type VideoPin, getVideoPins, pinWindow } from "@/data/video-pins";
+import { type VideoPin, getVideoPins, pinPosAt } from "@/data/video-pins";
 import { PinOverlay } from "@/components/tour/pin-overlay";
 import { cn } from "@/lib/utils";
 
 /**
- * Pin Studio — map where rooms live in a real flat film. Pick a Stream film,
- * scrub, select a pin, and click the room to drop a tracking keyframe. Pins
- * interpolate between keyframes so they follow the room as the drone moves.
- * Work autosaves to localStorage; "Copy JSON" exports for data/video-pins.ts.
+ * Pin Studio — guided room mapping on a real flat film.
+ *
+ * Per room you set just two frames: where it ENTERS and where it LEAVES. The
+ * tool then walks you to the middle of the path and asks "does the dot still
+ * sit on the room?" — drag it on if not (that adds an intermediary keyframe),
+ * otherwise tap Aligned. It keeps offering the next-biggest gap until the
+ * track is clean. You position by DRAGGING the dot, not pin-pointing a click.
  */
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 const round3 = (n: number) => Math.round(n * 1000) / 1000;
 const fmt = (s: number) =>
   `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, "0")}.${Math.floor((s % 1) * 10)}`;
+const SEG_MIN = 0.7; // don't bother refining gaps shorter than this
 
 type RVFCVideo = HTMLVideoElement & {
   requestVideoFrameCallback?: (cb: () => void) => number;
 };
+type Phase = "start" | "end" | "refine" | "done";
+type Seg = { aT: number; bT: number };
 
 export function PinStudio() {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const [uid, setUid] = useState(PROJECTS[0]?.streamUid ?? "");
   const [pins, setPins] = useState<VideoPin[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -33,7 +40,16 @@ export function PinStudio() {
   const [playing, setPlaying] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  // ---------- HLS playback (plain <video> so we can overlay click targets) ----------
+  const [phase, setPhase] = useState<Phase>("start");
+  const [confirmed, setConfirmed] = useState<string[]>([]);
+  const [checking, setChecking] = useState<Seg | null>(null);
+  const [editedThisCheck, setEditedThisCheck] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const draggingRef = useRef(false);
+
+  const active = pins.find((p) => p.id === activeId) ?? null;
+
+  // ---------- HLS playback (plain <video> so we can overlay a drag handle) ----------
   useEffect(() => {
     const v = videoRef.current;
     if (!v || !uid) return;
@@ -42,9 +58,8 @@ export function PinStudio() {
     setDuration(0);
     let hls: { destroy: () => void } | undefined;
     let cancelled = false;
-    // Prefer hls.js wherever MSE works (Chrome/Firefox/Edge, incl. Android —
-    // which reports a misleading "maybe" for native HLS but can't actually play
-    // it). Fall back to native HLS only when hls.js isn't supported (Safari/iOS).
+    // hls.js wherever MSE works (incl. Android Chrome, which misreports native
+    // HLS); native HLS only as the Safari/iOS fallback.
     import("hls.js").then(({ default: Hls }) => {
       if (cancelled) return;
       if (Hls.isSupported()) {
@@ -62,7 +77,7 @@ export function PinStudio() {
     };
   }, [uid]);
 
-  // ---------- time tracking (frame-accurate while playing) ----------
+  // ---------- time tracking ----------
   useEffect(() => {
     const v = videoRef.current as RVFCVideo | null;
     if (!v) return;
@@ -104,7 +119,7 @@ export function PinStudio() {
     };
   }, []);
 
-  // ---------- pins: load on film change (localStorage WIP, else committed data) ----------
+  // ---------- pin storage (per film) ----------
   useEffect(() => {
     let loaded: VideoPin[] = [];
     try {
@@ -115,24 +130,25 @@ export function PinStudio() {
     }
     if (!Array.isArray(loaded)) loaded = [];
     setPins(loaded);
-    setActiveId(loaded[0]?.id ?? null);
+    selectPin(loaded[0]?.id ?? null, loaded);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uid]);
 
-  // Every mutation goes through here so saves always target the current film.
-  const persist = useCallback(
-    (updater: (prev: VideoPin[]) => VideoPin[]) => {
-      setPins((prev) => {
-        const next = updater(prev);
-        try {
-          localStorage.setItem(`lvx-pins:${uid}`, JSON.stringify(next));
-        } catch {
-          /* storage unavailable */
-        }
-        return next;
-      });
-    },
-    [uid],
-  );
+  const save = (next: VideoPin[]) => {
+    try {
+      localStorage.setItem(`lvx-pins:${uid}`, JSON.stringify(next));
+    } catch {
+      /* storage unavailable */
+    }
+  };
+  // updateLive = state only (cheap, for drag); persist = state + localStorage.
+  const updateLive = (updater: (prev: VideoPin[]) => VideoPin[]) => setPins(updater);
+  const persist = (updater: (prev: VideoPin[]) => VideoPin[]) =>
+    setPins((prev) => {
+      const next = updater(prev);
+      save(next);
+      return next;
+    });
 
   // ---------- transport ----------
   const seek = useCallback((t: number) => {
@@ -147,58 +163,146 @@ export function PinStudio() {
     else v.pause();
   }, []);
 
-  // ---------- authoring ----------
+  // ---------- guided flow ----------
   const newId = () =>
     typeof crypto !== "undefined" && crypto.randomUUID
       ? crypto.randomUUID().slice(0, 8)
       : String(Math.floor(performance.now()));
 
+  const phaseFor = (p: VideoPin | null): Phase =>
+    !p || p.keys.length === 0 ? "start" : p.keys.length === 1 ? "end" : "done";
+
+  const selectPin = (id: string | null, list: VideoPin[] = pins) => {
+    setActiveId(id);
+    setConfirmed([]);
+    setChecking(null);
+    setEditedThisCheck(false);
+    setPhase(phaseFor(list.find((p) => p.id === id) ?? null));
+  };
+
   const addPin = () => {
     const id = newId();
-    persist((prev) => [
-      ...prev,
-      { id, label: `Room ${prev.length + 1}`, keys: [] },
-    ]);
+    persist((prev) => [...prev, { id, label: `Room ${prev.length + 1}`, keys: [] }]);
     setActiveId(id);
+    setConfirmed([]);
+    setChecking(null);
+    setPhase("start");
   };
   const removePin = (id: string) => {
     persist((prev) => prev.filter((p) => p.id !== id));
-    setActiveId((cur) => (cur === id ? null : cur));
+    if (id === activeId) selectPin(null);
   };
   const renamePin = (id: string, label: string) =>
     persist((prev) => prev.map((p) => (p.id === id ? { ...p, label } : p)));
 
-  const addKeyframeAt = (x: number, y: number) => {
-    if (!activeId) return;
+  // Insert/replace the active pin's keyframe at the current time.
+  const upsertKey = (x: number, y: number, commit: boolean) => {
+    if (!activeId) return 0;
     const t = round2(time);
-    persist((prev) =>
+    let len = 0;
+    const updater = (prev: VideoPin[]) =>
       prev.map((p) => {
         if (p.id !== activeId) return p;
         const keys = p.keys.filter((k) => Math.abs(k.t - t) > 0.12);
-        keys.push({ t, x: round3(x), y: round3(y) });
+        keys.push({ t, x: round3(Math.max(0, Math.min(1, x))), y: round3(Math.max(0, Math.min(1, y))) });
         keys.sort((a, b) => a.t - b.t);
+        len = keys.length;
         return { ...p, keys };
-      }),
-    );
+      });
+    if (commit) persist(updater);
+    else updateLive(updater);
+    if (phase === "refine") setEditedThisCheck(true);
+    return len;
   };
-  const removeKey = (id: string, t: number) =>
-    persist((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, keys: p.keys.filter((k) => k.t !== t) } : p)),
-    );
 
-  const onStageClick = (e: React.MouseEvent<HTMLDivElement>) => {
+  // Find the biggest gap not yet confirmed (and worth refining).
+  const nextGap = (keys: VideoPin["keys"], done: string[]): Seg | null => {
+    let best: Seg | null = null;
+    for (let i = 0; i < keys.length - 1; i++) {
+      const span = keys[i + 1].t - keys[i].t;
+      if (span <= SEG_MIN) continue;
+      const sig = `${keys[i].t}|${keys[i + 1].t}`;
+      if (done.includes(sig)) continue;
+      if (!best || span > best.bT - best.aT) best = { aT: keys[i].t, bT: keys[i + 1].t };
+    }
+    return best;
+  };
+
+  const advance = (keys: VideoPin["keys"], done: string[]) => {
+    const gap = nextGap(keys, done);
+    if (!gap) {
+      setChecking(null);
+      setPhase("done");
+      return;
+    }
+    setChecking(gap);
+    setEditedThisCheck(false);
+    setPhase("refine");
+    seek((gap.aT + gap.bT) / 2);
+  };
+
+  // When the 2nd keyframe lands, start the guided refine automatically.
+  const lenRef = useRef(0);
+  useEffect(() => {
+    const len = active?.keys.length ?? 0;
+    const was = lenRef.current;
+    lenRef.current = len;
+    if (!active) return;
+    if (phase === "start" && len >= 1) setPhase("end");
+    else if (phase === "end" && len >= 2 && was < 2) advance(active.keys, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active?.keys.length]);
+
+  const onAlignedNext = () => {
+    if (!active) return;
+    let done = confirmed;
+    if (!editedThisCheck && checking) {
+      done = [...confirmed, `${checking.aT}|${checking.bT}`];
+      setConfirmed(done);
+    }
+    advance(active.keys, done);
+  };
+  const reRefine = () => {
+    if (!active) return;
+    setConfirmed([]);
+    advance(active.keys, []);
+  };
+
+  // ---------- drag handle ----------
+  const stageXY = (clientX: number, clientY: number) => {
+    const r = stageRef.current?.getBoundingClientRect();
+    if (!r) return null;
+    return { x: (clientX - r.left) / r.width, y: (clientY - r.top) / r.height };
+  };
+  const onHandleDown = (e: React.PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+    draggingRef.current = true; // ref: a synchronous move right after sees it
+    setDragging(true);
+  };
+  const onHandleMove = (e: React.PointerEvent) => {
+    if (!draggingRef.current) return;
+    const p = stageXY(e.clientX, e.clientY);
+    if (p) upsertKey(p.x, p.y, false);
+  };
+  const onHandleUp = (e: React.PointerEvent) => {
+    if (!draggingRef.current) return;
+    draggingRef.current = false;
+    setDragging(false);
+    const p = stageXY(e.clientX, e.clientY);
+    if (p) upsertKey(p.x, p.y, true); // flush to storage
+  };
+  // Click anywhere on the frame to drop/move the dot there at this time.
+  const onStageClick = (e: React.MouseEvent) => {
     if (!activeId) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / rect.width;
-    const y = (e.clientY - rect.top) / rect.height;
-    if (x < 0 || x > 1 || y < 0 || y > 1) return;
-    addKeyframeAt(x, y);
+    const p = stageXY(e.clientX, e.clientY);
+    if (p) upsertKey(p.x, p.y, true);
   };
 
   const copyJson = async () => {
-    const payload = JSON.stringify({ uid, pins }, null, 2);
     try {
-      await navigator.clipboard.writeText(payload);
+      await navigator.clipboard.writeText(JSON.stringify({ uid, pins }, null, 2));
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
@@ -206,207 +310,212 @@ export function PinStudio() {
     }
   };
 
-  const active = pins.find((p) => p.id === activeId) ?? null;
+  // Handle position = the active pin's point at the current time.
+  const handlePos =
+    active && (active.keys.length ? pinPosAt(active, time) : { x: 0.5, y: 0.5 });
+
   const ctl =
-    "rounded-full border border-paper/30 px-3 py-1.5 font-sans text-xs uppercase tracking-[0.14em] text-paper/80 transition-colors hover:border-champagne hover:text-champagne";
+    "rounded-full border border-paper/30 px-3 py-1.5 font-sans text-xs uppercase tracking-[0.14em] text-paper/80 transition-colors hover:border-champagne hover:text-champagne disabled:opacity-30";
+  const labelOf = active?.label || "the room";
 
   return (
-    <div className="grid gap-6 lg:grid-cols-[1.6fr_1fr]">
-      {/* ---------- stage ---------- */}
-      <div>
-        <div className="relative aspect-video overflow-hidden rounded-lg border border-paper/15 bg-black [container-type:inline-size]">
-          <video
-            ref={videoRef}
-            muted
-            playsInline
-            poster={undefined}
-            className="h-full w-full object-cover"
-          />
-          <PinOverlay pins={pins} currentTime={time} activeId={activeId} />
-          {/* click-capture: drop a keyframe for the active pin */}
-          <div
-            onClick={onStageClick}
-            className={cn(
-              "absolute inset-0",
-              activeId ? "cursor-crosshair" : "cursor-default",
-            )}
-          />
-          {!activeId && (
-            <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">
-              <span className="rounded-full bg-ink/70 px-3 py-1 font-sans text-[0.7rem] uppercase tracking-[0.16em] text-paper/70 backdrop-blur-sm">
-                Add or select a pin, then click the room
-              </span>
-            </div>
-          )}
-        </div>
+    <div className="mx-auto max-w-4xl">
+      {/* film picker */}
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <span className="font-sans text-[0.7rem] uppercase tracking-[0.18em] text-paper/50">Film</span>
+        {PROJECTS.map((p) => (
+          <button
+            key={p.streamUid}
+            type="button"
+            onClick={() => setUid(p.streamUid)}
+            className={cn(ctl, uid === p.streamUid && "border-champagne text-champagne")}
+          >
+            {p.title}
+          </button>
+        ))}
+      </div>
 
-        {/* transport */}
-        <div className="mt-3 flex items-center gap-3">
-          <button type="button" onClick={togglePlay} className={ctl} aria-label={playing ? "Pause" : "Play"}>
-            {playing ? "❚❚" : "►"}
-          </button>
-          <button type="button" onClick={() => seek(time - 1 / 30)} className={ctl} aria-label="Back one frame">
-            ‹ frame
-          </button>
-          <button type="button" onClick={() => seek(time + 1 / 30)} className={ctl} aria-label="Forward one frame">
-            frame ›
-          </button>
-          <span className="font-mono text-xs tabular-nums text-paper/60">
-            {fmt(time)} / {fmt(duration || 0)}
-          </span>
-        </div>
-        {/* scrub + active-pin keyframe ticks */}
-        <div className="relative mt-2">
-          <input
-            type="range"
-            min={0}
-            max={duration || 0}
-            step={0.01}
-            value={time}
-            onChange={(e) => seek(parseFloat(e.target.value))}
-            className="w-full accent-champagne"
-            aria-label="Scrub"
-          />
-          {active && duration > 0 && (
-            <div className="pointer-events-none absolute inset-x-0 top-1/2 -z-0">
-              {active.keys.map((k) => (
-                <span
-                  key={k.t}
-                  className="absolute h-2 w-0.5 -translate-y-1/2 bg-champagne"
-                  style={{ left: `${(k.t / duration) * 100}%` }}
-                />
-              ))}
+      {/* ---------- stage ---------- */}
+      <div
+        ref={stageRef}
+        onClick={onStageClick}
+        className={cn(
+          "relative aspect-video w-full overflow-hidden rounded-lg border border-paper/15 bg-black [container-type:inline-size]",
+          activeId ? "cursor-crosshair" : "cursor-default",
+        )}
+      >
+        <video ref={videoRef} muted playsInline className="h-full w-full object-cover" />
+        <PinOverlay pins={pins} currentTime={time} activeId={activeId} />
+
+        {/* draggable handle for the active pin's point at this time */}
+        {active && handlePos && (
+          <div
+            onPointerDown={onHandleDown}
+            onPointerMove={onHandleMove}
+            onPointerUp={onHandleUp}
+            onClick={(e) => e.stopPropagation()}
+            className={cn(
+              "absolute z-10 flex h-[clamp(2rem,4cqw,3.25rem)] w-[clamp(2rem,4cqw,3.25rem)] -translate-x-1/2 -translate-y-1/2 touch-none items-center justify-center rounded-full border-2 border-champagne bg-champagne/15 backdrop-blur-sm",
+              dragging ? "cursor-grabbing scale-110" : "cursor-grab",
+            )}
+            style={{ left: `${handlePos.x * 100}%`, top: `${handlePos.y * 100}%` }}
+            aria-label={`Drag ${labelOf} onto the room`}
+          >
+            <span className="h-1.5 w-1.5 rounded-full bg-champagne" />
+            <span className="absolute h-full w-px bg-champagne/40" />
+            <span className="absolute h-px w-full bg-champagne/40" />
+          </div>
+        )}
+      </div>
+
+      {/* transport */}
+      <div className="mt-3 flex items-center gap-2">
+        <button type="button" onClick={togglePlay} className={ctl} aria-label={playing ? "Pause" : "Play"}>
+          {playing ? "❚❚" : "►"}
+        </button>
+        <button type="button" onClick={() => seek(time - 1 / 30)} className={ctl}>‹ frame</button>
+        <button type="button" onClick={() => seek(time + 1 / 30)} className={ctl}>frame ›</button>
+        <span className="ml-1 font-mono text-xs tabular-nums text-paper/60">
+          {fmt(time)} / {fmt(duration || 0)}
+        </span>
+      </div>
+      <div className="relative mt-2">
+        <input
+          type="range"
+          min={0}
+          max={duration || 0}
+          step={0.01}
+          value={time}
+          onChange={(e) => seek(parseFloat(e.target.value))}
+          className="w-full accent-champagne"
+          aria-label="Scrub"
+        />
+        {active && duration > 0 && (
+          <div className="pointer-events-none absolute inset-x-0 top-1/2">
+            {active.keys.map((k) => (
+              <span
+                key={k.t}
+                className="absolute h-2 w-0.5 -translate-y-1/2 bg-champagne"
+                style={{ left: `${(k.t / duration) * 100}%` }}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* ---------- guided step bar ---------- */}
+      {active && (
+        <div className="mt-4 rounded-lg border border-champagne/30 bg-champagne/[0.04] p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="font-sans text-[0.7rem] uppercase tracking-[0.18em] text-champagne/80">
+                {phase === "start" && `Step 1 · Set start — ${labelOf}`}
+                {phase === "end" && `Step 2 · Set end — ${labelOf}`}
+                {phase === "refine" && `Step 3 · Refine — ${labelOf}`}
+                {phase === "done" && `Tracked — ${labelOf}`}
+              </p>
+              <p className="mt-1 font-sans text-sm leading-relaxed text-paper/80">
+                {phase === "start" &&
+                  "Scrub to where the room first comes into frame, then drag the gold dot onto it (or click it)."}
+                {phase === "end" &&
+                  "Now scrub to where it’s about to leave frame, and drag the dot onto it again."}
+                {phase === "refine" &&
+                  "I jumped to the middle of the path. Does the dot still sit on the room? Drag it on if it drifted — otherwise tap Aligned."}
+                {phase === "done" &&
+                  "Start and end are set and the path checks out. Re-check if you want a tighter track, or add another room."}
+              </p>
             </div>
+            <div className="flex shrink-0 items-center gap-2">
+              {phase === "refine" && (
+                <>
+                  <button type="button" onClick={onAlignedNext} className={cn(ctl, "border-champagne text-champagne")}>
+                    {editedThisCheck ? "Next gap ›" : "Aligned ✓"}
+                  </button>
+                  <button type="button" onClick={() => setPhase("done")} className={ctl}>
+                    Done
+                  </button>
+                </>
+              )}
+              {phase === "done" && active.keys.length >= 2 && (
+                <button type="button" onClick={reRefine} className={ctl}>
+                  Re-check
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ---------- pins ---------- */}
+      <div className="mt-5">
+        <div className="mb-2 flex items-center justify-between">
+          <p className="font-sans text-[0.7rem] uppercase tracking-[0.18em] text-paper/50">
+            Rooms ({pins.length})
+          </p>
+          <button type="button" onClick={addPin} className={ctl}>+ Add room</button>
+        </div>
+        <div className="flex flex-col gap-2">
+          {pins.length === 0 && (
+            <p className="font-sans text-xs leading-relaxed text-paper/40">
+              Add a room to begin. You’ll set just a start and end frame; the tool asks for in-between
+              corrections only where the path needs them.
+            </p>
           )}
+          {pins.map((p) => {
+            const isActive = p.id === activeId;
+            return (
+              <div
+                key={p.id}
+                className={cn(
+                  "flex items-center gap-2 rounded-lg border p-2.5 transition-colors",
+                  isActive ? "border-champagne/60 bg-champagne/5" : "border-paper/15",
+                )}
+              >
+                <button
+                  type="button"
+                  onClick={() => selectPin(p.id)}
+                  aria-label="Select room"
+                  className={cn(
+                    "h-3.5 w-3.5 shrink-0 rounded-full border",
+                    isActive ? "border-champagne bg-champagne" : "border-paper/40",
+                  )}
+                />
+                <input
+                  value={p.label}
+                  onChange={(ev) => renamePin(p.id, ev.target.value)}
+                  onFocus={() => selectPin(p.id)}
+                  className="min-w-0 flex-1 bg-transparent font-sans text-sm text-paper outline-none placeholder:text-paper/30"
+                  placeholder="Room name"
+                />
+                <span className="font-mono text-[0.7rem] text-paper/40">{p.keys.length} pts</span>
+                <button
+                  type="button"
+                  onClick={() => removePin(p.id)}
+                  aria-label="Delete room"
+                  className="text-paper/40 transition-colors hover:text-red-400"
+                >
+                  ✕
+                </button>
+              </div>
+            );
+          })}
         </div>
       </div>
 
-      {/* ---------- panel ---------- */}
-      <div className="flex flex-col gap-5">
-        {/* film picker */}
-        <div>
-          <p className="mb-2 font-sans text-[0.7rem] uppercase tracking-[0.18em] text-paper/50">Film</p>
-          <div className="flex flex-wrap gap-2">
-            {PROJECTS.map((p) => (
-              <button
-                key={p.streamUid}
-                type="button"
-                onClick={() => setUid(p.streamUid)}
-                className={cn(ctl, uid === p.streamUid && "border-champagne text-champagne")}
-              >
-                {p.title}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* pins */}
-        <div>
-          <div className="mb-2 flex items-center justify-between">
-            <p className="font-sans text-[0.7rem] uppercase tracking-[0.18em] text-paper/50">
-              Pins ({pins.length})
-            </p>
-            <button type="button" onClick={addPin} className={ctl}>
-              + Add pin
-            </button>
-          </div>
-          <div className="flex flex-col gap-2">
-            {pins.length === 0 && (
-              <p className="font-sans text-xs leading-relaxed text-paper/40">
-                No pins yet. Add one, scrub to where a room appears, and click it in the frame to drop a
-                keyframe. Drop a few across the flight and the pin will track the room.
-              </p>
-            )}
-            {pins.map((p) => {
-              const [s, e] = pinWindow(p);
-              const isActive = p.id === activeId;
-              return (
-                <div
-                  key={p.id}
-                  className={cn(
-                    "rounded-lg border p-2.5 transition-colors",
-                    isActive ? "border-champagne/60 bg-champagne/5" : "border-paper/15",
-                  )}
-                >
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setActiveId(p.id)}
-                      aria-label="Select pin"
-                      className={cn(
-                        "h-3.5 w-3.5 shrink-0 rounded-full border",
-                        isActive ? "border-champagne bg-champagne" : "border-paper/40",
-                      )}
-                    />
-                    <input
-                      value={p.label}
-                      onChange={(ev) => renamePin(p.id, ev.target.value)}
-                      onFocus={() => setActiveId(p.id)}
-                      className="min-w-0 flex-1 bg-transparent font-sans text-sm text-paper outline-none placeholder:text-paper/30"
-                      placeholder="Room name"
-                    />
-                    <span className="font-mono text-[0.7rem] text-paper/40">{p.keys.length}k</span>
-                    <button
-                      type="button"
-                      onClick={() => removePin(p.id)}
-                      aria-label="Delete pin"
-                      className="text-paper/40 transition-colors hover:text-red-400"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                  {isActive && p.keys.length > 0 && (
-                    <div className="mt-2 flex flex-wrap gap-1.5 pl-6">
-                      {p.keys.map((k) => (
-                        <span key={k.t} className="inline-flex items-center overflow-hidden rounded-full border border-paper/20">
-                          <button
-                            type="button"
-                            onClick={() => seek(k.t)}
-                            className="px-2 py-0.5 font-mono text-[0.7rem] text-paper/70 transition-colors hover:text-champagne"
-                            title={`x ${k.x} · y ${k.y}`}
-                          >
-                            {fmt(k.t)}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => removeKey(p.id, k.t)}
-                            aria-label="Delete keyframe"
-                            className="border-l border-paper/20 px-1.5 py-0.5 text-[0.7rem] text-paper/40 hover:text-red-400"
-                          >
-                            ✕
-                          </button>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                  {isActive && (
-                    <p className="mt-1.5 pl-6 font-sans text-[0.7rem] text-paper/40">
-                      shows {fmt(s)}–{fmt(e)} · click the frame to add a keyframe here
-                    </p>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* export */}
-        <div className="mt-auto border-t border-paper/10 pt-4">
-          <button
-            type="button"
-            onClick={copyJson}
-            disabled={pins.length === 0}
-            className={cn(
-              "w-full rounded-full border border-champagne/60 px-4 py-2.5 font-sans text-xs uppercase tracking-[0.16em] text-champagne transition-colors hover:bg-champagne/10 disabled:opacity-30",
-            )}
-          >
-            {copied ? "Copied ✓" : "Copy JSON for video-pins.ts"}
-          </button>
-          <p className="mt-2 font-sans text-[0.7rem] leading-relaxed text-paper/40">
-            Autosaves to this browser. Paste the JSON into{" "}
-            <code className="text-champagne/80">data/video-pins.ts</code> to ship it.
-          </p>
-        </div>
+      {/* ---------- export ---------- */}
+      <div className="mt-6 border-t border-paper/10 pt-4">
+        <button
+          type="button"
+          onClick={copyJson}
+          disabled={pins.length === 0}
+          className="w-full rounded-full border border-champagne/60 px-4 py-2.5 font-sans text-xs uppercase tracking-[0.16em] text-champagne transition-colors hover:bg-champagne/10 disabled:opacity-30"
+        >
+          {copied ? "Copied ✓" : "Copy JSON for video-pins.ts"}
+        </button>
+        <p className="mt-2 font-sans text-[0.7rem] leading-relaxed text-paper/40">
+          Autosaves to this browser. Paste into{" "}
+          <code className="text-champagne/80">data/video-pins.ts</code> to ship it.
+        </p>
       </div>
     </div>
   );
