@@ -217,6 +217,42 @@ export const PLANS: Plan[] = [
       },
     ],
   },
+  {
+    // Apartment 1112 — SCHEMATIC interior floor (drawn by eye from the panos;
+    // refine room shapes + the dot path in /studio/plan). Tap a room to step in.
+    tourSlug: "apartment-1112",
+    sheets: [
+      {
+        id: "floor",
+        label: "Apartment 1112",
+        kind: "floor",
+        width: 16,
+        height: 12,
+        strokes: [[[0, 0], [16, 0], [16, 12], [0, 12], [0, 0]]],
+        zones: [
+          { id: "living", label: "Living Room", kind: "room", points: [[0.5, 0.5], [7.5, 0.5], [7.5, 5.5], [0.5, 5.5]], panoId: "living", videoTime: 5 },
+          { id: "kitchen", label: "Kitchen", kind: "room", points: [[8, 0.5], [15.5, 0.5], [15.5, 5.5], [8, 5.5]], panoId: "kitchen", videoTime: 20 },
+          { id: "bonus", label: "Bonus Room", kind: "room", points: [[0.5, 6], [6, 6], [6, 11.5], [0.5, 11.5]], panoId: "bonus", videoTime: 45 },
+          { id: "guest-bath", label: "Guest Bath", kind: "room", points: [[6.5, 6], [9.5, 6], [9.5, 8.5], [6.5, 8.5]], panoId: "guest-bath", videoTime: 35 },
+          { id: "primary-bath", label: "Primary Bath", kind: "room", points: [[10, 6], [15.5, 6], [15.5, 8.5], [10, 8.5]], panoId: "primary-bath", videoTime: 100 },
+          { id: "bedroom", label: "Primary Bedroom", kind: "room", points: [[6.5, 9], [15.5, 9], [15.5, 11.5], [6.5, 11.5]], panoId: "bedroom", videoTime: 80 },
+        ],
+        paths: {
+          flight: [
+            { t: 0, x: 4, y: 3 },
+            { t: 15, x: 11, y: 3 },
+            { t: 30, x: 8, y: 6 },
+            { t: 45, x: 3, y: 9 },
+            { t: 60, x: 8, y: 8 },
+            { t: 80, x: 12, y: 10 },
+            { t: 100, x: 13, y: 7 },
+            { t: 120, x: 9, y: 7 },
+            { t: 128, x: 6, y: 5 },
+          ],
+        },
+      },
+    ],
+  },
 ];
 
 export const getPlan = (tourSlug: string): Plan | undefined =>

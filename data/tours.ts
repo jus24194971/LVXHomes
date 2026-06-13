@@ -208,6 +208,32 @@ export const TOURS: Tour[] = [
     ],
     hidden: true,
   },
+  {
+    // Apartment 1112 — interior unit at The George (~2 min Avata 360 walkthrough).
+    // Rings to be authored in /tours/apartment-1112?author=1; panos reachable
+    // from the plan minimap meanwhile. Hidden.
+    slug: "apartment-1112",
+    title: "Apartment 1112",
+    location: "The George",
+    chapters: [
+      {
+        id: "flight",
+        label: "The Walkthrough",
+        video: { src: "https://media.lvxhomes.com/tours/apartment-1112/flight.mp4?v=1" },
+        startYaw: 180,
+        hotspots: [],
+      },
+    ],
+    panos: [
+      { id: "kitchen", label: "Kitchen", src: "https://media.lvxhomes.com/tours/apartment-1112/pano-kitchen.jpg?v=1", initialYaw: 0 },
+      { id: "living", label: "Living Room", src: "https://media.lvxhomes.com/tours/apartment-1112/pano-living.jpg?v=1", initialYaw: 0 },
+      { id: "guest-bath", label: "Guest Bath", src: "https://media.lvxhomes.com/tours/apartment-1112/pano-guest-bath.jpg?v=1", initialYaw: 0 },
+      { id: "bonus", label: "Bonus Room", src: "https://media.lvxhomes.com/tours/apartment-1112/pano-bonus.jpg?v=1", initialYaw: 0 },
+      { id: "bedroom", label: "Primary Bedroom", src: "https://media.lvxhomes.com/tours/apartment-1112/pano-bedroom.jpg?v=1", initialYaw: 0 },
+      { id: "primary-bath", label: "Primary Bath", src: "https://media.lvxhomes.com/tours/apartment-1112/pano-primary-bath.jpg?v=1", initialYaw: 0 },
+    ],
+    hidden: true,
+  },
 ];
 
 export const getTour = (slug: string): Tour | undefined =>
