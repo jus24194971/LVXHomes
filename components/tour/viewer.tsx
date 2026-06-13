@@ -21,6 +21,9 @@ import { cn } from "@/lib/utils";
 
 // Texture center (u=0.5) sits at lon=180 in the classic panorama camera math.
 const FRONT_LON = 180;
+// Flight altitude assumed for anchored-ring pitch (matches the render rig;
+// close enough for real footage until per-tour heights land).
+const CAMERA_HEIGHT_M = 1.35;
 
 const norm180 = (d: number) => ((((d + 180) % 360) + 360) % 360) - 180;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -357,17 +360,91 @@ export function TourViewer({
       const h = mount.clientHeight;
       const t = video.currentTime;
       const inVideo = startedRef.current && !panoRef.current;
+      const chId = tour.chapters[chapterIdxRef.current]?.id ?? "";
+
+      // Camera pose on the plan at time t — drives the you-are-here indicator
+      // AND world-anchored hotspots. Heading: keyframed h or travel tangent.
+      const interpPose = (path: NonNullable<NonNullable<typeof plan>["sheets"][0]["paths"]>[string]) => {
+        if (!path || path.length === 0) return null;
+        let a = path[0];
+        let b = path[path.length - 1];
+        if (t <= a.t) b = a;
+        else if (t >= b.t) a = b;
+        else {
+          for (let i = 0; i < path.length - 1; i++) {
+            if (t >= path[i].t && t <= path[i + 1].t) {
+              a = path[i];
+              b = path[i + 1];
+              break;
+            }
+          }
+        }
+        const f = b.t === a.t ? 0 : (t - a.t) / (b.t - a.t);
+        const x = a.x + (b.x - a.x) * f;
+        const y = a.y + (b.y - a.y) * f;
+        let heading: number;
+        if (a.h !== undefined && b.h !== undefined) {
+          heading = a.h + (((b.h - a.h + 540) % 360) - 180) * f;
+        } else if (a.h !== undefined) {
+          heading = a.h;
+        } else {
+          let dx = b.x - a.x;
+          let dy = b.y - a.y;
+          if (dx === 0 && dy === 0) {
+            const ai = path.indexOf(a);
+            const na = path[Math.max(ai - 1, 0)];
+            const nb = path[Math.min(ai + 1, path.length - 1)];
+            dx = nb.x - na.x;
+            dy = nb.y - na.y;
+          }
+          heading = (Math.atan2(dx, -dy) * 180) / Math.PI;
+        }
+        return { x, y, heading };
+      };
+      // World pose for anchors: the first sheet carrying this chapter's path.
+      let worldPose: { x: number; y: number; heading: number } | null = null;
+      if (plan) {
+        for (const s of plan.sheets) {
+          const p = s.paths?.[chId];
+          if (p && p.length) {
+            worldPose = interpPose(p);
+            break;
+          }
+        }
+      }
+
       for (const { ci, hs, key } of flatHotspots) {
         const node = hotspotEls.current.get(key);
         if (!node) continue;
-        let visible =
-          inVideo &&
-          ci === chapterIdxRef.current &&
-          t >= hs.start &&
-          t <= hs.end;
+        const inChapter = inVideo && ci === chapterIdxRef.current;
+        const gated =
+          (hs.start === undefined || t >= hs.start) &&
+          (hs.end === undefined || t <= hs.end);
+        let visible = false;
+        let yawDeg = 0;
+        let pitchDeg = 0;
+        let ringScale = 1;
+        if (hs.anchor && worldPose) {
+          // World-anchored: direction + distance from the live camera pose —
+          // the ring is wherever the room actually is, from wherever you are.
+          const dx = hs.anchor.x - worldPose.x;
+          const dyPlan = hs.anchor.y - worldPose.y;
+          const dist = Math.hypot(dx, dyPlan);
+          const bearing = (Math.atan2(dx, -dyPlan) * 180) / Math.PI;
+          yawDeg = norm180(bearing - worldPose.heading);
+          pitchDeg =
+            (Math.atan2((hs.anchor.h ?? 1) - CAMERA_HEIGHT_M, Math.max(dist, 0.1)) * 180) / Math.PI;
+          ringScale = Math.min(1.15, Math.max(0.42, 2.6 / Math.max(dist, 0.4)));
+          visible = inChapter && gated;
+        } else if (hs.yaw !== undefined && hs.pitch !== undefined) {
+          // Legacy timed mode: fixed frame-relative direction in a window.
+          yawDeg = hs.yaw;
+          pitchDeg = hs.pitch;
+          visible = inChapter && gated && hs.start !== undefined;
+        }
         if (visible) {
-          const phi = THREE.MathUtils.degToRad(90 - hs.pitch);
-          const theta = THREE.MathUtils.degToRad(FRONT_LON + hs.yaw);
+          const phi = THREE.MathUtils.degToRad(90 - pitchDeg);
+          const theta = THREE.MathUtils.degToRad(FRONT_LON + yawDeg);
           hsWorld.set(
             490 * Math.sin(phi) * Math.cos(theta),
             490 * Math.cos(phi),
@@ -386,6 +463,7 @@ export function TourViewer({
               const x = (hsWorld.x * 0.5 + 0.5) * w;
               const y = (-hsWorld.y * 0.5 + 0.5) * h;
               node.style.transform = `translate(-50%, -50%) translate(${x}px, ${y}px)`;
+              node.style.scale = String(ringScale);
             }
           }
         }
@@ -393,49 +471,19 @@ export function TourViewer({
         node.style.pointerEvents = visible ? "auto" : "none";
       }
 
-      // You-are-here: interpolate the flight path and aim the view cone.
+      // You-are-here: the displayed sheet's path for this chapter.
       const ind = planIndicatorRef.current;
       if (ind) {
         const sheetNow = plan?.sheets.find((s) => s.id === activeSheetIdRef.current);
-        const chapterNow = tour.chapters[chapterIdxRef.current];
-        const path = sheetNow?.paths?.[chapterNow?.id ?? ""];
-        if (inVideo && path && path.length > 0) {
-          let a = path[0];
-          let b = path[path.length - 1];
-          if (t <= a.t) b = a;
-          else if (t >= b.t) a = b;
-          else {
-            for (let i = 0; i < path.length - 1; i++) {
-              if (t >= path[i].t && t <= path[i + 1].t) {
-                a = path[i];
-                b = path[i + 1];
-                break;
-              }
-            }
-          }
-          const f = b.t === a.t ? 0 : (t - a.t) / (b.t - a.t);
-          const x = a.x + (b.x - a.x) * f;
-          const y = a.y + (b.y - a.y) * f;
-          // Base heading: keyframed (shortest-arc lerp) or direction of travel.
-          let base: number;
-          if (a.h !== undefined && b.h !== undefined) {
-            base = a.h + (((b.h - a.h + 540) % 360) - 180) * f;
-          } else if (a.h !== undefined) {
-            base = a.h;
-          } else {
-            let dx = b.x - a.x;
-            let dy = b.y - a.y;
-            if (dx === 0 && dy === 0) {
-              const ai = path.indexOf(a);
-              const na = path[Math.max(ai - 1, 0)];
-              const nb = path[Math.min(ai + 1, path.length - 1)];
-              dx = nb.x - na.x;
-              dy = nb.y - na.y;
-            }
-            base = (Math.atan2(dx, -dy) * 180) / Math.PI;
-          }
+        const dispPose = sheetNow?.paths?.[chId]
+          ? interpPose(sheetNow.paths[chId])
+          : null;
+        if (inVideo && dispPose) {
           const yawDeg = norm180(look.lon - FRONT_LON);
-          ind.setAttribute("transform", `translate(${x} ${y}) rotate(${base + yawDeg})`);
+          ind.setAttribute(
+            "transform",
+            `translate(${dispPose.x} ${dispPose.y}) rotate(${dispPose.heading + yawDeg})`,
+          );
           ind.style.display = "";
         } else {
           ind.style.display = "none";

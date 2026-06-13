@@ -11,13 +11,19 @@
 export type TourHotspot = {
   id: string;
   label: string;
-  /** Seconds into the chapter when the hotspot appears / disappears. */
-  start: number;
-  end: number;
-  /** Degrees from the center of the equirect frame (FRONT); positive = right. */
-  yaw: number;
-  /** Degrees above the horizon; positive = up. */
-  pitch: number;
+  /**
+   * World anchor (plan units = meters; plan y = world z; h = height in m).
+   * When set, the ring is computed live from the camera's plan-path pose —
+   * visible from anywhere you look, at any time, scaled down with distance.
+   */
+  anchor?: { x: number; y: number; h?: number };
+  /** Optional time gating (defaults: always). Required for legacy mode. */
+  start?: number;
+  end?: number;
+  /** Legacy timed mode: fixed degrees from frame center (FRONT). */
+  yaw?: number;
+  /** Legacy timed mode: degrees above the horizon. */
+  pitch?: number;
   panoId: string;
 };
 
@@ -57,18 +63,20 @@ export const TOURS: Tour[] = [
     title: "Engine Test Flight",
     chapters: [
       {
-        // 16s 3D-rendered flight: kitchen sweep → island pass → hallway →
-        // primary suite → arc over the bed. Hotspot yaws computed from the
-        // render spline against real scene anchors.
+        // 22s 3D-rendered flight: grand foyer → kitchen island → hallway →
+        // master bath → primary suite. Rings are world-anchored to the rooms
+        // themselves — always visible, scaling down with distance.
         id: "flight",
         label: "The Flight",
         video: {
-          src: "https://media.lvxhomes.com/tours/test/demo-flight-3d.mp4?v=1",
-          fallbackSrc: "/tours/demo-flight-3d.mp4",
+          src: "https://media.lvxhomes.com/tours/test/house-flight.mp4?v=1",
+          fallbackSrc: "/tours/house-flight.mp4",
         },
         hotspots: [
-          { id: "hs-kitchen", label: "Kitchen", start: 1, end: 4, yaw: -45, pitch: -12, panoId: "kitchen" },
-          { id: "hs-suite", label: "Primary Suite", start: 11, end: 14.5, yaw: 65, pitch: -10, panoId: "suite" },
+          { id: "hs-foyer", label: "Grand Foyer", anchor: { x: 4.25, y: 8, h: 1.5 }, panoId: "foyer" },
+          { id: "hs-kitchen", label: "Kitchen", anchor: { x: 3.5, y: 3, h: 1.0 }, panoId: "kitchen" },
+          { id: "hs-bath", label: "Master Bath", anchor: { x: 11.1, y: 1.85, h: 0.9 }, panoId: "bath" },
+          { id: "hs-suite", label: "Primary Suite", anchor: { x: 13, y: 5.6, h: 0.9 }, panoId: "suite" },
         ],
       },
       {
@@ -84,16 +92,28 @@ export const TOURS: Tour[] = [
     ],
     panos: [
       {
+        id: "foyer",
+        label: "The Grand Foyer",
+        src: "https://media.lvxhomes.com/tours/test/pano-foyer.jpg?v=1",
+        initialYaw: 170, // look back at the chandelier + entry
+      },
+      {
         id: "kitchen",
         label: "The Kitchen",
         src: "https://media.lvxhomes.com/tours/test/pano-kitchen-3d.jpg?v=1",
-        initialYaw: -125, // face the island from the capture point
+        initialYaw: 66, // face the island
+      },
+      {
+        id: "bath",
+        label: "The Master Bath",
+        src: "https://media.lvxhomes.com/tours/test/pano-bath.jpg?v=1",
+        initialYaw: 175, // look back at the tub + vanity
       },
       {
         id: "suite",
         label: "The Primary Suite",
         src: "https://media.lvxhomes.com/tours/test/pano-suite-3d.jpg?v=1",
-        initialYaw: 65, // face the bed
+        initialYaw: -138, // face the bed
       },
     ],
     hidden: true,

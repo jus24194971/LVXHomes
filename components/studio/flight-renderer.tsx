@@ -21,7 +21,7 @@ const RECEIVER = "http://localhost:4599";
 const W = 3072;
 const H = 1536;
 const FPS = 30;
-const SECONDS = 16;
+const SECONDS = 22;
 const FRAMES = FPS * SECONDS;
 const CAM_Y = 1.35;
 
@@ -82,18 +82,45 @@ function buildHouse(scene: THREE.Scene) {
   plankRegion(0, 7, 0, 6); // kitchen
   plankRegion(7, 9.5, 2, 4); // hall
   plankRegion(9.5, 16, 0, 7); // suite
+  plankRegion(1.5, 7, 6, 10); // grand foyer
+  // master bath: stone tile laid over the planks
+  const tile = mat(0xb9bfba, 0.6);
+  const tileB = mat(0xaab0ab, 0.6);
+  for (let tx = 9.5; tx < 12; tx += 0.625) {
+    for (let tz = 0; tz < 2.5; tz += 0.625) {
+      box(0.6, 0.04, 0.6, tx + 0.3125, 0.005, tz + 0.3125, ((tx + tz) * 1.6) % 2 < 1 ? tile : tileB, false, true);
+    }
+  }
 
-  // ---- ceiling ----
-  box(16, 0.1, 7.2, 8, 2.85, 3.5, paper, false, false);
+  // ---- ceilings ----
+  box(16, 0.1, 7.2, 8, 2.85, 3.5, paper, false, false); // main
+  box(5.5, 0.1, 4.2, 4.25, 3.65, 8, paper, false, false); // foyer (taller)
+  box(5.5, 0.95, 0.15, 4.25, 3.27, 6, cream, false, false); // clerestory band
+  box(0.15, 0.95, 4, 1.5, 3.27, 8, cream, false, false);
+  box(0.15, 0.95, 4, 7, 3.27, 8, cream, false, false);
 
   // ---- walls (h 2.8, t .15) ----
   const wall = (w: number, d: number, x: number, z: number) =>
     box(w, 2.8, d, x, 1.4, z, cream, true, true);
   wall(16.3, 0.15, 8, -0.075); // north z=0
   wall(0.15, 6.3, -0.075, 3); // west x=0
-  wall(7.15, 0.15, 3.5, 6.075); // kitchen south z=6
+  // kitchen south z=6 with foyer door gap x 3..4.6
+  wall(3, 0.15, 1.5, 6.075);
+  wall(2.4, 0.15, 5.8, 6.075);
+  box(1.9, 0.1, 0.22, 3.8, 2.45, 6.075, champagne, false, false); // door header
   wall(0.15, 7.3, 16.075, 3.5); // east x=16
   wall(6.65, 0.15, 12.75, 7.075); // suite south z=7
+  // grand foyer shell (taller walls h 3.6)
+  box(0.15, 4.15, 3.6, 1.5, 1.8, 8.075, cream); // west
+  box(0.15, 4.15, 3.6, 7, 1.8, 8.075, cream); // east
+  box(2.05, 3.6, 0.15, 2.475, 1.8, 10.075, cream); // south, left of entry
+  box(2.05, 3.6, 0.15, 6.025, 1.8, 10.075, cream); // south, right of entry
+  box(2.1, 0.7, 0.15, 4.25, 3.25, 10.075, cream); // above entry
+  // master bath partition (inside the suite, x 9.5..12 z 0..2.5)
+  wall(0.7, 0.15, 9.85, 2.5); // south wall, west of door
+  wall(0.8, 0.15, 11.6, 2.5); // south wall, east of door
+  wall(0.15, 2.5, 12, 1.25); // east wall
+  box(0.22, 0.1, 1, 10.7, 2.45, 2.5, champagne, false, false); // bath door header
   // kitchen/hall wall x=7 with door gap z 2..4
   wall(0.15, 2, 7, 1); wall(0.15, 2, 7, 5);
   // hall sides
@@ -174,6 +201,64 @@ function buildHouse(scene: THREE.Scene) {
   box(0.1, 0.08, 2.7, 15.94, 2.32, 3.2, champagne, false, false);
   box(2.1, 1.3, 0.06, 12.6, 1.55, 0.04, mat(0xfff0d8, 1, 0, 1.3), false, false);
 
+  // ---- grand foyer ----
+  {
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.55, 0.045, 10, 36), champagne);
+    ring.rotation.x = Math.PI / 2;
+    ring.position.set(4.25, 2.75, 8);
+    scene.add(ring);
+    box(0.025, 0.85, 0.025, 4.25, 3.2, 8, espresso, false, false); // stem
+    for (let i = 0; i < 5; i++) {
+      const a = (i / 5) * Math.PI * 2;
+      const bulb = new THREE.Mesh(
+        new THREE.SphereGeometry(0.07, 14, 10),
+        new THREE.MeshStandardMaterial({ color: 0xffe0b0, emissive: 0xffcf8a, emissiveIntensity: 2.4 }),
+      );
+      bulb.position.set(4.25 + Math.cos(a) * 0.55, 2.72, 8 + Math.sin(a) * 0.55);
+      scene.add(bulb);
+    }
+    const chand = new THREE.PointLight(0xffd9a8, 9, 11, 2);
+    chand.position.set(4.25, 2.6, 8);
+    scene.add(chand);
+    const rug = new THREE.Mesh(new THREE.CylinderGeometry(1.35, 1.35, 0.025, 40), mat(0x6f7a82, 0.95));
+    rug.position.set(4.25, 0.0125, 8);
+    rug.receiveShadow = true;
+    scene.add(rug);
+    box(1.5, 0.85, 0.4, 2.0, 0.425, 9.7, espresso); // console
+    box(1.0, 0.8, 0.05, 2.0, 1.95, 10.0, champagne, false, false); // art
+    box(1.0, 0.8, 0.05, 1.56, 1.7, 8.0, champagne, false, false); // art west
+    // entry doors + glowing transom/sidelites
+    box(0.7, 2.2, 0.1, 3.9, 1.1, 10.04, espresso, false, false);
+    box(0.7, 2.2, 0.1, 4.6, 1.1, 10.04, espresso, false, false);
+    box(2.1, 0.5, 0.06, 4.25, 2.6, 10.03, mat(0xfff0d0, 1, 0, 1.5), false, false); // transom
+    box(0.28, 1.9, 0.06, 3.4, 1.15, 10.03, mat(0xfff0d0, 1, 0, 1.2), false, false);
+    box(0.28, 1.9, 0.06, 5.1, 1.15, 10.03, mat(0xfff0d0, 1, 0, 1.2), false, false);
+  }
+
+  // ---- master bath ----
+  {
+    box(1.9, 0.82, 0.55, 10.6, 0.41, 0.36, espresso); // vanity
+    box(2.05, 0.06, 0.62, 10.6, 0.85, 0.37, counter);
+    box(0.5, 0.1, 0.36, 10.15, 0.91, 0.34, mat(0xfbf8f1, 0.25)); // sinks
+    box(0.5, 0.1, 0.36, 11.05, 0.91, 0.34, mat(0xfbf8f1, 0.25));
+    box(1.7, 0.95, 0.04, 10.6, 1.62, 0.1, mat(0xbcc4c8, 0.06, 0.95), false, false); // mirror
+    box(1.85, 0.06, 0.08, 10.6, 2.14, 0.11, champagne, false, false);
+    // freestanding tub
+    box(1.6, 0.55, 0.78, 11.1, 0.275, 1.85, mat(0xfbf8f1, 0.2));
+    box(1.44, 0.06, 0.62, 11.1, 0.52, 1.85, mat(0x8d959b, 0.4), false, false); // water line
+    // glass shower
+    const glass = new THREE.MeshStandardMaterial({ color: 0xcfe2e8, roughness: 0.05, metalness: 0.1, transparent: true, opacity: 0.22 });
+    box(0.05, 2.1, 0.9, 9.95, 1.05, 1.95, glass, false, false);
+    box(0.7, 2.1, 0.05, 10.28, 1.05, 1.52, glass, false, false);
+    box(0.06, 2.15, 0.06, 9.95, 1.075, 1.51, champagne, false, false);
+    const sconceA = new THREE.PointLight(0xffe2c0, 3.2, 6, 2);
+    sconceA.position.set(10.1, 1.9, 0.4);
+    scene.add(sconceA);
+    const sconceB = new THREE.PointLight(0xffe2c0, 3.2, 6, 2);
+    sconceB.position.set(11.1, 1.9, 0.4);
+    scene.add(sconceB);
+  }
+
   // ---- lights ----
   scene.add(new THREE.AmbientLight(0xfff2e2, 0.6));
   scene.add(new THREE.HemisphereLight(0xfff6e8, 0x5a4a38, 0.55));
@@ -252,11 +337,13 @@ export function FlightRenderer() {
       });
       quadScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), quadMat));
 
-      // flight path — kitchen sweep → island orbit → hall → suite → bed arc
+      // flight path — grand foyer → kitchen door → island loop → hall →
+      // master bath (vanity + tub) → primary suite → bed arc → settle
       const pts = [
-        [1.0, 1.0], [2.2, 2.6], [3.3, 4.6], [5.2, 3.6], [6.4, 3.0],
-        [8.3, 3.0], [10.2, 3.1], [11.6, 2.4], [13.2, 2.6], [14.4, 4.0],
-        [13.4, 5.0], [11.9, 3.6],
+        [4.2, 9.2], [4.0, 7.6], [3.7, 6.2], [2.8, 4.7], [2.4, 3.0],
+        [3.4, 1.9], [5.1, 2.5], [6.4, 3.0], [8.3, 3.0], [10.3, 3.0],
+        [10.7, 2.2], [10.4, 1.2], [11.3, 1.4], [11.0, 2.2], [12.4, 3.0],
+        [13.9, 3.7], [14.2, 4.7], [13.0, 5.1], [12.0, 4.0],
       ].map(([x, z]) => new THREE.Vector3(x, CAM_Y, z));
       const curve = new THREE.CatmullRomCurve3(pts, false, "centripetal", 0.5);
 
@@ -265,24 +352,8 @@ export function FlightRenderer() {
         const p = curve.getPointAt(t / SECONDS);
         state.pathKeys.push({ t, x: Math.round(p.x * 10) / 10, y: Math.round(p.z * 10) / 10 });
       }
-      // hotspot yaw suggestions toward scene anchors
-      const suggest = (name: string, t: number, target: THREE.Vector3) => {
-        const u = t / SECONDS;
-        const pos = curve.getPointAt(u);
-        const tan = curve.getTangentAt(u);
-        const yawCam = Math.atan2(-tan.x, -tan.z);
-        const d = target.clone().sub(pos);
-        const c = Math.cos(-yawCam), s = Math.sin(-yawCam);
-        const lx = c * d.x + s * d.z;
-        const lz = -s * d.x + c * d.z;
-        state.suggestions[name] = {
-          t,
-          yaw: Math.round(Math.atan2(lx, -lz) * (180 / Math.PI)),
-          pitch: Math.round(Math.atan2(d.y, Math.hypot(lx, lz)) * (180 / Math.PI)),
-        };
-      };
-      suggest("kitchenIsland", 3, new THREE.Vector3(3.5, 1.0, 3.0));
-      suggest("suiteBed", 12.5, new THREE.Vector3(13.0, 0.9, 5.6));
+      // (Hotspots are world-anchored now — no per-time yaw suggestions needed;
+      // anchors in data/tours.ts use these same scene coordinates.)
 
       const blob = () =>
         new Promise<Blob>((res, rej) =>
@@ -290,7 +361,12 @@ export function FlightRenderer() {
         );
 
       set("rendering");
-      const PANO_FRAMES: Record<number, string> = { 90: "pano-kitchen-3d.jpg", 372: "pano-suite-3d.jpg" };
+      const PANO_FRAMES: Record<number, string> = {
+        45: "pano-foyer.jpg", // t 1.5 — under the chandelier
+        165: "pano-kitchen-3d.jpg", // t 5.5 — by the island
+        480: "pano-bath.jpg", // t 16 — vanity + tub
+        585: "pano-suite-3d.jpg", // t 19.5 — over the bed
+      };
       for (let f = 0; f < FRAMES; f++) {
         const u = f / (FRAMES - 1);
         const pos = curve.getPointAt(u);
