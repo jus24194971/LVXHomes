@@ -81,23 +81,26 @@ export const PLANS: Plan[] = [
           ],
         ],
         zones: [
-          { id: "suite", label: "Primary Suite", kind: "room", points: [[10, 10], [30, 10], [30, 40], [10, 40]], panoId: "suite" },
+          { id: "suite", label: "Primary Suite", kind: "room", points: [[10, 10], [30, 10], [30, 40], [10, 40]], videoTime: 12 },
           { id: "foyer", label: "Foyer", kind: "room", points: [[10, 40], [30, 40], [30, 60], [10, 60]], videoTime: 0 },
-          { id: "great", label: "Great Room", kind: "room", points: [[30, 10], [65, 10], [65, 60], [30, 60]], videoTime: 4 },
-          { id: "kitchen", label: "Kitchen", kind: "room", points: [[65, 10], [90, 10], [90, 35], [65, 35]], panoId: "kitchen" },
-          { id: "dining", label: "Dining", kind: "room", points: [[65, 35], [90, 35], [90, 60], [65, 60]], videoTime: 8 },
+          { id: "great", label: "Great Room", kind: "room", points: [[30, 10], [65, 10], [65, 60], [30, 60]], videoTime: 2 },
+          { id: "kitchen", label: "Kitchen", kind: "room", points: [[65, 10], [90, 10], [90, 35], [65, 35]], videoTime: 7 },
+          { id: "dining", label: "Dining", kind: "room", points: [[65, 35], [90, 35], [90, 60], [65, 60]], videoTime: 9 },
         ],
-        // Traveling-dot keyframes for the 12s test loop: foyer → great room →
-        // kitchen pass → dining → back. Headings fall back to path tangent.
+        // Traveling-dot keyframes matched to the 16s demo flight:
+        // Great Room (0–5) → Kitchen (6–10) → Primary Suite (11–16).
         paths: {
           flight: [
-            { t: 0, x: 20, y: 50 },
-            { t: 2, x: 38, y: 42 },
-            { t: 4, x: 47, y: 22 },
-            { t: 6, x: 62, y: 24 },
-            { t: 8, x: 77, y: 46 },
-            { t: 10, x: 50, y: 52 },
-            { t: 12, x: 20, y: 50 },
+            { t: 0, x: 22, y: 50 },
+            { t: 1.5, x: 42, y: 38 },
+            { t: 4.5, x: 52, y: 26 },
+            { t: 6, x: 64, y: 24 },
+            { t: 7.5, x: 76, y: 20 },
+            { t: 9.5, x: 80, y: 30 },
+            { t: 11, x: 50, y: 34 },
+            { t: 12.5, x: 31, y: 28 },
+            { t: 14, x: 20, y: 20 },
+            { t: 16, x: 17, y: 30 },
           ],
         },
       },

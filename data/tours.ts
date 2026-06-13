@@ -57,14 +57,19 @@ export const TOURS: Tour[] = [
     title: "Engine Test Flight",
     chapters: [
       {
+        // 16s demo: Great Room (0–5) → Kitchen (6–10) → Primary Suite (11–16),
+        // with timed hotspot rings hanging on each room's drawn doorways.
         id: "flight",
         label: "The Flight",
-        video: TEST_VIDEO,
-        // Always-visible windows for engine testing; real tours use timed
-        // windows. (±60°, not ±90 — exactly perpendicular is degenerate.)
+        video: {
+          src: "https://media.lvxhomes.com/tours/test/demo-flight.mp4?v=1",
+          fallbackSrc: "/tours/demo-flight.mp4",
+        },
         hotspots: [
-          { id: "hs-kitchen", label: "Kitchen", start: 0, end: 999, yaw: -60, pitch: -6, panoId: "kitchen" },
-          { id: "hs-suite", label: "Primary Suite", start: 0, end: 999, yaw: 60, pitch: -6, panoId: "suite" },
+          { id: "hs-kitchen", label: "Kitchen", start: 0.5, end: 4.8, yaw: 60, pitch: -4, panoId: "kitchen" },
+          { id: "hs-suite", label: "Primary Suite", start: 0.5, end: 4.8, yaw: -60, pitch: -4, panoId: "suite" },
+          { id: "hs-great-k", label: "Great Room", start: 6.2, end: 9.8, yaw: -70, pitch: -4, panoId: "great" },
+          { id: "hs-great-s", label: "Great Room", start: 11.2, end: 15.5, yaw: 70, pitch: -4, panoId: "great" },
         ],
       },
       {
@@ -79,6 +84,11 @@ export const TOURS: Tour[] = [
       },
     ],
     panos: [
+      {
+        id: "great",
+        label: "The Great Room",
+        src: "https://media.lvxhomes.com/tours/test/pano-great.jpg?v=1",
+      },
       {
         id: "kitchen",
         label: "The Kitchen",
