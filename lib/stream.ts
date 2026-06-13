@@ -29,6 +29,15 @@ const POSTER_TIME: Record<string, string> = {
   d0cde33269c8528f1a71ad128aa54310: "4s",
 };
 
+/**
+ * HLS manifest URL for a Stream video — for a plain <video> element (Safari
+ * plays it natively; elsewhere attach via hls.js). Used by the Pin Studio,
+ * which needs a real <video> to overlay click-placed markers on.
+ */
+export function streamHls(uid: string): string {
+  return `https://customer-${CF_STREAM_CUSTOMER_CODE}.cloudflarestream.com/${uid}/manifest/video.m3u8`;
+}
+
 /** Poster/thumbnail URL for a Stream video. */
 export function streamPoster(
   uid: string,
