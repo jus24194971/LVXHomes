@@ -63,7 +63,11 @@ export function TourViewer({
   const [pano, setPano] = useState<TourPano | null>(null);
   const [author, setAuthor] = useState(false);
   const [marks, setMarks] = useState<AuthorMark[]>([]);
+  const [pathMarks, setPathMarks] = useState<
+    Record<string, Record<string, { t: number; x: number; y: number }[]>>
+  >({});
   const [copied, setCopied] = useState(false);
+  const [copiedPaths, setCopiedPaths] = useState(false);
   const [planOpen, setPlanOpen] = useState(false);
   const [activeSheetId, setActiveSheetId] = useState(plan?.sheets[0]?.id ?? "");
   const [chapterIdx, setChapterIdx] = useState(0);
@@ -73,6 +77,8 @@ export function TourViewer({
   const panoRef = useRef<TourPano | null>(null);
   const authorRef = useRef(false);
   const chapterIdxRef = useRef(0);
+  const activeSheetIdRef = useRef("");
+  const planIndicatorRef = useRef<SVGGElement | null>(null);
   /** Each chapter remembers where the viewer left it. */
   const chapterTimesRef = useRef<Record<string, number>>({});
   const triedFallbackRef = useRef(false);
@@ -80,6 +86,7 @@ export function TourViewer({
   panoRef.current = pano;
   authorRef.current = author;
   chapterIdxRef.current = chapterIdx;
+  activeSheetIdRef.current = activeSheetId;
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -386,6 +393,55 @@ export function TourViewer({
         node.style.pointerEvents = visible ? "auto" : "none";
       }
 
+      // You-are-here: interpolate the flight path and aim the view cone.
+      const ind = planIndicatorRef.current;
+      if (ind) {
+        const sheetNow = plan?.sheets.find((s) => s.id === activeSheetIdRef.current);
+        const chapterNow = tour.chapters[chapterIdxRef.current];
+        const path = sheetNow?.paths?.[chapterNow?.id ?? ""];
+        if (inVideo && path && path.length > 0) {
+          let a = path[0];
+          let b = path[path.length - 1];
+          if (t <= a.t) b = a;
+          else if (t >= b.t) a = b;
+          else {
+            for (let i = 0; i < path.length - 1; i++) {
+              if (t >= path[i].t && t <= path[i + 1].t) {
+                a = path[i];
+                b = path[i + 1];
+                break;
+              }
+            }
+          }
+          const f = b.t === a.t ? 0 : (t - a.t) / (b.t - a.t);
+          const x = a.x + (b.x - a.x) * f;
+          const y = a.y + (b.y - a.y) * f;
+          // Base heading: keyframed (shortest-arc lerp) or direction of travel.
+          let base: number;
+          if (a.h !== undefined && b.h !== undefined) {
+            base = a.h + (((b.h - a.h + 540) % 360) - 180) * f;
+          } else if (a.h !== undefined) {
+            base = a.h;
+          } else {
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            if (dx === 0 && dy === 0) {
+              const ai = path.indexOf(a);
+              const na = path[Math.max(ai - 1, 0)];
+              const nb = path[Math.min(ai + 1, path.length - 1)];
+              dx = nb.x - na.x;
+              dy = nb.y - na.y;
+            }
+            base = (Math.atan2(dx, -dy) * 180) / Math.PI;
+          }
+          const yawDeg = norm180(look.lon - FRONT_LON);
+          ind.setAttribute("transform", `translate(${x} ${y}) rotate(${base + yawDeg})`);
+          ind.style.display = "";
+        } else {
+          ind.style.display = "none";
+        }
+      }
+
       if (authorRef.current && readoutRef.current) {
         readoutRef.current.textContent = `t ${t.toFixed(1)}s · yaw ${norm180(
           look.lon - FRONT_LON,
@@ -604,6 +660,38 @@ export function TourViewer({
     }
   };
 
+  /** Author mode: a click on the plan drops a timed path keyframe. */
+  const recordPathMark = useCallback(
+    (x: number, y: number) => {
+      const v = videoRef.current;
+      const ch = tour.chapters[chapterIdxRef.current]?.id;
+      const sh = activeSheetIdRef.current;
+      if (!v || !ch || !sh) return;
+      const t = Math.round(v.currentTime * 10) / 10;
+      setPathMarks((prev) => {
+        const bySheet = { ...(prev[sh] ?? {}) };
+        bySheet[ch] = [...(bySheet[ch] ?? []), { t, x, y }].sort((p, q) => p.t - q.t);
+        return { ...prev, [sh]: bySheet };
+      });
+    },
+    [tour.chapters],
+  );
+
+  const copyPathMarks = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(pathMarks, null, 2));
+      setCopiedPaths(true);
+      setTimeout(() => setCopiedPaths(false), 1500);
+    } catch {
+      /* clipboard unavailable */
+    }
+  };
+
+  const pathMarkCount = Object.values(pathMarks).reduce(
+    (n, byCh) => n + Object.values(byCh).reduce((m, arr) => m + arr.length, 0),
+    0,
+  );
+
   // Sizes use container-query units so the UI keeps the same visual weight
   // whether the player is a 400px embed or a fullscreen 4K monitor.
   const ctl =
@@ -810,6 +898,9 @@ export function TourViewer({
             }
             onZoneClick={handleZoneClick}
             onClose={() => setPlanOpen(false)}
+            indicatorRef={planIndicatorRef}
+            authorMode={author}
+            onCanvasClick={author ? recordPathMark : undefined}
           />
         </div>
       )}
@@ -862,6 +953,30 @@ export function TourViewer({
             >
               Clear
             </button>
+          </div>
+          <div className="mt-4 border-t border-paper/15 pt-3">
+            <p className="text-paper/70">
+              Path keys: <span className="tabular-nums text-champagne">{pathMarkCount}</span>
+              <span className="text-paper/40"> — open the Plan, fly, click your position</span>
+            </p>
+            <div className="mt-2 flex gap-2">
+              <button
+                type="button"
+                onClick={() => void copyPathMarks()}
+                disabled={pathMarkCount === 0}
+                className="flex-1 rounded border border-champagne/60 px-2 py-1.5 uppercase tracking-[0.14em] text-champagne transition-colors hover:bg-champagne hover:text-ink disabled:opacity-40"
+              >
+                {copiedPaths ? "Copied" : "Copy paths"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setPathMarks({})}
+                disabled={pathMarkCount === 0}
+                className="rounded border border-paper/30 px-2 py-1.5 uppercase tracking-[0.14em] text-paper/70 transition-colors hover:border-paper/60 disabled:opacity-40"
+              >
+                Clear
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -102,7 +102,11 @@ a ‹ › chapter switcher. Encode one file per chapter
       zone→pano links, hidden test tour only.
 - [x] Plan Phase B — Floorplan Studio editor at /studio/plan (draw / snap /
       trace / multi-sheet / import-export); chaptered flights shipped with it.
-- [ ] Plan Phase C — you-are-here path + view cone on the plan.
+- [x] Plan Phase C — the traveling dot: per-chapter path keyframes on each
+      sheet (`paths`), interpolated against video time, with a live view cone
+      (path heading or keyframed `h`, plus the viewer's current look).
+      Authoring: in ?author=1 open the Plan, fly, click your position as you
+      go — each click records {t,x,y}; "Copy paths" emits the `paths` JSON.
 - [ ] Plan Phase D — SLAM pipeline (camera path + wall evidence from 360
       masters; GPS telemetry for outdoor sheets).
 - [ ] Tour Phase 3 — polish + integration: HEVC/4K tier switching, intro

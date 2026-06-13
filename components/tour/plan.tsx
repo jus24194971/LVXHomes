@@ -31,25 +31,46 @@ function PlanSheetSVG({
   sheet,
   activeZoneId,
   onZoneClick,
+  indicatorRef,
+  authorMode,
+  onCanvasClick,
 }: {
   sheet: PlanSheet;
   activeZoneId?: string;
   onZoneClick: (zone: PlanZone) => void;
+  /** Mutated each frame by the player loop — the traveling dot + view cone. */
+  indicatorRef?: React.RefObject<SVGGElement | null>;
+  /** Author mode: every click reports plan coords instead of zone actions. */
+  authorMode?: boolean;
+  onCanvasClick?: (x: number, y: number) => void;
 }) {
   const labelSize = Math.max(sheet.width, sheet.height) * 0.034;
+  const indScale = Math.max(sheet.width, sheet.height) * 0.014;
   return (
     <svg
       viewBox={`0 0 ${sheet.width} ${sheet.height}`}
       className="block h-auto w-full"
       role="group"
       aria-label={`${sheet.label} plan`}
+      onClick={
+        authorMode && onCanvasClick
+          ? (e) => {
+              const svg = e.currentTarget;
+              const m = svg.getScreenCTM();
+              if (!m) return;
+              const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(m.inverse());
+              onCanvasClick(Math.round(p.x * 10) / 10, Math.round(p.y * 10) / 10);
+            }
+          : undefined
+      }
     >
       {/* Plan card */}
       <rect x={0} y={0} width={sheet.width} height={sheet.height} fill="#FBF8F1" />
 
       {sheet.zones.map((z) => {
         const active = z.id === activeZoneId;
-        const interactive = z.panoId !== undefined || z.videoTime !== undefined;
+        const interactive =
+          !authorMode && (z.panoId !== undefined || z.videoTime !== undefined);
         const [cx, cy] = centroid(z.points);
         const d = `M ${z.points.map(([x, y]) => `${x} ${y}`).join(" L ")} Z`;
         return (
@@ -120,6 +141,18 @@ function PlanSheetSVG({
           strokeLinejoin="miter"
         />
       ))}
+
+      {/* You-are-here — positioned/rotated each frame by the player loop */}
+      {indicatorRef && (
+        <g ref={indicatorRef} style={{ display: "none" }} aria-hidden>
+          <g transform={`scale(${indScale})`}>
+            {/* view cone points "up"; the loop rotates the outer group */}
+            <path d="M 0 0 L -2.4 -5.6 A 6.1 6.1 0 0 1 2.4 -5.6 Z" fill="#B7995C" fillOpacity={0.35} />
+            <circle r={2.6} fill="none" stroke="#B7995C" strokeOpacity={0.45} strokeWidth={0.35} className="motion-safe:animate-ping" style={{ transformOrigin: "0 0" }} />
+            <circle r={1.5} fill="#A6863F" stroke="#FBF8F1" strokeWidth={0.45} />
+          </g>
+        </g>
+      )}
     </svg>
   );
 }
@@ -131,6 +164,9 @@ export function PlanPanel({
   activeZoneId,
   onZoneClick,
   onClose,
+  indicatorRef,
+  authorMode,
+  onCanvasClick,
   className,
 }: {
   plan: Plan;
@@ -139,6 +175,9 @@ export function PlanPanel({
   activeZoneId?: string;
   onZoneClick: (zone: PlanZone) => void;
   onClose: () => void;
+  indicatorRef?: React.RefObject<SVGGElement | null>;
+  authorMode?: boolean;
+  onCanvasClick?: (x: number, y: number) => void;
   className?: string;
 }) {
   const sheet =
@@ -182,10 +221,13 @@ export function PlanPanel({
           sheet={sheet}
           activeZoneId={activeZoneId}
           onZoneClick={onZoneClick}
+          indicatorRef={indicatorRef}
+          authorMode={authorMode}
+          onCanvasClick={onCanvasClick}
         />
       </div>
       <p className="px-3 pb-2 font-sans text-[clamp(0.5625rem,0.65cqw,0.8125rem)] uppercase tracking-[0.14em] text-paper/45">
-        Tap a space to fly there
+        {authorMode ? "Author mode · click the plan to drop a path key" : "Tap a space to fly there"}
       </p>
     </div>
   );

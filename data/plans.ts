@@ -32,6 +32,16 @@ export type PlanZone = {
   panoId?: string;
 };
 
+/**
+ * A keyframe on the flight path: at `t` seconds into a chapter the camera is
+ * at (x, y) on this sheet. Optional `h` = the plan bearing (degrees clockwise
+ * from sheet-up) that the equirect frame's FRONT faces at that moment — when
+ * omitted, the direction of travel (path tangent) is used, which suits
+ * camera-locked footage. The live view cone = this base heading + the
+ * viewer's current look direction.
+ */
+export type PlanPathKey = { t: number; x: number; y: number; h?: number };
+
 export type PlanSheet = {
   id: string;
   label: string;
@@ -42,6 +52,8 @@ export type PlanSheet = {
   zones: PlanZone[];
   /** Heavy strokes: exterior walls, property boundary, fences. */
   strokes?: [number, number][][];
+  /** Flight-path keyframes per chapter id — drives the traveling dot. */
+  paths?: Record<string, PlanPathKey[]>;
 };
 
 export type Plan = {
@@ -75,6 +87,19 @@ export const PLANS: Plan[] = [
           { id: "kitchen", label: "Kitchen", kind: "room", points: [[65, 10], [90, 10], [90, 35], [65, 35]], panoId: "kitchen" },
           { id: "dining", label: "Dining", kind: "room", points: [[65, 35], [90, 35], [90, 60], [65, 60]], videoTime: 8 },
         ],
+        // Traveling-dot keyframes for the 12s test loop: foyer → great room →
+        // kitchen pass → dining → back. Headings fall back to path tangent.
+        paths: {
+          flight: [
+            { t: 0, x: 20, y: 50 },
+            { t: 2, x: 38, y: 42 },
+            { t: 4, x: 47, y: 22 },
+            { t: 6, x: 62, y: 24 },
+            { t: 8, x: 77, y: 46 },
+            { t: 10, x: 50, y: 52 },
+            { t: 12, x: 20, y: 50 },
+          ],
+        },
       },
       {
         id: "grounds",
@@ -100,6 +125,17 @@ export const PLANS: Plan[] = [
           { id: "patio", label: "Courtyard", kind: "hardscape", points: [[45, 60], [95, 60], [95, 75], [45, 75]], chapterId: "grounds", videoTime: 6 },
           { id: "pool", label: "Pool", kind: "water", points: [[100, 65], [125, 65], [125, 85], [100, 85]], chapterId: "grounds", videoTime: 8 },
         ],
+        paths: {
+          grounds: [
+            { t: 0, x: 112, y: 25 },
+            { t: 2, x: 98, y: 35 },
+            { t: 4, x: 70, y: 42 },
+            { t: 6, x: 70, y: 68 },
+            { t: 8, x: 112, y: 75 },
+            { t: 10, x: 40, y: 80 },
+            { t: 12, x: 25, y: 40 },
+          ],
+        },
       },
     ],
   },
