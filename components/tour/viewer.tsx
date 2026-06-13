@@ -60,6 +60,8 @@ export function TourViewer({
   const [hint, setHint] = useState(false);
   const [motionAvail, setMotionAvail] = useState(false);
   const [motionOn, setMotionOn] = useState(false);
+  const [calibMsg, setCalibMsg] = useState<null | "hold" | "done">(null);
+  const [motionNudge, setMotionNudge] = useState(false);
   const [fsAvail, setFsAvail] = useState(false);
   const [failed, setFailed] = useState(false);
   const [fading, setFading] = useState(false);
@@ -82,6 +84,10 @@ export function TourViewer({
   const chapterIdxRef = useRef(0);
   const activeSheetIdRef = useRef("");
   const planIndicatorRef = useRef<SVGGElement | null>(null);
+  /** Heading reference captured at gyro calibration (degrees, lon-space). */
+  const calibLonRef = useRef(FRONT_LON);
+  /** Gyro calibration phase: request → provisional zero → steady lock. */
+  const calibPhaseRef = useRef<"off" | "kickoff" | "waiting" | "done">("off");
   /** Each chapter remembers where the viewer left it. */
   const chapterTimesRef = useRef<Record<string, number>>({});
   const triedFallbackRef = useRef(false);
@@ -166,17 +172,6 @@ export function TourViewer({
 
     // ---------- device orientation ----------
     const orient = { alpha: 0, beta: 0, gamma: 0, has: false };
-    window.addEventListener(
-      "deviceorientation",
-      (e) => {
-        if (e.alpha === null || e.beta === null || e.gamma === null) return;
-        orient.alpha = THREE.MathUtils.degToRad(e.alpha);
-        orient.beta = THREE.MathUtils.degToRad(e.beta);
-        orient.gamma = THREE.MathUtils.degToRad(e.gamma);
-        orient.has = true;
-      },
-      { signal },
-    );
     const zee = new THREE.Vector3(0, 0, 1);
     const euler = new THREE.Euler();
     const qScreen = new THREE.Quaternion();
@@ -189,6 +184,71 @@ export function TourViewer({
           (window as unknown as { orientation?: number }).orientation ??
           0) as number,
       );
+
+    // Gyro calibration: gravity gives absolute pitch/roll, but heading boots
+    // to an arbitrary device frame. We zero it against the current view so
+    // engaging Motion never jumps, then lock a clean reference once the
+    // phone is held steady (detected from orientation deltas — same signal
+    // as the accelerometer without a second iOS permission prompt).
+    const calQ = new THREE.Quaternion();
+    const calE = new THREE.Euler();
+    const calV = new THREE.Vector3();
+    const captureCalibration = () => {
+      calE.set(orient.beta, orient.alpha, -orient.gamma, "YXZ");
+      calQ.setFromEuler(calE);
+      calQ.multiply(qWorld);
+      calQ.multiply(qScreen.setFromAxisAngle(zee, -screenAngle()));
+      calV.set(0, 0, -1).applyQuaternion(calQ);
+      const lonDev = (Math.atan2(calV.z, calV.x) * 180) / Math.PI;
+      // With qYaw built against this reference, the final view lon equals
+      // look.lon at the capture instant — engage/recalibrate never jumps.
+      calibLonRef.current = lonDev;
+      look.lon = FRONT_LON + norm180(look.lon - FRONT_LON); // keep lon tidy
+    };
+    const steadyBuf: { t: number; a: number; b: number; g: number }[] = [];
+    let calibDeadline = 0;
+    window.addEventListener(
+      "deviceorientation",
+      (e) => {
+        if (e.alpha === null || e.beta === null || e.gamma === null) return;
+        orient.alpha = THREE.MathUtils.degToRad(e.alpha);
+        orient.beta = THREE.MathUtils.degToRad(e.beta);
+        orient.gamma = THREE.MathUtils.degToRad(e.gamma);
+        orient.has = true;
+
+        const phase = calibPhaseRef.current;
+        if (phase === "kickoff") {
+          captureCalibration(); // provisional zero — no jump on engage
+          calibPhaseRef.current = "waiting";
+          calibDeadline = performance.now() + 8000;
+          steadyBuf.length = 0;
+          setCalibMsg("hold");
+        } else if (phase === "waiting") {
+          const now = performance.now();
+          steadyBuf.push({ t: now, a: e.alpha, b: e.beta, g: e.gamma });
+          while (steadyBuf.length && now - steadyBuf[0].t > 750) steadyBuf.shift();
+          const windowFull =
+            steadyBuf.length > 6 && now - steadyBuf[0].t > 600;
+          let steady = false;
+          if (windowFull) {
+            let aMin = 360, aMax = -360, bMin = 360, bMax = -360, gMin = 360, gMax = -360;
+            for (const s of steadyBuf) {
+              aMin = Math.min(aMin, s.a); aMax = Math.max(aMax, s.a);
+              bMin = Math.min(bMin, s.b); bMax = Math.max(bMax, s.b);
+              gMin = Math.min(gMin, s.g); gMax = Math.max(gMax, s.g);
+            }
+            steady = aMax - aMin < 2 && bMax - bMin < 2 && gMax - gMin < 2;
+          }
+          if (steady || now > calibDeadline) {
+            captureCalibration(); // clean locked reference
+            calibPhaseRef.current = "done";
+            setCalibMsg("done");
+            setTimeout(() => setCalibMsg(null), 1400);
+          }
+        }
+      },
+      { signal },
+    );
 
     // ---------- pointer controls ----------
     const el = renderer.domElement;
@@ -342,7 +402,10 @@ export function TourViewer({
         camera.quaternion.setFromEuler(euler);
         camera.quaternion.multiply(qWorld);
         camera.quaternion.multiply(qScreen.setFromAxisAngle(zee, -screenAngle()));
-        qYaw.setFromAxisAngle(yAxis, THREE.MathUtils.degToRad(-(look.lon - FRONT_LON)));
+        qYaw.setFromAxisAngle(
+          yAxis,
+          THREE.MathUtils.degToRad(-(look.lon - calibLonRef.current)),
+        );
         camera.quaternion.premultiply(qYaw);
       } else {
         const phi = THREE.MathUtils.degToRad(90 - look.lat);
@@ -659,6 +722,16 @@ export function TourViewer({
       setStarted(true);
       setHint(true);
       setTimeout(() => setHint(false), 4500);
+      // A few seconds in, nudge phone users toward Motion (iOS requires the
+      // tap — sensors can't auto-start without a user gesture).
+      if (motionAvail) {
+        setTimeout(() => {
+          if (!motionOnRef.current) {
+            setMotionNudge(true);
+            setTimeout(() => setMotionNudge(false), 5000);
+          }
+        }, 5000);
+      }
     } catch {
       setFailed(true);
     } finally {
@@ -676,6 +749,8 @@ export function TourViewer({
   const toggleMotion = async () => {
     if (motionOn) {
       setMotionOn(false);
+      calibPhaseRef.current = "off";
+      setCalibMsg(null);
       return;
     }
     type IOSOrientation = { requestPermission?: () => Promise<string> };
@@ -685,6 +760,8 @@ export function TourViewer({
         const res = await doe.requestPermission();
         if (res !== "granted") return;
       }
+      setMotionNudge(false);
+      calibPhaseRef.current = "kickoff"; // re-enabling recalibrates
       setMotionOn(true);
     } catch {
       /* declined */
@@ -846,11 +923,22 @@ export function TourViewer({
         aria-hidden
         className={cn(
           "pointer-events-none absolute inset-x-0 bottom-16 flex justify-center transition-opacity duration-700",
-          hint && !pano ? "opacity-100" : "opacity-0",
+          (hint || motionNudge || calibMsg) && !pano ? "opacity-100" : "opacity-0",
         )}
       >
-        <span className="rounded-full bg-ink/60 px-[1.5em] py-[0.65em] font-sans text-[clamp(0.6875rem,0.95cqw,1.125rem)] uppercase tracking-[0.2em] text-paper/85 backdrop-blur-sm">
-          Drag to look · tap a gold ring to step inside
+        <span
+          className={cn(
+            "rounded-full bg-ink/60 px-[1.5em] py-[0.65em] font-sans text-[clamp(0.6875rem,0.95cqw,1.125rem)] uppercase tracking-[0.2em] backdrop-blur-sm",
+            calibMsg ? "text-champagne" : "text-paper/85",
+          )}
+        >
+          {calibMsg === "hold"
+            ? "Hold your phone steady — calibrating…"
+            : calibMsg === "done"
+              ? "Calibrated"
+              : motionNudge
+                ? "Steer with your phone — tap Motion"
+                : "Drag to look · tap a gold ring to step inside"}
         </span>
       </div>
 
