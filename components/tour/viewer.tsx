@@ -24,6 +24,9 @@ const FRONT_LON = 180;
 // Flight altitude assumed for anchored-ring pitch (matches the render rig;
 // close enough for real footage until per-tour heights land).
 const CAMERA_HEIGHT_M = 1.35;
+// A lone-keyframe ring shows for ±this many seconds around its time (so a
+// single click still produces a visible, fading ring at a fixed spot).
+const SOLO_RING = 2.5;
 
 const norm180 = (d: number) => ((((d + 180) % 360) + 360) % 360) - 180;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -678,8 +681,11 @@ export function TourViewer({
           // in on approach and out as you pass — never persistent. The window
           // is the keyframe span; yaw/pitch interpolate (shortest-arc yaw).
           const ks = hs.keys;
-          const t0 = ks[0].t;
-          const tn = ks[ks.length - 1].t;
+          // A lone keyframe still gets a window (±SOLO_RING) so a single click
+          // produces a visible, fading ring at a fixed spot.
+          const solo = ks.length === 1;
+          const t0 = solo ? ks[0].t - SOLO_RING : ks[0].t;
+          const tn = solo ? ks[0].t + SOLO_RING : ks[ks.length - 1].t;
           if (inChapter && t >= t0 && t <= tn) {
             let yk = ks[0].yaw;
             let pk = ks[0].pitch;

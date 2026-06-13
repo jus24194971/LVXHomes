@@ -143,7 +143,25 @@ export const TOURS: Tour[] = [
         id: "flight",
         label: "The Flight",
         video: { src: "https://media.lvxhomes.com/tours/the-george/flight.mp4?v=1" },
-        hotspots: [],
+        // Keyframed fade rings authored in /tours/the-george?author=1.
+        hotspots: [
+          { id: "hs-courtyard", label: "Resident Courtyard", panoId: "courtyard", fade: 0.6, keys: [
+            { t: 33.81, yaw: -140.7, pitch: -10.8 },
+          ] },
+          { id: "hs-firepit", label: "Firepit Lounge", panoId: "firepit", fade: 0.6, keys: [
+            { t: 59.99, yaw: -56.6, pitch: -17.8 },
+          ] },
+          { id: "hs-pool", label: "Resort Pool", panoId: "pool", fade: 0.6, keys: [
+            { t: 70.7, yaw: -72.6, pitch: -9.5 },
+            { t: 85.86, yaw: -92.3, pitch: -28.1 },
+            { t: 92.2, yaw: -130.5, pitch: -35.3 },
+          ] },
+          { id: "hs-garden", label: "Garden Walk", panoId: "garden", fade: 0.6, keys: [
+            { t: 109.85, yaw: -72.8, pitch: -14.6 },
+            { t: 116.5, yaw: -78, pitch: -24.1 },
+            { t: 122.01, yaw: -72.6, pitch: -47.7 },
+          ] },
+        ],
       },
     ],
     panos: [
