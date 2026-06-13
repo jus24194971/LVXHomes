@@ -51,6 +51,10 @@ export type TourChapter = {
   id: string;
   label: string;
   video: { src: string; fallbackSrc?: string };
+  /** Initial view offset from the equirect front, in degrees — e.g. 180 when
+   *  the camera's forward (drone heading) sits opposite the equirect center,
+   *  so the flight opens facing the direction of travel. */
+  startYaw?: number;
   hotspots: TourHotspot[];
 };
 
@@ -143,6 +147,7 @@ export const TOURS: Tour[] = [
         id: "flight",
         label: "The Flight",
         video: { src: "https://media.lvxhomes.com/tours/the-george/flight.mp4?v=1" },
+        startYaw: 180, // Avata 360 equirect front = drone tail; open facing forward
         // Keyframed fade rings authored in /tours/the-george?author=1. Several
         // amenities are flown past twice — the two keyframe clusters become two
         // fade windows (engine splits on RING_GAP).

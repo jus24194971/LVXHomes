@@ -269,7 +269,10 @@ export function TourViewer({
     scene.add(new THREE.Mesh(geometry, material));
 
     // ---------- look state ----------
-    const look = { lon: FRONT_LON, lat: 0, mlon: 0, mlat: 0, vLon: 0, vLat: 0, fov: 75, dragging: false };
+    const look = {
+      lon: FRONT_LON + (tour.chapters[0]?.startYaw ?? 0), // face the drone's forward
+      lat: 0, mlon: 0, mlat: 0, vLon: 0, vLat: 0, fov: 75, dragging: false,
+    };
     engineRef.current = { camera, material, videoTexture, look, video };
     const pointers = new Map<number, { x: number; y: number }>();
     let pinchDist = 0;
