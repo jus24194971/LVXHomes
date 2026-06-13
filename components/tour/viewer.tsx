@@ -105,6 +105,9 @@ export function TourViewer({
   const panoRef = useRef<TourPano | null>(null);
   /** The flight's look direction when you stepped into a pano — restored on resume. */
   const flightLookRef = useRef<{ lon: number; lat: number; mlon: number; mlat: number } | null>(null);
+  /** Entering a pano from the MAP sets this; on resume the flight jumps to the
+   *  amenity's keyframe time (facing it) instead of where it was paused. */
+  const resumeAtRef = useRef<{ t: number; yaw: number } | null>(null);
   const authorRef = useRef(false);
   const ringsRef = useRef<TourHotspot[]>([]);
   const activeRingRef = useRef<string | null>(null);
@@ -1004,10 +1007,11 @@ export function TourViewer({
   }, []);
 
   const enterPano = useCallback(
-    async (panoId: string) => {
+    async (panoId: string, resumeAt: { t: number; yaw: number } | null = null) => {
       const engine = engineRef.current;
       const target = tour.panos.find((p) => p.id === panoId);
       if (!engine || !target) return;
+      resumeAtRef.current = resumeAt; // null for a ring tap; set for a map jump
       try {
         const texPromise = loadPano(target);
         setFading(true);
@@ -1044,9 +1048,20 @@ export function TourViewer({
     await sleep(350);
     engine.material.map = engine.videoTexture;
     engine.material.needsUpdate = true;
-    // Resume the flight looking exactly where you left it.
-    const saved = flightLookRef.current;
-    if (saved) {
+    // Map entry → resume at the amenity's keyframe time, facing it. Ring entry
+    // → resume exactly where you left off (same time + camera angle).
+    const jump = resumeAtRef.current;
+    if (jump) {
+      engine.video.currentTime = jump.t;
+      engine.look.lon = FRONT_LON + jump.yaw;
+      engine.look.lat = 0;
+      engine.look.mlon = 0;
+      engine.look.mlat = 0;
+      engine.look.vLon = 0;
+      engine.look.vLat = 0;
+      resumeAtRef.current = null;
+    } else if (flightLookRef.current) {
+      const saved = flightLookRef.current;
       engine.look.lon = saved.lon;
       engine.look.lat = saved.lat;
       engine.look.mlon = saved.mlon;
@@ -1121,11 +1136,24 @@ export function TourViewer({
 
   const handleZoneClick = useCallback(
     (zone: PlanZone) => {
-      if (zone.panoId) void enterPano(zone.panoId);
-      else if (zone.videoTime !== undefined)
+      if (zone.panoId) {
+        // A map jump resumes the flight at the amenity's ring keyframe (facing
+        // it), falling back to the zone's videoTime if it has no ring yet.
+        let resumeAt: { t: number; yaw: number } | null = null;
+        for (const ch of tour.chapters) {
+          const ring = ch.hotspots.find((h) => h.panoId === zone.panoId && h.keys?.length);
+          if (ring?.keys?.length) {
+            resumeAt = { t: ring.keys[0].t, yaw: ring.keys[0].yaw };
+            break;
+          }
+        }
+        if (!resumeAt && zone.videoTime !== undefined) resumeAt = { t: zone.videoTime, yaw: 0 };
+        void enterPano(zone.panoId, resumeAt);
+      } else if (zone.videoTime !== undefined) {
         void seekFlight(zone.videoTime, zone.chapterId);
+      }
     },
-    [enterPano, seekFlight],
+    [enterPano, seekFlight, tour.chapters],
   );
 
   // ---------- basic controls ----------
@@ -1742,17 +1770,13 @@ export function TourViewer({
                   <div className="flex items-center gap-1.5">
                     <button type="button" onClick={() => setActiveRing(r.id)} aria-label="Select ring"
                       className={cn("h-3 w-3 shrink-0 rounded-full border", isA ? "border-champagne bg-champagne" : "border-paper/40")} />
-                    <select
-                      value={r.panoId}
-                      onChange={(e) => {
-                        const p = tour.panos.find((x) => x.id === e.target.value);
-                        updateRing(r.id, { panoId: e.target.value, label: p?.label ?? r.label });
-                      }}
+                    <input
+                      value={r.label}
+                      onChange={(e) => updateRing(r.id, { label: e.target.value })}
                       onFocus={() => setActiveRing(r.id)}
-                      className="min-w-0 flex-1 rounded bg-ink/60 px-1 py-0.5 text-paper outline-none"
-                    >
-                      {tour.panos.map((p) => (<option key={p.id} value={p.id}>{p.label}</option>))}
-                    </select>
+                      placeholder="Ring name"
+                      className="min-w-0 flex-1 rounded bg-ink/60 px-1.5 py-0.5 text-paper outline-none placeholder:text-paper/30"
+                    />
                     <span className="font-mono text-[0.65rem] text-paper/40">{ks.length}k</span>
                     <button type="button" onClick={() => removeRing(r.id)} aria-label="Delete ring" className="text-paper/40 hover:text-red-400">✕</button>
                   </div>
@@ -1775,6 +1799,16 @@ export function TourViewer({
                           ))}
                         </div>
                       )}
+                      <label className="mt-1.5 flex items-center gap-2 text-[0.65rem] text-paper/60">
+                        Pano
+                        <select
+                          value={r.panoId}
+                          onChange={(e) => updateRing(r.id, { panoId: e.target.value })}
+                          className="min-w-0 flex-1 rounded bg-ink/60 px-1 py-0.5 text-paper outline-none"
+                        >
+                          {tour.panos.map((p) => (<option key={p.id} value={p.id}>{p.label}</option>))}
+                        </select>
+                      </label>
                       <label className="mt-1.5 flex items-center gap-2 text-[0.65rem] text-paper/60">
                         Fade
                         <input type="number" min={0} max={3} step={0.1} value={r.fade ?? 0.6}
