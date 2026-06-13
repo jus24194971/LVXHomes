@@ -221,7 +221,43 @@ export const TOURS: Tour[] = [
         label: "The Walkthrough",
         video: { src: "https://media.lvxhomes.com/tours/apartment-1112/flight.mp4?v=1" },
         startYaw: 180,
-        hotspots: [],
+        // Authored in /tours/apartment-1112?author=1. NOTE: "Primary Bathroom"
+        // points at the bedroom pano as sent — confirm vs the primary-bath pano.
+        hotspots: [
+          { id: "hs-living", label: "Living Room", panoId: "living", fade: 0.6, keys: [
+            { t: 3.28, yaw: 126.4, pitch: -5.5 },
+            { t: 4.67, yaw: 133.6, pitch: -6.1 },
+            { t: 59.68, yaw: 165.6, pitch: -3.8 },
+            { t: 117.79, yaw: 96.4, pitch: -9.5 },
+            { t: 120.27, yaw: 131, pitch: -10.8 },
+          ] },
+          { id: "hs-kitchen", label: "Kitchen", panoId: "kitchen", fade: 0.6, keys: [
+            { t: 14.21, yaw: -62.3, pitch: -3.4 },
+            { t: 16.8, yaw: -58.5, pitch: -4.2 },
+            { t: 19.57, yaw: -62.3, pitch: -4.9 },
+            { t: 37.86, yaw: -96.9, pitch: 1.3 },
+            { t: 59.68, yaw: -100.6, pitch: 1 },
+            { t: 113.09, yaw: -14.6, pitch: -0.5 },
+          ] },
+          { id: "hs-bonus", label: "Bonus Room", panoId: "bonus", fade: 0.6, keys: [
+            { t: 21.23, yaw: 72.4, pitch: -2.8 },
+          ] },
+          { id: "hs-guestbath", label: "Guest Bathroom", panoId: "guest-bath", fade: 0.6, keys: [
+            { t: 21.23, yaw: 27.4, pitch: -3.4 },
+            { t: 40.75, yaw: 20, pitch: 5.6 },
+          ] },
+          { id: "hs-bedroom", label: "Primary Bedroom", panoId: "bedroom", fade: 0.6, keys: [
+            { t: 68.16, yaw: 178, pitch: -0.9 },
+            { t: 70.03, yaw: 156.9, pitch: -2.4 },
+            { t: 72.73, yaw: 146.2, pitch: -6.9 },
+            { t: 77.35, yaw: -138.5, pitch: -14.6 },
+            { t: 91.36, yaw: 117.9, pitch: -8.7 },
+          ] },
+          { id: "hs-primarybath", label: "Primary Bathroom", panoId: "bedroom", fade: 0.6, keys: [
+            { t: 79.4, yaw: -74.2, pitch: 1.8 },
+            { t: 81.42, yaw: -65.1, pitch: -1.3 },
+          ] },
+        ],
       },
     ],
     panos: [
