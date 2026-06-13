@@ -551,36 +551,50 @@ export function TourViewer({
       // AND world-anchored hotspots. Heading: keyframed h or travel tangent.
       const interpPose = (path: NonNullable<NonNullable<typeof plan>["sheets"][0]["paths"]>[string]) => {
         if (!path || path.length === 0) return null;
-        let a = path[0];
-        let b = path[path.length - 1];
-        if (t <= a.t) b = a;
-        else if (t >= b.t) a = b;
+        const n = path.length;
+        if (n === 1) return { x: path[0].x, y: path[0].y, heading: path[0].h ?? 0 };
+        // Segment [i, i+1] that holds t.
+        let i = 0;
+        if (t <= path[0].t) i = 0;
+        else if (t >= path[n - 1].t) i = n - 2;
         else {
-          for (let i = 0; i < path.length - 1; i++) {
-            if (t >= path[i].t && t <= path[i + 1].t) {
-              a = path[i];
-              b = path[i + 1];
+          for (let k = 0; k < n - 1; k++) {
+            if (t >= path[k].t && t <= path[k + 1].t) {
+              i = k;
               break;
             }
           }
         }
-        const f = b.t === a.t ? 0 : (t - a.t) / (b.t - a.t);
-        const x = a.x + (b.x - a.x) * f;
-        const y = a.y + (b.y - a.y) * f;
+        const k0 = path[Math.max(i - 1, 0)];
+        const k1 = path[i];
+        const k2 = path[i + 1];
+        const k3 = path[Math.min(i + 2, n - 1)];
+        const seg = k2.t - k1.t;
+        const f = seg <= 0 ? 0 : Math.min(1, Math.max(0, (t - k1.t) / seg));
+        // Catmull-Rom: position AND its tangent stay continuous across
+        // keyframes (C1), so the camera glides instead of cornering — and the
+        // heading derived from that tangent no longer snaps once per second,
+        // which is what made the anchored rings stutter.
+        const f2 = f * f;
+        const f3 = f2 * f;
+        const cr = (p0: number, p1: number, p2: number, p3: number) =>
+          0.5 *
+          (2 * p1 + (-p0 + p2) * f + (2 * p0 - 5 * p1 + 4 * p2 - p3) * f2 + (-p0 + 3 * p1 - 3 * p2 + p3) * f3);
+        const crD = (p0: number, p1: number, p2: number, p3: number) =>
+          0.5 * (-p0 + p2 + 2 * (2 * p0 - 5 * p1 + 4 * p2 - p3) * f + 3 * (-p0 + 3 * p1 - 3 * p2 + p3) * f2);
+        const x = cr(k0.x, k1.x, k2.x, k3.x);
+        const y = cr(k0.y, k1.y, k2.y, k3.y);
         let heading: number;
-        if (a.h !== undefined && b.h !== undefined) {
-          heading = a.h + (((b.h - a.h + 540) % 360) - 180) * f;
-        } else if (a.h !== undefined) {
-          heading = a.h;
+        if (k1.h !== undefined && k2.h !== undefined) {
+          heading = k1.h + (((k2.h - k1.h + 540) % 360) - 180) * f;
+        } else if (k1.h !== undefined) {
+          heading = k1.h;
         } else {
-          let dx = b.x - a.x;
-          let dy = b.y - a.y;
-          if (dx === 0 && dy === 0) {
-            const ai = path.indexOf(a);
-            const na = path[Math.max(ai - 1, 0)];
-            const nb = path[Math.min(ai + 1, path.length - 1)];
-            dx = nb.x - na.x;
-            dy = nb.y - na.y;
+          let dx = crD(k0.x, k1.x, k2.x, k3.x);
+          let dy = crD(k0.y, k1.y, k2.y, k3.y);
+          if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) {
+            dx = k2.x - k1.x;
+            dy = k2.y - k1.y;
           }
           heading = (Math.atan2(dx, -dy) * 180) / Math.PI;
         }
@@ -598,6 +612,15 @@ export function TourViewer({
         }
       }
 
+      // Pass 1 — gather each visible ring's target screen position.
+      const vis: {
+        node: HTMLDivElement;
+        key: string;
+        tx: number;
+        ty: number;
+        scale: number;
+        dist: number;
+      }[] = [];
       for (const { ci, hs, key } of flatHotspots) {
         const node = hotspotEls.current.get(key);
         if (!node) continue;
@@ -609,12 +632,13 @@ export function TourViewer({
         let yawDeg = 0;
         let pitchDeg = 0;
         let ringScale = 1;
+        let dist = 999;
         if (hs.anchor && worldPose) {
           // World-anchored: direction + distance from the live camera pose —
           // the ring is wherever the room actually is, from wherever you are.
           const dx = hs.anchor.x - worldPose.x;
           const dyPlan = hs.anchor.y - worldPose.y;
-          const dist = Math.hypot(dx, dyPlan);
+          dist = Math.hypot(dx, dyPlan);
           const bearing = (Math.atan2(dx, -dyPlan) * 180) / Math.PI;
           yawDeg = norm180(bearing - worldPose.heading);
           pitchDeg =
@@ -627,65 +651,107 @@ export function TourViewer({
           pitchDeg = hs.pitch;
           visible = inChapter && gated && hs.start !== undefined;
         }
-        if (visible) {
-          const phi = THREE.MathUtils.degToRad(90 - pitchDeg);
-          const theta = THREE.MathUtils.degToRad(FRONT_LON + yawDeg);
-          hsWorld.set(
-            490 * Math.sin(phi) * Math.cos(theta),
-            490 * Math.cos(phi),
-            490 * Math.sin(phi) * Math.sin(theta),
-          );
-          hsCam.copy(hsWorld).applyMatrix4(camera.matrixWorldInverse);
-
-          // Resolve a target NDC position, pinning to a frame edge rather than
-          // vanishing when the room is off-screen or behind — so every room
-          // stays a reachable tap target the whole flight.
-          let nx: number;
-          let ny: number;
-          let clamped = false;
-          if (hsCam.z < -2) {
-            hsWorld.project(camera);
-            nx = hsWorld.x;
-            ny = hsWorld.y;
-            if (Math.abs(nx) > EDGE || Math.abs(ny) > EDGE) {
-              const k = EDGE / Math.max(Math.abs(nx), Math.abs(ny));
-              nx *= k;
-              ny *= k;
-              clamped = true;
-            }
-          } else {
-            // Beside/behind: projection is degenerate, so pin to the edge on the
-            // room's side (camera-space x/y carry the true direction).
-            nx = (hsCam.x >= 0 ? 1 : -1) * EDGE;
-            ny = Math.max(-EDGE, Math.min(EDGE, (hsCam.y / Math.max(Math.abs(hsCam.x), 1)) * EDGE));
-            clamped = true;
-          }
-
-          const tx = (nx * 0.5 + 0.5) * w;
-          const ty = (-ny * 0.5 + 0.5) * h;
-          // Glide to the target; snap on first show or a big jump (edge flip).
-          let sm = hsScreen.get(key);
-          if (!sm) {
-            sm = { x: tx, y: ty, set: true };
-            hsScreen.set(key, sm);
-          } else if (!sm.set || Math.hypot(tx - sm.x, ty - sm.y) > Math.max(w, h) * 0.5) {
-            sm.x = tx;
-            sm.y = ty;
-            sm.set = true;
-          } else {
-            sm.x += (tx - sm.x) * 0.22;
-            sm.y += (ty - sm.y) * 0.22;
-          }
-          node.style.transform = `translate(-50%, -50%) translate(${sm.x}px, ${sm.y}px)`;
-          // Scale the VISUAL ring only (via --rs); the button keeps a fixed,
-          // generous tap area. Edge-pinned rings hold a steady, easy size.
-          node.style.setProperty("--rs", String(clamped ? 0.7 : ringScale));
-        } else {
+        if (!visible) {
+          node.style.opacity = "0";
+          node.style.pointerEvents = "none";
           const sm = hsScreen.get(key);
           if (sm) sm.set = false; // re-snap cleanly next time it appears
+          continue;
         }
-        node.style.opacity = visible ? "1" : "0";
-        node.style.pointerEvents = visible ? "auto" : "none";
+        const phi = THREE.MathUtils.degToRad(90 - pitchDeg);
+        const theta = THREE.MathUtils.degToRad(FRONT_LON + yawDeg);
+        hsWorld.set(
+          490 * Math.sin(phi) * Math.cos(theta),
+          490 * Math.cos(phi),
+          490 * Math.sin(phi) * Math.sin(theta),
+        );
+        hsCam.copy(hsWorld).applyMatrix4(camera.matrixWorldInverse);
+
+        // Resolve a target NDC position, pinning to a frame edge rather than
+        // vanishing when the room is off-screen or behind — so every room
+        // stays a reachable tap target the whole flight.
+        let nx: number;
+        let ny: number;
+        let clamped = false;
+        if (hsCam.z < -2) {
+          hsWorld.project(camera);
+          nx = hsWorld.x;
+          ny = hsWorld.y;
+          if (Math.abs(nx) > EDGE || Math.abs(ny) > EDGE) {
+            const k = EDGE / Math.max(Math.abs(nx), Math.abs(ny));
+            nx *= k;
+            ny *= k;
+            clamped = true;
+          }
+        } else {
+          // Beside/behind: projection is degenerate, so pin to the edge on the
+          // room's side (camera-space x/y carry the true direction).
+          nx = (hsCam.x >= 0 ? 1 : -1) * EDGE;
+          ny = Math.max(-EDGE, Math.min(EDGE, (hsCam.y / Math.max(Math.abs(hsCam.x), 1)) * EDGE));
+          clamped = true;
+        }
+        vis.push({
+          node,
+          key,
+          tx: (nx * 0.5 + 0.5) * w,
+          ty: (-ny * 0.5 + 0.5) * h,
+          scale: clamped ? 0.7 : ringScale,
+          dist,
+        });
+      }
+
+      // Pass 2 — push apart any rings that would overlap, so each stays a
+      // distinct, tappable target. A few relaxation passes over the handful of
+      // on-screen rings is plenty; spreading is symmetric so it stays stable.
+      const minSep = Math.max(70, Math.min(w, h) * 0.19);
+      for (let pass = 0; pass < 4; pass++) {
+        for (let p = 0; p < vis.length; p++) {
+          for (let q = p + 1; q < vis.length; q++) {
+            const A = vis[p];
+            const B = vis[q];
+            let ddx = B.tx - A.tx;
+            let ddy = B.ty - A.ty;
+            let d = Math.hypot(ddx, ddy);
+            if (d < 0.01) {
+              ddx = 0;
+              ddy = 1;
+              d = 1;
+            }
+            if (d < minSep) {
+              const half = (minSep - d) / 2;
+              const ux = (ddx / d) * half;
+              const uy = (ddy / d) * half;
+              A.tx -= ux;
+              A.ty -= uy;
+              B.tx += ux;
+              B.ty += uy;
+            }
+          }
+        }
+      }
+
+      // Pass 3 — glide toward the (separated) target and apply. Nearer rings
+      // render on top so a cluster reads cleanly.
+      for (const v of vis) {
+        v.tx = Math.max(w * 0.05, Math.min(w * 0.95, v.tx));
+        v.ty = Math.max(h * 0.05, Math.min(h * 0.95, v.ty));
+        let sm = hsScreen.get(v.key);
+        if (!sm) {
+          sm = { x: v.tx, y: v.ty, set: true };
+          hsScreen.set(v.key, sm);
+        } else if (!sm.set || Math.hypot(v.tx - sm.x, v.ty - sm.y) > Math.max(w, h) * 0.5) {
+          sm.x = v.tx;
+          sm.y = v.ty;
+          sm.set = true;
+        } else {
+          sm.x += (v.tx - sm.x) * 0.3;
+          sm.y += (v.ty - sm.y) * 0.3;
+        }
+        v.node.style.transform = `translate(-50%, -50%) translate(${sm.x}px, ${sm.y}px)`;
+        v.node.style.setProperty("--rs", String(v.scale));
+        v.node.style.zIndex = String(Math.round(1000 - Math.min(v.dist, 99) * 8));
+        v.node.style.opacity = "1";
+        v.node.style.pointerEvents = "auto";
       }
 
       // You-are-here: the displayed sheet's path for this chapter.
