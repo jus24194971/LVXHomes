@@ -118,6 +118,31 @@ export const TOURS: Tour[] = [
     ],
     hidden: true,
   },
+  {
+    // First real DJI Avata 360 capture — a ~4 min flythrough of The George, an
+    // Arizona luxury apartment community. For v1 the 5 amenity panos are reached
+    // from the plan minimap (tap an amenity); in-flight rings can be authored
+    // later. Hidden until the property/path is finalized.
+    slug: "the-george",
+    title: "The George",
+    location: "Arizona",
+    chapters: [
+      {
+        id: "flight",
+        label: "The Flight",
+        video: { src: "https://media.lvxhomes.com/tours/the-george/flight.mp4?v=1" },
+        hotspots: [],
+      },
+    ],
+    panos: [
+      { id: "courtyard", label: "Resident Courtyard", src: "https://media.lvxhomes.com/tours/the-george/pano-courtyard.jpg?v=1", initialYaw: 0 },
+      { id: "firepit", label: "Firepit Lounge", src: "https://media.lvxhomes.com/tours/the-george/pano-firepit.jpg?v=1", initialYaw: 0 },
+      { id: "pool", label: "Resort Pool", src: "https://media.lvxhomes.com/tours/the-george/pano-pool.jpg?v=1", initialYaw: 0 },
+      { id: "garden", label: "Garden Walk", src: "https://media.lvxhomes.com/tours/the-george/pano-garden.jpg?v=1", initialYaw: 0 },
+      { id: "clubhouse", label: "Clubhouse Lawn", src: "https://media.lvxhomes.com/tours/the-george/pano-clubhouse.jpg?v=1", initialYaw: 0 },
+    ],
+    hidden: true,
+  },
 ];
 
 export const getTour = (slug: string): Tour | undefined =>

@@ -171,6 +171,52 @@ export const PLANS: Plan[] = [
       },
     ],
   },
+  {
+    // The George — SCHEMATIC first-pass site plan (no GPS lock, so this is
+    // drawn by eye from the aerial frames, NOT survey-accurate). Refine the
+    // amenity positions + the dot path in /studio/plan. Tap an amenity to step
+    // into its 360 still; the dot traces the ~4 min flight (chapter "flight").
+    tourSlug: "the-george",
+    sheets: [
+      {
+        id: "site",
+        label: "The Grounds",
+        kind: "site",
+        width: 100,
+        height: 70,
+        strokes: [[[3, 3], [97, 3], [97, 67], [3, 67], [3, 3]]],
+        zones: [
+          { id: "courtyard", label: "Resident Courtyard", kind: "outdoor", points: [[10, 22], [45, 22], [45, 48], [10, 48]], panoId: "courtyard", videoTime: 12 },
+          { id: "firepit", label: "Firepit Lounge", kind: "hardscape", points: [[12, 24], [22, 24], [22, 33], [12, 33]], panoId: "firepit", videoTime: 25 },
+          { id: "garden", label: "Garden Walk", kind: "outdoor", points: [[46, 22], [60, 22], [60, 48], [46, 48]], panoId: "garden", videoTime: 45 },
+          { id: "clubhouse", label: "Clubhouse", kind: "structure", points: [[62, 30], [75, 30], [75, 43], [62, 43]], panoId: "clubhouse", videoTime: 95 },
+          { id: "pool", label: "Resort Pool", kind: "water", points: [[78, 24], [95, 24], [95, 50], [78, 50]], panoId: "pool", videoTime: 180 },
+          // building footprints — context only
+          { id: "bldg-nw", label: "", kind: "structure", points: [[8, 8], [45, 8], [45, 18], [8, 18]] },
+          { id: "bldg-ne", label: "", kind: "structure", points: [[55, 8], [92, 8], [92, 18], [55, 18]] },
+          { id: "bldg-sw", label: "", kind: "structure", points: [[8, 54], [45, 54], [45, 64], [8, 64]] },
+          { id: "bldg-se", label: "", kind: "structure", points: [[55, 54], [78, 54], [78, 64], [55, 64]] },
+        ],
+        paths: {
+          flight: [
+            { t: 0, x: 15, y: 35 },
+            { t: 20, x: 28, y: 32 },
+            { t: 40, x: 42, y: 30 },
+            { t: 60, x: 55, y: 32 },
+            { t: 80, x: 66, y: 34 },
+            { t: 100, x: 72, y: 37 },
+            { t: 120, x: 82, y: 31 },
+            { t: 140, x: 60, y: 56 },
+            { t: 160, x: 75, y: 45 },
+            { t: 180, x: 87, y: 38 },
+            { t: 200, x: 58, y: 40 },
+            { t: 220, x: 34, y: 38 },
+            { t: 238, x: 20, y: 36 },
+          ],
+        },
+      },
+    ],
+  },
 ];
 
 export const getPlan = (tourSlug: string): Plan | undefined =>
