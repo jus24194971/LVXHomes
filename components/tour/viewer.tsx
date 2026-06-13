@@ -27,6 +27,33 @@ const CAMERA_HEIGHT_M = 1.35;
 // A lone-keyframe ring shows for ±this many seconds around its time (so a
 // single click still produces a visible, fading ring at a fixed spot).
 const SOLO_RING = 2.5;
+// Keyframes farther apart than this start a SEPARATE visible window — so an
+// amenity the drone passes twice fades in/out on each pass instead of lingering
+// (and drifting) across the long gap between them.
+const RING_GAP = 20;
+
+/**
+ * The contiguous keyframe window [s, e] (with faded time bounds t0/tn) that the
+ * time t falls in — windows break where consecutive keys are more than RING_GAP
+ * apart. A lone key gets a ±SOLO_RING window. Returns null when t is in no
+ * window (between passes, or before/after the ring's life).
+ */
+function ringWindow(
+  ks: { t: number }[],
+  t: number,
+): { s: number; e: number; t0: number; tn: number } | null {
+  let s = 0;
+  while (s < ks.length) {
+    let e = s;
+    while (e + 1 < ks.length && ks[e + 1].t - ks[e].t <= RING_GAP) e++;
+    const solo = s === e;
+    const t0 = solo ? ks[s].t - SOLO_RING : ks[s].t;
+    const tn = solo ? ks[s].t + SOLO_RING : ks[e].t;
+    if (t >= t0 && t <= tn) return { s, e, t0, tn };
+    s = e + 1;
+  }
+  return null;
+}
 
 const norm180 = (d: number) => ((((d + 180) % 360) + 360) % 360) - 180;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -694,20 +721,16 @@ export function TourViewer({
         let ringScale = 1;
         let dist = 999;
         let opacity = 1;
-        if (hs.keys && hs.keys.length) {
+        if (hs.keys && hs.keys.length && inChapter) {
           // Keyframed flight ring: track the amenity across its window, fading
-          // in on approach and out as you pass — never persistent. The window
-          // is the keyframe span; yaw/pitch interpolate (shortest-arc yaw).
+          // in on approach and out as you pass — never persistent. Keys split
+          // into separate windows for amenities flown past more than once.
           const ks = hs.keys;
-          // A lone keyframe still gets a window (±SOLO_RING) so a single click
-          // produces a visible, fading ring at a fixed spot.
-          const solo = ks.length === 1;
-          const t0 = solo ? ks[0].t - SOLO_RING : ks[0].t;
-          const tn = solo ? ks[0].t + SOLO_RING : ks[ks.length - 1].t;
-          if (inChapter && t >= t0 && t <= tn) {
-            let yk = ks[0].yaw;
-            let pk = ks[0].pitch;
-            for (let i = 0; i < ks.length - 1; i++) {
+          const win = ringWindow(ks, t);
+          if (win) {
+            let yk = ks[win.s].yaw;
+            let pk = ks[win.s].pitch;
+            for (let i = win.s; i < win.e; i++) {
               if (t >= ks[i].t && t <= ks[i + 1].t) {
                 const span = ks[i + 1].t - ks[i].t;
                 const f = span <= 0 ? 0 : (t - ks[i].t) / span;
@@ -719,8 +742,8 @@ export function TourViewer({
             yawDeg = yk;
             pitchDeg = pk;
             const fd = hs.fade ?? 0.6;
-            const fin = fd > 0 ? Math.min(1, (t - t0) / fd) : 1;
-            const fout = fd > 0 ? Math.min(1, (tn - t) / fd) : 1;
+            const fin = fd > 0 ? Math.min(1, (t - win.t0) / fd) : 1;
+            const fout = fd > 0 ? Math.min(1, (win.tn - t) / fd) : 1;
             opacity = Math.max(0, Math.min(fin, fout));
             visible = opacity > 0.02;
             ringScale = 1;

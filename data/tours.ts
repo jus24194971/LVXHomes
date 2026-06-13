@@ -143,23 +143,52 @@ export const TOURS: Tour[] = [
         id: "flight",
         label: "The Flight",
         video: { src: "https://media.lvxhomes.com/tours/the-george/flight.mp4?v=1" },
-        // Keyframed fade rings authored in /tours/the-george?author=1.
+        // Keyframed fade rings authored in /tours/the-george?author=1. Several
+        // amenities are flown past twice — the two keyframe clusters become two
+        // fade windows (engine splits on RING_GAP).
         hotspots: [
-          { id: "hs-courtyard", label: "Resident Courtyard", panoId: "courtyard", fade: 0.6, keys: [
-            { t: 33.81, yaw: -140.7, pitch: -10.8 },
+          { id: "hs-cornhole", label: "Outdoor Cornhole", panoId: "courtyard", fade: 0.6, keys: [
+            { t: 36.34, yaw: -143.6, pitch: -12.1 },
+            { t: 44.35, yaw: -132.6, pitch: -16.3 },
+            { t: 50.36, yaw: -125.2, pitch: -27.1 },
+            { t: 53.62, yaw: -113, pitch: -38.1 },
+            { t: 204.13, yaw: 100.2, pitch: -48.1 },
+            { t: 207.56, yaw: 118, pitch: -61.9 },
           ] },
           { id: "hs-firepit", label: "Firepit Lounge", panoId: "firepit", fade: 0.6, keys: [
-            { t: 59.99, yaw: -56.6, pitch: -17.8 },
+            { t: 55.41, yaw: -67.3, pitch: -14.2 },
+            { t: 56.96, yaw: -62, pitch: -13.5 },
+            { t: 57.74, yaw: -60.2, pitch: -14.8 },
+            { t: 64.35, yaw: -51.1, pitch: -23.9 },
+            { t: 68.87, yaw: -52.2, pitch: -36 },
+            { t: 194.73, yaw: 50.4, pitch: -30.1 },
+            { t: 197.94, yaw: 41.7, pitch: -44.3 },
+            { t: 200.96, yaw: 14.9, pitch: -52 },
           ] },
-          { id: "hs-pool", label: "Resort Pool", panoId: "pool", fade: 0.6, keys: [
-            { t: 70.7, yaw: -72.6, pitch: -9.5 },
-            { t: 85.86, yaw: -92.3, pitch: -28.1 },
-            { t: 92.2, yaw: -130.5, pitch: -35.3 },
+          { id: "hs-pool", label: "Resort Style Pool", panoId: "pool", fade: 0.6, keys: [
+            { t: 72.49, yaw: -77.7, pitch: -9.9 },
+            { t: 80.38, yaw: -80.4, pitch: -18 },
+            { t: 86.46, yaw: -101.7, pitch: -29.2 },
+            { t: 94.51, yaw: -147.9, pitch: -34.5 },
+            { t: 181.22, yaw: 73.8, pitch: -45.9 },
+            { t: 183.69, yaw: 48.5, pitch: -48.8 },
+            { t: 187.11, yaw: 8, pitch: -45.3 },
+            { t: 190.33, yaw: -17.5, pitch: -35.6 },
           ] },
-          { id: "hs-garden", label: "Garden Walk", panoId: "garden", fade: 0.6, keys: [
-            { t: 109.85, yaw: -72.8, pitch: -14.6 },
-            { t: 116.5, yaw: -78, pitch: -24.1 },
-            { t: 122.01, yaw: -72.6, pitch: -47.7 },
+          { id: "hs-bocce", label: "Bocce Ball", panoId: "garden", fade: 0.6, keys: [
+            { t: 100.41, yaw: -63.7, pitch: -12.4 },
+            { t: 108.13, yaw: -72.2, pitch: -14.6 },
+            { t: 119.74, yaw: -78.5, pitch: -45.3 },
+            { t: 124.17, yaw: -50.7, pitch: -70.1 },
+          ] },
+          { id: "hs-soccer", label: "Soccer Pool", panoId: "clubhouse", fade: 0.6, keys: [
+            { t: 151.44, yaw: 114.3, pitch: -15.1 },
+            { t: 155.24, yaw: 99.5, pitch: -18.3 },
+            { t: 159.78, yaw: 80.8, pitch: -21.5 },
+            { t: 164.26, yaw: 57.1, pitch: -31.8 },
+            { t: 167.92, yaw: 31.9, pitch: -48.2 },
+            { t: 171.07, yaw: -16.4, pitch: -53 },
+            { t: 174.65, yaw: -58, pitch: -38.3 },
           ] },
         ],
       },
