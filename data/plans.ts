@@ -186,11 +186,11 @@ export const PLANS: Plan[] = [
         height: 70,
         strokes: [[[3, 3], [97, 3], [97, 67], [3, 67], [3, 3]]],
         zones: [
-          { id: "courtyard", label: "Resident Courtyard", kind: "outdoor", points: [[10, 22], [45, 22], [45, 48], [10, 48]], panoId: "courtyard", videoTime: 12 },
+          { id: "courtyard", label: "Outdoor Cornhole", kind: "outdoor", points: [[10, 22], [45, 22], [45, 48], [10, 48]], panoId: "courtyard", videoTime: 12 },
           { id: "firepit", label: "Firepit Lounge", kind: "hardscape", points: [[12, 24], [22, 24], [22, 33], [12, 33]], panoId: "firepit", videoTime: 25 },
-          { id: "garden", label: "Garden Walk", kind: "outdoor", points: [[46, 22], [60, 22], [60, 48], [46, 48]], panoId: "garden", videoTime: 45 },
-          { id: "clubhouse", label: "Clubhouse", kind: "structure", points: [[62, 30], [75, 30], [75, 43], [62, 43]], panoId: "clubhouse", videoTime: 95 },
-          { id: "pool", label: "Resort Pool", kind: "water", points: [[78, 24], [95, 24], [95, 50], [78, 50]], panoId: "pool", videoTime: 180 },
+          { id: "garden", label: "Bocce Ball", kind: "outdoor", points: [[46, 22], [60, 22], [60, 48], [46, 48]], panoId: "garden", videoTime: 45 },
+          { id: "clubhouse", label: "Soccer Pool", kind: "structure", points: [[62, 30], [75, 30], [75, 43], [62, 43]], panoId: "clubhouse", videoTime: 95 },
+          { id: "pool", label: "Resort Style Pool", kind: "water", points: [[78, 24], [95, 24], [95, 50], [78, 50]], panoId: "pool", videoTime: 180 },
           // building footprints — context only
           { id: "bldg-nw", label: "", kind: "structure", points: [[8, 8], [45, 8], [45, 18], [8, 18]] },
           { id: "bldg-ne", label: "", kind: "structure", points: [[55, 8], [92, 8], [92, 18], [55, 18]] },

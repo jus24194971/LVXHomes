@@ -194,11 +194,12 @@ export const TOURS: Tour[] = [
       },
     ],
     panos: [
-      { id: "courtyard", label: "Resident Courtyard", src: "https://media.lvxhomes.com/tours/the-george/pano-courtyard.jpg?v=1", initialYaw: 0 },
+      // ids stay stable (rings + plan zones reference them); only labels change.
+      { id: "courtyard", label: "Outdoor Cornhole", src: "https://media.lvxhomes.com/tours/the-george/pano-courtyard.jpg?v=1", initialYaw: 0 },
       { id: "firepit", label: "Firepit Lounge", src: "https://media.lvxhomes.com/tours/the-george/pano-firepit.jpg?v=1", initialYaw: 0 },
-      { id: "pool", label: "Resort Pool", src: "https://media.lvxhomes.com/tours/the-george/pano-pool.jpg?v=1", initialYaw: 0 },
-      { id: "garden", label: "Garden Walk", src: "https://media.lvxhomes.com/tours/the-george/pano-garden.jpg?v=1", initialYaw: 0 },
-      { id: "clubhouse", label: "Clubhouse Lawn", src: "https://media.lvxhomes.com/tours/the-george/pano-clubhouse.jpg?v=1", initialYaw: 0 },
+      { id: "pool", label: "Resort Style Pool", src: "https://media.lvxhomes.com/tours/the-george/pano-pool.jpg?v=1", initialYaw: 0 },
+      { id: "garden", label: "Bocce Ball", src: "https://media.lvxhomes.com/tours/the-george/pano-garden.jpg?v=1", initialYaw: 0 },
+      { id: "clubhouse", label: "Soccer Pool", src: "https://media.lvxhomes.com/tours/the-george/pano-clubhouse.jpg?v=1", initialYaw: 0 },
     ],
     hidden: true,
   },
