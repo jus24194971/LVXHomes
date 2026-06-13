@@ -57,19 +57,18 @@ export const TOURS: Tour[] = [
     title: "Engine Test Flight",
     chapters: [
       {
-        // 16s demo: Great Room (0–5) → Kitchen (6–10) → Primary Suite (11–16),
-        // with timed hotspot rings hanging on each room's drawn doorways.
+        // 16s 3D-rendered flight: kitchen sweep → island pass → hallway →
+        // primary suite → arc over the bed. Hotspot yaws computed from the
+        // render spline against real scene anchors.
         id: "flight",
         label: "The Flight",
         video: {
-          src: "https://media.lvxhomes.com/tours/test/demo-flight.mp4?v=1",
-          fallbackSrc: "/tours/demo-flight.mp4",
+          src: "https://media.lvxhomes.com/tours/test/demo-flight-3d.mp4?v=1",
+          fallbackSrc: "/tours/demo-flight-3d.mp4",
         },
         hotspots: [
-          { id: "hs-kitchen", label: "Kitchen", start: 0.5, end: 4.8, yaw: 60, pitch: -4, panoId: "kitchen" },
-          { id: "hs-suite", label: "Primary Suite", start: 0.5, end: 4.8, yaw: -60, pitch: -4, panoId: "suite" },
-          { id: "hs-great-k", label: "Great Room", start: 6.2, end: 9.8, yaw: -70, pitch: -4, panoId: "great" },
-          { id: "hs-great-s", label: "Great Room", start: 11.2, end: 15.5, yaw: 70, pitch: -4, panoId: "great" },
+          { id: "hs-kitchen", label: "Kitchen", start: 1, end: 4, yaw: -45, pitch: -12, panoId: "kitchen" },
+          { id: "hs-suite", label: "Primary Suite", start: 11, end: 14.5, yaw: 65, pitch: -10, panoId: "suite" },
         ],
       },
       {
@@ -85,19 +84,16 @@ export const TOURS: Tour[] = [
     ],
     panos: [
       {
-        id: "great",
-        label: "The Great Room",
-        src: "https://media.lvxhomes.com/tours/test/pano-great.jpg?v=1",
-      },
-      {
         id: "kitchen",
         label: "The Kitchen",
-        src: "https://media.lvxhomes.com/tours/test/pano-kitchen.jpg?v=1",
+        src: "https://media.lvxhomes.com/tours/test/pano-kitchen-3d.jpg?v=1",
+        initialYaw: -125, // face the island from the capture point
       },
       {
         id: "suite",
         label: "The Primary Suite",
-        src: "https://media.lvxhomes.com/tours/test/pano-suite.jpg?v=1",
+        src: "https://media.lvxhomes.com/tours/test/pano-suite-3d.jpg?v=1",
+        initialYaw: 65, // face the bed
       },
     ],
     hidden: true,
