@@ -94,6 +94,9 @@ export function TourViewer({
   const [copied, setCopied] = useState(false);
   const [copiedPaths, setCopiedPaths] = useState(false);
   const [planOpen, setPlanOpen] = useState(false);
+  /** Auto-hiding player chrome for the immersive mobile flight. */
+  const [controlsVisible, setControlsVisible] = useState(true);
+  const [isPortrait, setIsPortrait] = useState(false);
   const [activeSheetId, setActiveSheetId] = useState(plan?.sheets[0]?.id ?? "");
   const [chapterIdx, setChapterIdx] = useState(0);
 
@@ -116,6 +119,8 @@ export function TourViewer({
   /** Each chapter remembers where the viewer left it. */
   const chapterTimesRef = useRef<Record<string, number>>({});
   const triedFallbackRef = useRef(false);
+  /** Pending auto-hide of the player chrome. */
+  const hideTimerRef = useRef<number | null>(null);
   /** Device/browser capabilities, detected once on mount. */
   const capsRef = useRef({
     isIOS: false,
@@ -425,13 +430,13 @@ export function TourViewer({
       { signal },
     );
     const endPointer = (e: PointerEvent) => {
-      // Author mode: a press that barely moved is a placement click.
-      if (
-        authorRef.current &&
+      // A press that barely moved is a tap (vs a drag-look).
+      const tap =
         pointers.has(e.pointerId) &&
         Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) < 6 &&
-        performance.now() - downAt.t < 400
-      ) {
+        performance.now() - downAt.t < 400;
+      // Author mode: a tap places a ring keyframe.
+      if (authorRef.current && tap) {
         const rect = el.getBoundingClientRect();
         const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
         const ndcY = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
@@ -461,6 +466,14 @@ export function TourViewer({
             return next;
           });
         }
+      } else if (tap && startedRef.current && !panoRef.current && capsRef.current.isMobile) {
+        // Tap on the flight (mobile) toggles the auto-hiding chrome.
+        if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
+        setControlsVisible((vis) => {
+          const next = !vis;
+          if (next) hideTimerRef.current = window.setTimeout(() => setControlsVisible(false), 4000);
+          return next;
+        });
       }
       pointers.delete(e.pointerId);
       if (pointers.size < 2) pinchDist = 0;
@@ -899,6 +912,18 @@ export function TourViewer({
     };
   }, [pseudoFs]);
 
+  // Track portrait/landscape for the immersive flight's rotate nudge.
+  useEffect(() => {
+    const update = () => setIsPortrait(window.innerHeight > window.innerWidth);
+    update();
+    window.addEventListener("resize", update);
+    window.addEventListener("orientationchange", update);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("orientationchange", update);
+    };
+  }, []);
+
   // Author transport helpers (used by the keyboard effect + the panel).
   const authSeek = useCallback((t: number) => {
     const v = videoRef.current;
@@ -1121,11 +1146,12 @@ export function TourViewer({
     if (useApi) {
       host.requestFullscreen().then(
         () => {
+          // Force landscape for the immersive flight. Android/Chrome honor this;
+          // iOS has no lock and falls back to the rotate nudge.
           const so = screen.orientation as unknown as {
             lock?: (o: string) => Promise<void>;
-            type?: string;
           };
-          if (so?.lock && so.type) so.lock(so.type).catch(() => {});
+          so?.lock?.("landscape").catch(() => {});
         },
         () => setPseudoFs(true), // API rejected → fall back to the overlay
       );
@@ -1164,6 +1190,13 @@ export function TourViewer({
         setLoading(false);
         setHint(true);
         setTimeout(() => setHint(false), 4500);
+        // Mobile: surface the chrome briefly, then auto-hide for the immersive
+        // flight (a tap brings it back).
+        if (caps.isMobile) {
+          setControlsVisible(true);
+          if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
+          hideTimerRef.current = window.setTimeout(() => setControlsVisible(false), 3500);
+        }
         // One-time nudge that VR/motion is available — drag remains default.
         if (caps.isMobile && caps.hasOrientation) {
           setTimeout(() => {
@@ -1484,9 +1517,46 @@ export function TourViewer({
         </span>
       </div>
 
-      {/* Controls */}
+      {/* Rotate-to-landscape nudge for the immersive flight (iOS can't force it) */}
+      {started && !pano && isPortrait && (pseudoFs || fsActive) && (
+        <div className="pointer-events-none absolute inset-0 z-50 flex items-center justify-center">
+          <div className="flex flex-col items-center gap-3 rounded-2xl bg-ink/80 px-8 py-6 backdrop-blur-sm">
+            <svg
+              width="38"
+              height="38"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="#B7995C"
+              strokeWidth="1.4"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="motion-safe:animate-pulse"
+              aria-hidden="true"
+            >
+              <rect x="8.5" y="2.5" width="7" height="13" rx="1.5" />
+              <path d="M5 14a8 8 0 0 0 8 7.5" />
+              <path d="M3 12l2 2 2-2" />
+            </svg>
+            <span className="font-sans text-[0.7rem] uppercase tracking-[0.22em] text-paper/90">
+              Rotate to landscape
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Controls (auto-hide on mobile; tap the flight to bring them back) */}
       {started && (
-        <div className="absolute inset-x-0 bottom-0 flex flex-col gap-2.5 p-4">
+        <div
+          onPointerDown={() => {
+            if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
+            if (capsRef.current.isMobile)
+              hideTimerRef.current = window.setTimeout(() => setControlsVisible(false), 4000);
+          }}
+          className={cn(
+            "absolute inset-x-0 bottom-0 flex flex-col gap-2.5 p-4 transition-opacity duration-300",
+            controlsVisible || author || pano ? "opacity-100" : "pointer-events-none opacity-0",
+          )}
+        >
           {/* Seek / scrub bar */}
           {!pano && (
             <div className="flex items-center gap-2.5">
