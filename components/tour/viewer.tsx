@@ -100,6 +100,8 @@ export function TourViewer({
   const startedRef = useRef(false);
   const motionOnRef = useRef(false);
   const panoRef = useRef<TourPano | null>(null);
+  /** The flight's look direction when you stepped into a pano — restored on resume. */
+  const flightLookRef = useRef<{ lon: number; lat: number; mlon: number; mlat: number } | null>(null);
   const authorRef = useRef(false);
   const ringsRef = useRef<TourHotspot[]>([]);
   const activeRingRef = useRef<string | null>(null);
@@ -985,6 +987,15 @@ export function TourViewer({
         const texPromise = loadPano(target);
         setFading(true);
         const [tex] = await Promise.all([texPromise, sleep(350)]);
+        // Remember where the flight was looking so Resume picks it back up.
+        if (!panoRef.current) {
+          flightLookRef.current = {
+            lon: engine.look.lon,
+            lat: engine.look.lat,
+            mlon: engine.look.mlon,
+            mlat: engine.look.mlat,
+          };
+        }
         engine.video.pause();
         engine.material.map = tex;
         engine.material.needsUpdate = true;
@@ -1008,6 +1019,16 @@ export function TourViewer({
     await sleep(350);
     engine.material.map = engine.videoTexture;
     engine.material.needsUpdate = true;
+    // Resume the flight looking exactly where you left it.
+    const saved = flightLookRef.current;
+    if (saved) {
+      engine.look.lon = saved.lon;
+      engine.look.lat = saved.lat;
+      engine.look.mlon = saved.mlon;
+      engine.look.mlat = saved.mlat;
+      engine.look.vLon = 0;
+      engine.look.vLat = 0;
+    }
     setPano(null);
     void engine.video.play();
     setFading(false);
@@ -1297,6 +1318,8 @@ export function TourViewer({
   // whether the player is a 400px embed or a fullscreen 4K monitor.
   const ctl =
     "flex h-[clamp(2.5rem,3cqw,4.25rem)] w-[clamp(2.5rem,3cqw,4.25rem)] items-center justify-center rounded-full border border-paper/40 text-[clamp(0.875rem,1cqw,1.35rem)] text-paper/90 backdrop-blur-sm transition-colors hover:border-champagne hover:text-champagne";
+  const clk = (s: number) =>
+    `${Math.floor((s || 0) / 60)}:${String(Math.floor((s || 0) % 60)).padStart(2, "0")}`;
 
   return (
     <div
@@ -1463,7 +1486,28 @@ export function TourViewer({
 
       {/* Controls */}
       {started && (
-        <div className="absolute inset-x-0 bottom-0 flex items-center justify-between p-4">
+        <div className="absolute inset-x-0 bottom-0 flex flex-col gap-2.5 p-4">
+          {/* Seek / scrub bar */}
+          {!pano && (
+            <div className="flex items-center gap-2.5">
+              <span className="font-mono text-[clamp(0.6rem,0.78cqw,0.9rem)] tabular-nums text-paper/70">{clk(authTime)}</span>
+              <input
+                type="range"
+                min={0}
+                max={authDur || 0}
+                step={0.05}
+                value={Math.min(authTime, authDur || 0)}
+                onChange={(e) => {
+                  const v = engineRef.current?.video;
+                  if (v) v.currentTime = parseFloat(e.target.value);
+                }}
+                className="h-1 flex-1 cursor-pointer accent-champagne"
+                aria-label="Seek"
+              />
+              <span className="font-mono text-[clamp(0.6rem,0.78cqw,0.9rem)] tabular-nums text-paper/50">{clk(authDur || 0)}</span>
+            </div>
+          )}
+          <div className="relative flex items-center justify-between">
           {/* Chapter switcher — only when the tour has multiple flight chapters */}
           {tour.chapters.length > 1 && !pano && (
             <div className="absolute left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-paper/30 bg-ink/40 px-2 py-1 backdrop-blur-sm">
@@ -1545,6 +1589,7 @@ export function TourViewer({
                 </svg>
               </button>
             )}
+          </div>
           </div>
         </div>
       )}
