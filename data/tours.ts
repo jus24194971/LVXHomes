@@ -221,8 +221,7 @@ export const TOURS: Tour[] = [
         label: "The Walkthrough",
         video: { src: "https://media.lvxhomes.com/tours/apartment-1112/flight.mp4?v=1" },
         startYaw: 180,
-        // Authored in /tours/apartment-1112?author=1. NOTE: "Primary Bathroom"
-        // points at the bedroom pano as sent — confirm vs the primary-bath pano.
+        // Authored in /tours/apartment-1112?author=1.
         hotspots: [
           { id: "hs-living", label: "Living Room", panoId: "living", fade: 0.6, keys: [
             { t: 3.28, yaw: 126.4, pitch: -5.5 },
@@ -242,7 +241,7 @@ export const TOURS: Tour[] = [
           { id: "hs-bonus", label: "Bonus Room", panoId: "bonus", fade: 0.6, keys: [
             { t: 21.23, yaw: 72.4, pitch: -2.8 },
           ] },
-          { id: "hs-guestbath", label: "Guest Bathroom", panoId: "guest-bath", fade: 0.6, keys: [
+          { id: "hs-guestbath", label: "Guest Bath", panoId: "guest-bath", fade: 0.6, keys: [
             { t: 21.23, yaw: 27.4, pitch: -3.4 },
             { t: 40.75, yaw: 20, pitch: 5.6 },
           ] },
@@ -253,7 +252,7 @@ export const TOURS: Tour[] = [
             { t: 77.35, yaw: -138.5, pitch: -14.6 },
             { t: 91.36, yaw: 117.9, pitch: -8.7 },
           ] },
-          { id: "hs-primarybath", label: "Primary Bathroom", panoId: "bedroom", fade: 0.6, keys: [
+          { id: "hs-primarybath", label: "Primary Bath", panoId: "primary-bath", fade: 0.6, keys: [
             { t: 79.4, yaw: -74.2, pitch: 1.8 },
             { t: 81.42, yaw: -65.1, pitch: -1.3 },
           ] },
