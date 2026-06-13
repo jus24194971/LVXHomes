@@ -266,50 +266,72 @@ export function TourViewer({
     };
     const steadyBuf: { t: number; a: number; b: number; g: number }[] = [];
     let calibDeadline = 0;
+    // Heading source. Relative `deviceorientation` alpha is gyro-integrated and
+    // DRIFTS on Android, so we prefer `deviceorientationabsolute` — the OS-fused
+    // absolute-orientation sensor (accel+gyro+magnetometer), which is north-
+    // locked and doesn't wander. iOS never fires the absolute event, so it stays
+    // on `deviceorientation`. If absolute goes quiet (sensor hiccup) we let the
+    // relative stream resume after a short grace window.
+    let lastAbsoluteAt = 0;
+    const onOrient = (e: DeviceOrientationEvent, isAbsolute: boolean) => {
+      if (e.alpha === null || e.beta === null || e.gamma === null) return;
+      const now = performance.now();
+      if (!isAbsolute && lastAbsoluteAt && now - lastAbsoluteAt < 2000) return;
+      const firstAbsolute = isAbsolute && lastAbsoluteAt === 0;
+      if (isAbsolute) lastAbsoluteAt = now;
+
+      orient.alpha = THREE.MathUtils.degToRad(e.alpha);
+      orient.beta = THREE.MathUtils.degToRad(e.beta);
+      orient.gamma = THREE.MathUtils.degToRad(e.gamma);
+      orient.has = true;
+
+      // Relative→absolute handoff after we'd already calibrated: silently
+      // re-zero heading against the absolute stream. captureCalibration keeps
+      // the current look.lon, so the switch is seamless (no visible jump).
+      if (firstAbsolute && calibPhaseRef.current === "done") captureCalibration();
+
+      const phase = calibPhaseRef.current;
+      if (phase === "kickoff") {
+        look.mlon = 0; // a new calibration clears any prior finger pan
+        look.mlat = 0;
+        look.vLon = 0;
+        look.vLat = 0;
+        captureCalibration(); // provisional zero — no jump on engage
+        calibPhaseRef.current = "waiting";
+        calibDeadline = now + 8000;
+        steadyBuf.length = 0;
+        setCalibMsg("hold");
+      } else if (phase === "waiting") {
+        steadyBuf.push({ t: now, a: e.alpha, b: e.beta, g: e.gamma });
+        while (steadyBuf.length && now - steadyBuf[0].t > 750) steadyBuf.shift();
+        const windowFull = steadyBuf.length > 6 && now - steadyBuf[0].t > 600;
+        let steady = false;
+        if (windowFull) {
+          let aMin = 360, aMax = -360, bMin = 360, bMax = -360, gMin = 360, gMax = -360;
+          for (const s of steadyBuf) {
+            aMin = Math.min(aMin, s.a); aMax = Math.max(aMax, s.a);
+            bMin = Math.min(bMin, s.b); bMax = Math.max(bMax, s.b);
+            gMin = Math.min(gMin, s.g); gMax = Math.max(gMax, s.g);
+          }
+          steady = aMax - aMin < 2 && bMax - bMin < 2 && gMax - gMin < 2;
+        }
+        if (steady || now > calibDeadline) {
+          captureCalibration(); // clean locked reference
+          calibPhaseRef.current = "done";
+          setCalibMsg("done");
+          setTimeout(() => setCalibMsg(null), 1400);
+        }
+      }
+    };
     window.addEventListener(
       "deviceorientation",
-      (e) => {
-        if (e.alpha === null || e.beta === null || e.gamma === null) return;
-        orient.alpha = THREE.MathUtils.degToRad(e.alpha);
-        orient.beta = THREE.MathUtils.degToRad(e.beta);
-        orient.gamma = THREE.MathUtils.degToRad(e.gamma);
-        orient.has = true;
-
-        const phase = calibPhaseRef.current;
-        if (phase === "kickoff") {
-          look.mlon = 0; // a new calibration clears any prior finger pan
-          look.mlat = 0;
-          look.vLon = 0;
-          look.vLat = 0;
-          captureCalibration(); // provisional zero — no jump on engage
-          calibPhaseRef.current = "waiting";
-          calibDeadline = performance.now() + 8000;
-          steadyBuf.length = 0;
-          setCalibMsg("hold");
-        } else if (phase === "waiting") {
-          const now = performance.now();
-          steadyBuf.push({ t: now, a: e.alpha, b: e.beta, g: e.gamma });
-          while (steadyBuf.length && now - steadyBuf[0].t > 750) steadyBuf.shift();
-          const windowFull =
-            steadyBuf.length > 6 && now - steadyBuf[0].t > 600;
-          let steady = false;
-          if (windowFull) {
-            let aMin = 360, aMax = -360, bMin = 360, bMax = -360, gMin = 360, gMax = -360;
-            for (const s of steadyBuf) {
-              aMin = Math.min(aMin, s.a); aMax = Math.max(aMax, s.a);
-              bMin = Math.min(bMin, s.b); bMax = Math.max(bMax, s.b);
-              gMin = Math.min(gMin, s.g); gMax = Math.max(gMax, s.g);
-            }
-            steady = aMax - aMin < 2 && bMax - bMin < 2 && gMax - gMin < 2;
-          }
-          if (steady || now > calibDeadline) {
-            captureCalibration(); // clean locked reference
-            calibPhaseRef.current = "done";
-            setCalibMsg("done");
-            setTimeout(() => setCalibMsg(null), 1400);
-          }
-        }
-      },
+      (e) => onOrient(e, false),
+      { signal },
+    );
+    // Non-standard event (Android) — cast the name so TS infers the right type.
+    window.addEventListener(
+      "deviceorientationabsolute" as "deviceorientation",
+      (e) => onOrient(e, true),
       { signal },
     );
 
