@@ -102,6 +102,9 @@ export function TourViewer({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const engineRef = useRef<Engine | null>(null);
   const hotspotEls = useRef(new Map<string, HTMLDivElement>());
+  /** Screen positions of the visible flight rings, for tap hit-testing — so the
+   *  canvas owns dragging and a ring never steals a drag-look. */
+  const ringHitsRef = useRef<{ x: number; y: number; r: number; node: HTMLDivElement }[]>([]);
   const panoCache = useRef(new Map<string, THREE.Texture>());
   const readoutRef = useRef<HTMLSpanElement | null>(null);
 
@@ -246,10 +249,31 @@ export function TourViewer({
     video.muted = true;
     video.playsInline = true;
     video.setAttribute("webkit-playsinline", "true");
-    video.preload = "metadata";
+    video.preload = "auto";
     videoRef.current = video;
-    video.addEventListener("playing", () => setPlaying(true), { signal });
+    // Keep the element attached (offscreen) so the browser buffers the whole
+    // clip — a DETACHED <video> gets a small buffer cap and starves a couple
+    // seconds into a heavy 4K file.
+    video.style.cssText =
+      "position:absolute;left:-9999px;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none;";
+    mount.appendChild(video);
+    video.addEventListener(
+      "playing",
+      () => {
+        setPlaying(true);
+        setLoading(false);
+      },
+      { signal },
+    );
     video.addEventListener("pause", () => setPlaying(false), { signal });
+    // Recover from buffer-starvation stalls — re-kick playback when it stalls.
+    const onStall = () => {
+      if (startedRef.current && !panoRef.current && !video.paused) {
+        void video.play().catch(() => {});
+      }
+    };
+    video.addEventListener("waiting", onStall, { signal });
+    video.addEventListener("stalled", onStall, { signal });
     // Author scrub readout (cheap; only surfaced in the authoring panel).
     video.addEventListener("timeupdate", () => setAuthTime(video.currentTime), { signal });
     video.addEventListener("seeked", () => setAuthTime(video.currentTime), { signal });
@@ -524,14 +548,25 @@ export function TourViewer({
             return next;
           });
         }
-      } else if (tap && startedRef.current && !panoRef.current && capsRef.current.isMobile) {
-        // Tap on the flight (mobile) toggles the auto-hiding chrome.
-        if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
-        setControlsVisible((vis) => {
-          const next = !vis;
-          if (next) hideTimerRef.current = window.setTimeout(() => setControlsVisible(false), 4000);
-          return next;
-        });
+      } else if (tap && startedRef.current && !panoRef.current) {
+        // Tap → step into a ring if one was hit (the canvas owns the hit-test so
+        // a drag is never stolen by a ring); else, on mobile, toggle the chrome.
+        const rect = el.getBoundingClientRect();
+        const tx = e.clientX - rect.left;
+        const ty = e.clientY - rect.top;
+        const hit = ringHitsRef.current.find(
+          (hp) => Math.hypot(tx - hp.x, ty - hp.y) <= hp.r,
+        );
+        if (hit) {
+          hit.node.querySelector("button")?.click();
+        } else if (capsRef.current.isMobile) {
+          if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
+          setControlsVisible((vis) => {
+            const next = !vis;
+            if (next) hideTimerRef.current = window.setTimeout(() => setControlsVisible(false), 4000);
+            return next;
+          });
+        }
       }
       pointers.delete(e.pointerId);
       if (pointers.size < 2) pinchDist = 0;
@@ -877,6 +912,7 @@ export function TourViewer({
 
       // Pass 3 — glide toward the (separated) target and apply. Nearer rings
       // render on top so a cluster reads cleanly.
+      const hits: { x: number; y: number; r: number; node: HTMLDivElement }[] = [];
       for (const v of vis) {
         v.tx = Math.max(w * 0.05, Math.min(w * 0.95, v.tx));
         v.ty = Math.max(h * 0.05, Math.min(h * 0.95, v.ty));
@@ -896,10 +932,15 @@ export function TourViewer({
         v.node.style.setProperty("--rs", String(v.scale));
         v.node.style.zIndex = String(Math.round(1000 - Math.min(v.dist, 99) * 8));
         v.node.style.opacity = String(v.opacity);
-        // While authoring, let clicks fall through to the canvas (to drop
-        // keyframes) instead of being caught by a ring.
-        v.node.style.pointerEvents = authoring ? "none" : v.opacity > 0.5 ? "auto" : "none";
+        // Rings never capture pointer events — the canvas owns dragging, and a
+        // tap is hit-tested against these positions below (a programmatic click
+        // still fires the ring's handler through pointer-events:none).
+        v.node.style.pointerEvents = "none";
+        if (!authoring && v.opacity > 0.5) {
+          hits.push({ x: sm.x, y: sm.y, r: Math.max(28, Math.min(60, w * 0.03)), node: v.node });
+        }
       }
+      ringHitsRef.current = hits;
 
       // You-are-here: the displayed sheet's path for this chapter.
       const ind = planIndicatorRef.current;
@@ -937,6 +978,7 @@ export function TourViewer({
       video.pause();
       video.removeAttribute("src");
       video.load();
+      video.remove();
       videoTexture.dispose();
       material.dispose();
       geometry.dispose();
