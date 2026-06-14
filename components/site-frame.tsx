@@ -17,14 +17,17 @@ export function SiteFrame({
   children: ReactNode;
   footer: ReactNode;
 }) {
-  const inStudio = usePathname()?.startsWith("/studio") ?? false;
+  const path = usePathname() ?? "";
+  // The gated /studio back office and the chromeless /embed player both supply
+  // their own shell — no public marketing nav/footer on either.
+  const bare = path.startsWith("/studio") || path.startsWith("/embed");
   return (
     <>
-      {!inStudio && <Nav />}
+      {!bare && <Nav />}
       <main id="main" className="flex-1">
         {children}
       </main>
-      {!inStudio && footer}
+      {!bare && footer}
     </>
   );
 }

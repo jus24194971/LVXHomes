@@ -6,6 +6,7 @@ import type { Tour } from "@/data/tours";
 import { saveDoc } from "@/lib/author-client";
 import { AssetPicker } from "@/components/studio/asset-picker";
 import type { Asset } from "@/lib/library-client";
+import { SITE } from "@/data/site";
 import { cn } from "@/lib/utils";
 
 const fileOf = (url: string) => {
@@ -26,6 +27,7 @@ export function TourSettings({ tour: initial }: { tour: Tour }) {
   const [picking, setPicking] = useState<null | "video" | "pano">(null);
   const [state, setState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [msg, setMsg] = useState("");
+  const [copied, setCopied] = useState<"link" | "iframe" | null>(null);
 
   const videoSrc = tour.chapters[0]?.video?.src ?? "";
 
@@ -62,6 +64,23 @@ export function TourSettings({ tour: initial }: { tour: Tour }) {
     } catch (e) {
       setState("error");
       setMsg(e instanceof Error ? e.message : "Save failed");
+    }
+  };
+
+  const embedUrl = `${SITE.url}/embed/${tour.slug}`;
+  const iframeSnippet =
+    `<div style="position:relative;width:100%;padding-bottom:56.25%">\n` +
+    `  <iframe src="${embedUrl}" style="position:absolute;inset:0;width:100%;height:100%;border:0"\n` +
+    `    allow="fullscreen; gyroscope; accelerometer" allowfullscreen loading="lazy"\n` +
+    `    title="${tour.title} — 360 Tour"></iframe>\n` +
+    `</div>`;
+  const copy = async (text: string, key: "link" | "iframe") => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(key);
+      setTimeout(() => setCopied(null), 1500);
+    } catch {
+      /* clipboard unavailable */
     }
   };
 
@@ -174,6 +193,69 @@ export function TourSettings({ tour: initial }: { tour: Tour }) {
           >
             {state === "saving" ? "Saving…" : state === "saved" ? "Saved ✓" : "Save settings"}
           </button>
+        </div>
+      </div>
+
+      {/* share & embed */}
+      <div className="mt-5 border-t border-paper/10 pt-4">
+        <p className="font-display text-[0.7rem] uppercase tracking-[0.2em] text-champagne">
+          Share &amp; embed
+        </p>
+        <p className="mt-1.5 font-sans text-[0.7rem] leading-relaxed text-paper/45">
+          Give an agent the link (works as an MLS virtual-tour URL) or the iframe
+          to drop on their own listing page — the tour plays in their page, no
+          redirect to your site.
+        </p>
+
+        <label className="mt-3 block">
+          <span className="font-sans text-[0.62rem] uppercase tracking-[0.14em] text-paper/50">
+            Direct link
+          </span>
+          <div className="mt-1 flex gap-2">
+            <input
+              readOnly
+              value={embedUrl}
+              onFocus={(e) => e.currentTarget.select()}
+              className="min-w-0 flex-1 rounded border border-paper/20 bg-ink/60 px-2 py-1.5 font-mono text-xs text-paper/80 outline-none"
+            />
+            <button
+              type="button"
+              onClick={() => copy(embedUrl, "link")}
+              className="shrink-0 rounded border border-champagne/50 px-3 py-1.5 font-sans text-[0.7rem] uppercase tracking-[0.12em] text-champagne hover:bg-champagne/10"
+            >
+              {copied === "link" ? "Copied ✓" : "Copy"}
+            </button>
+          </div>
+        </label>
+
+        <div className="mt-3">
+          <span className="font-sans text-[0.62rem] uppercase tracking-[0.14em] text-paper/50">
+            Embed code (responsive)
+          </span>
+          <textarea
+            readOnly
+            rows={4}
+            value={iframeSnippet}
+            onFocus={(e) => e.currentTarget.select()}
+            className="mt-1 w-full rounded border border-paper/20 bg-ink/60 p-2 font-mono text-[0.68rem] leading-relaxed text-paper/80 outline-none"
+          />
+          <div className="mt-1.5 flex items-center gap-4">
+            <button
+              type="button"
+              onClick={() => copy(iframeSnippet, "iframe")}
+              className="rounded border border-champagne/50 px-3 py-1.5 font-sans text-[0.7rem] uppercase tracking-[0.12em] text-champagne hover:bg-champagne/10"
+            >
+              {copied === "iframe" ? "Copied ✓" : "Copy embed code"}
+            </button>
+            <a
+              href={embedUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-sans text-[0.7rem] uppercase tracking-[0.12em] text-paper/50 transition-colors hover:text-champagne"
+            >
+              Preview ↗
+            </a>
+          </div>
         </div>
       </div>
 
