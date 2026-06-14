@@ -57,6 +57,10 @@ export type PlanSheet = {
   /** WGS84 bbox when georeferenced from GPS — enables the Studio's one-click
    *  satellite trace (the sheet's metre extents map 1:1 onto this box). */
   geo?: { minLon: number; minLat: number; maxLon: number; maxLat: number };
+  /** Saved satellite base image (data-URL) for a georeferenced site sheet —
+   *  the Studio stitches it from the bbox, and both the Studio and the player
+   *  minimap render the flight path + amenity dots over it. */
+  satUrl?: string;
 };
 
 export type Plan = {

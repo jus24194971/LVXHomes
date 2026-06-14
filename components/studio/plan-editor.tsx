@@ -69,6 +69,7 @@ export function PlanEditor() {
   const svgRef = useRef<SVGSVGElement>(null);
   const dragRef = useRef<Drag>(null);
   const undoStack = useRef<string[]>([]);
+  const satTried = useRef<Set<string>>(new Set());
 
   const sheet = sheets[sheetIdx];
   const trace = sheet ? traces[sheet.id] : undefined;
@@ -367,7 +368,7 @@ export function PlanEditor() {
           out.height,
         );
       const url = out.toDataURL("image/jpeg", 0.85);
-      setTraces((t) => ({ ...t, [sheet.id]: { url, opacity: 0.65, scale: 1, x: 0, y: 0 } }));
+      mutateSheet((s) => ({ ...s, satUrl: url }));
       setTool("select");
     } catch (e) {
       alert(e instanceof Error ? e.message : "Couldn't fetch satellite imagery");
@@ -375,6 +376,14 @@ export function PlanEditor() {
       setSatLoading(false);
     }
   }, [sheet]);
+
+  // Auto-stitch the satellite the first time a georeferenced sheet loads.
+  useEffect(() => {
+    if (sheet?.geo && !sheet.satUrl && !satTried.current.has(sheet.id)) {
+      satTried.current.add(sheet.id);
+      void fetchSatellite();
+    }
+  }, [sheet, fetchSatellite]);
 
   const centroid = (pts: [number, number][]): [number, number] => {
     let x = 0, y = 0;
@@ -501,6 +510,18 @@ export function PlanEditor() {
             </pattern>
           </defs>
           <rect x={0} y={0} width={sheet.width} height={sheet.height} fill="url(#grid)" stroke="#CBBC9C" strokeWidth={0.3} />
+
+          {/* satellite base (georeferenced grounds) */}
+          {sheet.satUrl && (
+            <image
+              href={sheet.satUrl}
+              x={0}
+              y={0}
+              width={sheet.width}
+              height={sheet.height}
+              preserveAspectRatio="none"
+            />
+          )}
 
           {/* trace underlay */}
           {trace && (

@@ -64,8 +64,37 @@ function PlanSheetSVG({
           : undefined
       }
     >
-      {/* Plan card */}
-      <rect x={0} y={0} width={sheet.width} height={sheet.height} fill="#FBF8F1" />
+      {/* Base — the real satellite for georeferenced grounds, else the cream card */}
+      {sheet.satUrl ? (
+        <image
+          href={sheet.satUrl}
+          x={0}
+          y={0}
+          width={sheet.width}
+          height={sheet.height}
+          preserveAspectRatio="none"
+        />
+      ) : (
+        <rect x={0} y={0} width={sheet.width} height={sheet.height} fill="#FBF8F1" />
+      )}
+
+      {/* Flight path in gold */}
+      {sheet.paths &&
+        Object.values(sheet.paths).map((keys, ci) =>
+          keys.length > 1 ? (
+            <polyline
+              key={`path-${ci}`}
+              points={keys.map((k) => `${k.x},${k.y}`).join(" ")}
+              fill="none"
+              stroke="#E9C77E"
+              strokeOpacity={0.9}
+              strokeWidth={Math.max(sheet.width, sheet.height) * 0.005}
+              strokeLinejoin="round"
+              strokeLinecap="round"
+              className="pointer-events-none"
+            />
+          ) : null,
+        )}
 
       {sheet.zones.map((z) => {
         const active = z.id === activeZoneId;
@@ -77,9 +106,9 @@ function PlanSheetSVG({
           <g key={z.id}>
             <path
               d={d}
-              fill={active ? "#B7995C" : ZONE_FILL[z.kind]}
-              fillOpacity={active ? 0.55 : 1}
-              stroke={active ? "#A6863F" : "#CBBC9C"}
+              fill={active ? "#B7995C" : sheet.satUrl ? "#B7995C" : ZONE_FILL[z.kind]}
+              fillOpacity={active ? 0.55 : sheet.satUrl ? 0.22 : 1}
+              stroke={active ? "#A6863F" : sheet.satUrl ? "#E9C77E" : "#CBBC9C"}
               strokeWidth={sheet.width * 0.004}
               className={cn(
                 interactive &&
@@ -111,8 +140,11 @@ function PlanSheetSVG({
               dominantBaseline="central"
               fontSize={labelSize}
               letterSpacing={labelSize * 0.12}
-              fill={active ? "#211C16" : "#6B5D45"}
-              className="pointer-events-none select-none font-sans uppercase"
+              fill={active ? "#211C16" : sheet.satUrl ? "#FBF8F1" : "#6B5D45"}
+              className="pointer-events-none select-none font-sans uppercase [paint-order:stroke]"
+              stroke={sheet.satUrl && !active ? "#211C16" : undefined}
+              strokeWidth={sheet.satUrl && !active ? labelSize * 0.12 : undefined}
+              strokeOpacity={0.5}
             >
               {z.label}
             </text>
