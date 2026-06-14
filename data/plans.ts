@@ -54,6 +54,9 @@ export type PlanSheet = {
   strokes?: [number, number][][];
   /** Flight-path keyframes per chapter id — drives the traveling dot. */
   paths?: Record<string, PlanPathKey[]>;
+  /** WGS84 bbox when georeferenced from GPS — enables the Studio's one-click
+   *  satellite trace (the sheet's metre extents map 1:1 onto this box). */
+  geo?: { minLon: number; minLat: number; maxLon: number; maxLat: number };
 };
 
 export type Plan = {

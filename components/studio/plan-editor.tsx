@@ -64,6 +64,7 @@ export function PlanEditor() {
   const [copied, setCopied] = useState(false);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveMsg, setSaveMsg] = useState("");
+  const [satLoading, setSatLoading] = useState(false);
 
   const svgRef = useRef<SVGSVGElement>(null);
   const dragRef = useRef<Drag>(null);
@@ -302,6 +303,77 @@ export function PlanEditor() {
     [sheet],
   );
 
+  /** One-click satellite trace: stitch Esri World Imagery tiles for the sheet's
+   *  GPS bbox (via the same-origin proxy) and drop the cropped, aligned image in
+   *  as the trace — so the path overlays the real grounds and you just draw. */
+  const fetchSatellite = useCallback(async () => {
+    const g = sheet?.geo;
+    if (!g) return;
+    setSatLoading(true);
+    try {
+      const lon2x = (lon: number, z: number) => ((lon + 180) / 360) * 2 ** z;
+      const lat2y = (lat: number, z: number) => {
+        const r = (lat * Math.PI) / 180;
+        return ((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * 2 ** z;
+      };
+      // deepest zoom that keeps the stitched image ≲ ~2200px wide
+      let z = 21;
+      for (; z > 1; z--) {
+        if ((lon2x(g.maxLon, z) - lon2x(g.minLon, z)) * 256 <= 2200) break;
+      }
+      const xNW = lon2x(g.minLon, z), yNW = lat2y(g.maxLat, z);
+      const xSE = lon2x(g.maxLon, z), ySE = lat2y(g.minLat, z);
+      const tx0 = Math.floor(xNW), ty0 = Math.floor(yNW);
+      const tx1 = Math.floor(xSE), ty1 = Math.floor(ySE);
+
+      const full = document.createElement("canvas");
+      full.width = (tx1 - tx0 + 1) * 256;
+      full.height = (ty1 - ty0 + 1) * 256;
+      const fctx = full.getContext("2d");
+      if (!fctx) throw new Error("no 2d context");
+
+      const draw = (col: number, row: number) =>
+        new Promise<void>((resolve) => {
+          const img = new Image();
+          img.onload = () => {
+            fctx.drawImage(img, (col - tx0) * 256, (row - ty0) * 256);
+            resolve();
+          };
+          img.onerror = () => resolve();
+          img.src = `/studio/api/sat?z=${z}&x=${col}&y=${row}`;
+        });
+      const jobs: Promise<void>[] = [];
+      for (let col = tx0; col <= tx1; col++)
+        for (let row = ty0; row <= ty1; row++) jobs.push(draw(col, row));
+      await Promise.all(jobs);
+
+      // crop the tile mosaic to the exact bbox
+      const out = document.createElement("canvas");
+      out.width = Math.max(1, Math.round((xSE - xNW) * 256));
+      out.height = Math.max(1, Math.round((ySE - yNW) * 256));
+      out
+        .getContext("2d")
+        ?.drawImage(
+          full,
+          (xNW - tx0) * 256,
+          (yNW - ty0) * 256,
+          (xSE - xNW) * 256,
+          (ySE - yNW) * 256,
+          0,
+          0,
+          out.width,
+          out.height,
+        );
+      const url = out.toDataURL("image/jpeg", 0.85);
+      setTraces((t) => ({ ...t, [sheet.id]: { url, opacity: 0.65, scale: 1, x: 0, y: 0 } }));
+      setTool("select");
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Couldn't fetch satellite imagery");
+    } finally {
+      setSatLoading(false);
+    }
+  }, [sheet]);
+
   const centroid = (pts: [number, number][]): [number, number] => {
     let x = 0, y = 0;
     for (const [px, py] of pts) { x += px; y += py; }
@@ -371,6 +443,17 @@ export function PlanEditor() {
             Trace image…
             <input type="file" accept="image/*" className="hidden" onChange={(e) => onTraceFile(e.target.files?.[0])} />
           </label>
+          {sheet.geo && (
+            <button
+              type="button"
+              onClick={() => void fetchSatellite()}
+              disabled={satLoading}
+              title="Stitch aligned satellite imagery for this GPS-referenced sheet"
+              className="rounded border border-champagne/60 px-3 py-1.5 font-sans text-[0.6875rem] uppercase tracking-[0.14em] text-champagne transition-colors hover:bg-champagne hover:text-ink disabled:opacity-40"
+            >
+              {satLoading ? "Fetching…" : "🛰 Fetch satellite"}
+            </button>
+          )}
           {trace && (
             <>
               {toolBtn("trace", "Move trace")}
