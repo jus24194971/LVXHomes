@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Plan, PlanSheet, PlanZone, PlanZoneKind } from "@/data/plans";
 import { PLANS } from "@/data/plans";
 import { ZONE_FILL } from "@/components/tour/plan";
+import { loadDoc, saveDoc } from "@/lib/author-client";
 import { cn } from "@/lib/utils";
 
 /**
@@ -61,6 +62,8 @@ export function PlanEditor() {
   const [showExport, setShowExport] = useState(false);
   const [importText, setImportText] = useState("");
   const [copied, setCopied] = useState(false);
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [saveMsg, setSaveMsg] = useState("");
 
   const svgRef = useRef<SVGSVGElement>(null);
   const dragRef = useRef<Drag>(null);
@@ -264,6 +267,30 @@ export function PlanEditor() {
       alert("Couldn't parse that JSON — expected a Plan ({ tourSlug, sheets }).");
     }
   }, [importText, loadPlan]);
+
+  // ---------- live site (Zero Trust backend) ----------
+  const saveToSite = useCallback(async () => {
+    setSaveState("saving");
+    setSaveMsg("");
+    try {
+      await saveDoc("plan", tourSlug, { tourSlug, sheets } satisfies Plan);
+      setSaveState("saved");
+      setTimeout(() => setSaveState("idle"), 2200);
+    } catch (e) {
+      setSaveState("error");
+      setSaveMsg(e instanceof Error ? e.message : "Save failed");
+    }
+  }, [tourSlug, sheets]);
+
+  const loadFromSite = useCallback(async () => {
+    try {
+      const doc = await loadDoc<Plan>("plan", tourSlug);
+      if (doc && Array.isArray(doc.sheets)) loadPlan(doc);
+      else alert(`No saved plan for "${tourSlug}" yet.`);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Load failed");
+    }
+  }, [tourSlug, loadPlan]);
 
   const onTraceFile = useCallback(
     (file: File | undefined) => {
@@ -617,6 +644,21 @@ export function PlanEditor() {
             >
               {copied ? "Copied" : "Copy"}
             </button>
+            <button
+              type="button"
+              onClick={() => void saveToSite()}
+              disabled={saveState === "saving"}
+              className="rounded border border-champagne bg-champagne/90 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] text-ink transition-colors hover:bg-champagne disabled:opacity-40"
+            >
+              {saveState === "saving" ? "Saving…" : saveState === "saved" ? "Saved ✓" : "Save to site"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void loadFromSite()}
+              className="rounded border border-paper/30 px-3 py-1.5 text-xs uppercase tracking-[0.14em] text-paper/70 hover:border-champagne/60 hover:text-champagne"
+            >
+              Load from site
+            </button>
             {PLANS.map((p) => (
               <button
                 key={p.tourSlug}
@@ -628,6 +670,9 @@ export function PlanEditor() {
               </button>
             ))}
           </div>
+          {saveState === "error" && (
+            <p className="mt-2 text-xs leading-snug text-red-400">{saveMsg}</p>
+          )}
           {showExport && (
             <textarea
               readOnly

@@ -4,8 +4,10 @@ import { TourViewer } from "@/components/tour/viewer";
 import { Container } from "@/components/ui/container";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { Section } from "@/components/ui/section";
-import { getPlan } from "@/data/plans";
-import { getTour, TOURS } from "@/data/tours";
+import { TOURS } from "@/data/tours";
+import { getPlanLive, getTourLive } from "@/lib/store";
+
+export const dynamic = "force-dynamic";
 
 export function generateStaticParams() {
   return TOURS.map((t) => ({ slug: t.slug }));
@@ -17,7 +19,7 @@ export async function generateMetadata({
   params: Promise<{ slug: string }>;
 }): Promise<Metadata> {
   const { slug } = await params;
-  const tour = getTour(slug);
+  const tour = await getTourLive(slug);
   if (!tour) return { title: "Tours" };
   return {
     title: `${tour.title} — The 360 Flight`,
@@ -33,7 +35,7 @@ export default async function TourPage({
   params: Promise<{ slug: string }>;
 }) {
   const { slug } = await params;
-  const tour = getTour(slug);
+  const tour = await getTourLive(slug);
   if (!tour) notFound();
 
   return (
@@ -56,7 +58,7 @@ export default async function TourPage({
         <div className="mt-10 overflow-hidden border border-paper/15">
           <TourViewer
             tour={tour}
-            plan={getPlan(tour.slug)}
+            plan={await getPlanLive(tour.slug)}
             className="aspect-[4/5] w-full sm:aspect-video"
           />
         </div>

@@ -9,6 +9,26 @@
     "binding": "ASSETS"
   },
   "vars": {
-    "CONTACT_FROM_EMAIL": "LVX Homes <hello@lvxhomes.com>"
-  }
+    "CONTACT_FROM_EMAIL": "LVX Homes <hello@lvxhomes.com>",
+    // Zero Trust hardening (optional): set both to turn ON in-Worker Access JWT
+    // verification, on top of the edge Access policy that already guards these
+    // paths. ACCESS_TEAM_DOMAIN looks like "yourteam.cloudflareaccess.com";
+    // ACCESS_AUD is the Application Audience (AUD) tag from the Access app's
+    // Overview. Leave blank to rely on the edge Access policy alone.
+    "ACCESS_TEAM_DOMAIN": "",
+    "ACCESS_AUD": "",
+    // Optional: comma-separated emails allowed to write (belt-and-suspenders
+    // on top of the Access policy). Leave blank to allow anyone Access lets in.
+    "AUTHOR_ALLOWLIST": ""
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "lvx-content",
+      // Run `wrangler d1 create lvx-content` and paste the returned id here
+      // BEFORE pushing — a placeholder id will fail the deploy.
+      "database_id": "bdf126a0-b0e3-4d4b-98b8-3c672322cf43",
+      "migrations_dir": "migrations"
+    }
+  ]
 }

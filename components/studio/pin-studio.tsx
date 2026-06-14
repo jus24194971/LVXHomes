@@ -3,8 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PROJECTS } from "@/data/projects";
 import { streamHls } from "@/lib/stream";
-import { type VideoPin, getVideoPins, pinPosAt } from "@/data/video-pins";
+import { type VideoPin, type VideoPinSet, getVideoPins, pinPosAt } from "@/data/video-pins";
 import { PinOverlay } from "@/components/tour/pin-overlay";
+import { loadDoc, saveDoc } from "@/lib/author-client";
 import { cn } from "@/lib/utils";
 
 /**
@@ -39,6 +40,8 @@ export function PinStudio() {
   const [duration, setDuration] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [saveMsg, setSaveMsg] = useState("");
   const [fps, setFps] = useState(30);
   const fpsRef = useRef(30);
   fpsRef.current = fps;
@@ -355,6 +358,34 @@ export function PinStudio() {
     }
   };
 
+  // ---------- live site (Zero Trust backend) ----------
+  const saveToSite = async () => {
+    setSaveState("saving");
+    setSaveMsg("");
+    try {
+      await saveDoc("pinset", uid, { uid, pins } satisfies VideoPinSet);
+      setSaveState("saved");
+      setTimeout(() => setSaveState("idle"), 2200);
+    } catch (e) {
+      setSaveState("error");
+      setSaveMsg(e instanceof Error ? e.message : "Save failed");
+    }
+  };
+  const loadFromSite = async () => {
+    try {
+      const doc = await loadDoc<VideoPinSet>("pinset", uid);
+      if (doc && Array.isArray(doc.pins)) {
+        setPins(doc.pins);
+        save(doc.pins);
+        selectPin(doc.pins[0]?.id ?? null, doc.pins);
+      } else {
+        alert("No saved pins for this film yet.");
+      }
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Load failed");
+    }
+  };
+
   // Handle position = the active pin's point at the current time.
   const handlePos =
     active && (active.keys.length ? pinPosAt(active, time) : { x: 0.5, y: 0.5 });
@@ -569,19 +600,39 @@ export function PinStudio() {
         </div>
       </div>
 
-      {/* ---------- export ---------- */}
+      {/* ---------- save / export ---------- */}
       <div className="mt-6 border-t border-paper/10 pt-4">
-        <button
-          type="button"
-          onClick={copyJson}
-          disabled={pins.length === 0}
-          className="w-full rounded-full border border-champagne/60 px-4 py-2.5 font-sans text-xs uppercase tracking-[0.16em] text-champagne transition-colors hover:bg-champagne/10 disabled:opacity-30"
-        >
-          {copied ? "Copied ✓" : "Copy JSON for video-pins.ts"}
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => void saveToSite()}
+            disabled={pins.length === 0 || saveState === "saving"}
+            className="flex-1 rounded-full border border-champagne bg-champagne/90 px-4 py-2.5 font-sans text-xs font-semibold uppercase tracking-[0.16em] text-ink transition-colors hover:bg-champagne disabled:opacity-30"
+          >
+            {saveState === "saving" ? "Saving…" : saveState === "saved" ? "Saved ✓" : "Save to site"}
+          </button>
+          <button
+            type="button"
+            onClick={() => void loadFromSite()}
+            className="rounded-full border border-paper/30 px-4 py-2.5 font-sans text-xs uppercase tracking-[0.16em] text-paper/70 transition-colors hover:border-champagne hover:text-champagne"
+          >
+            Load from site
+          </button>
+          <button
+            type="button"
+            onClick={copyJson}
+            disabled={pins.length === 0}
+            className="rounded-full border border-paper/30 px-4 py-2.5 font-sans text-xs uppercase tracking-[0.16em] text-paper/70 transition-colors hover:border-champagne hover:text-champagne disabled:opacity-30"
+          >
+            {copied ? "Copied ✓" : "Copy JSON"}
+          </button>
+        </div>
+        {saveState === "error" && (
+          <p className="mt-2 font-sans text-[0.7rem] text-red-400">{saveMsg}</p>
+        )}
         <p className="mt-2 font-sans text-[0.7rem] leading-relaxed text-paper/40">
-          Autosaves to this browser. Paste into{" "}
-          <code className="text-champagne/80">data/video-pins.ts</code> to ship it.
+          Save writes straight to the live site (behind Zero Trust). Still
+          autosaves to this browser as a draft; Copy JSON is a manual backup.
         </p>
       </div>
     </div>

@@ -4,6 +4,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import type { Plan, PlanZone } from "@/data/plans";
 import type { Tour, TourPano, TourHotspot } from "@/data/tours";
+import {
+  loadDoc,
+  listRevisions,
+  restoreRevision,
+  saveDoc,
+  type RevisionMeta,
+} from "@/lib/author-client";
 import { PlanPanel } from "@/components/tour/plan";
 import { cn } from "@/lib/utils";
 
@@ -120,6 +127,10 @@ export function TourViewer({
   >({});
   const [copied, setCopied] = useState(false);
   const [copiedPaths, setCopiedPaths] = useState(false);
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [saveMsg, setSaveMsg] = useState("");
+  const [revs, setRevs] = useState<RevisionMeta[]>([]);
+  const [revsOpen, setRevsOpen] = useState(false);
   const [planOpen, setPlanOpen] = useState(false);
   /** Auto-hiding player chrome for the immersive mobile flight. */
   const [controlsVisible, setControlsVisible] = useState(true);
@@ -968,10 +979,12 @@ export function TourViewer({
     v.currentTime = Math.max(0, Math.min(v.duration || 0, (idx + n) / fps + 0.001));
   }, []);
 
-  // Load authored rings for this tour (author mode), once per tour.
+  // Load authored rings for this tour (author mode). Prefer an unsaved local
+  // draft; otherwise seed from the tour's live hotspots — which the page has
+  // already fetched from the backend — so you pick up exactly what's published.
   useEffect(() => {
     if (!author) return;
-    let loaded: TourHotspot[] = [];
+    let loaded: TourHotspot[] | null = null;
     try {
       const raw = localStorage.getItem(`lvx-rings:${tour.slug}`);
       if (raw) {
@@ -980,6 +993,11 @@ export function TourViewer({
       }
     } catch {
       /* ignore */
+    }
+    if (!loaded) {
+      loaded = (tour.chapters[chapterIdxRef.current]?.hotspots ?? []).filter(
+        (h) => (h.keys?.length ?? 0) > 0,
+      );
     }
     setRings(loaded);
     setActiveRing(loaded[0]?.id ?? null);
@@ -1365,6 +1383,84 @@ export function TourViewer({
       /* clipboard unavailable */
     }
   };
+  // ---------- publish to the live site (Zero Trust backend) ----------
+  // The ring editor only edits hotspots; a Save publishes the WHOLE tour with
+  // the authored rings merged into the current chapter, so the saved doc is
+  // always complete and valid. Ids are kept idempotent so round-trips don't
+  // stack the "hs-" prefix.
+  const cleanRings = (): TourHotspot[] =>
+    rings
+      .filter((r) => (r.keys?.length ?? 0) > 0)
+      .map((r) => ({
+        id: r.id.startsWith("hs-") ? r.id : `hs-${r.id}`,
+        label: r.label,
+        panoId: r.panoId,
+        fade: r.fade ?? 0.6,
+        keys: r.keys,
+      }));
+  const buildTourDoc = (): Tour => {
+    const ci = chapterIdxRef.current;
+    const hotspots = cleanRings();
+    return {
+      ...tour,
+      chapters: tour.chapters.map((c, i) => (i === ci ? { ...c, hotspots } : c)),
+    };
+  };
+  const applyTourToRings = (t: Tour) => {
+    const hs = (t.chapters[chapterIdxRef.current]?.hotspots ?? []).filter(
+      (h) => (h.keys?.length ?? 0) > 0,
+    );
+    setRings(hs);
+    saveRings(hs);
+    setActiveRing(hs[0]?.id ?? null);
+  };
+  const saveToSite = async () => {
+    setSaveState("saving");
+    setSaveMsg("");
+    try {
+      await saveDoc("tour", tour.slug, buildTourDoc());
+      setSaveState("saved");
+      setTimeout(() => setSaveState("idle"), 2200);
+    } catch (e) {
+      setSaveState("error");
+      setSaveMsg(e instanceof Error ? e.message : "Save failed");
+    }
+  };
+  const revertToSaved = async () => {
+    try {
+      const doc = await loadDoc<Tour>("tour", tour.slug);
+      if (doc) applyTourToRings(doc);
+    } catch (e) {
+      setSaveState("error");
+      setSaveMsg(e instanceof Error ? e.message : "Load failed");
+    }
+  };
+  const toggleRevisions = async () => {
+    const next = !revsOpen;
+    setRevsOpen(next);
+    if (next) {
+      try {
+        setRevs(await listRevisions("tour", tour.slug));
+      } catch {
+        setRevs([]);
+      }
+    }
+  };
+  const restoreRev = async (id: number) => {
+    try {
+      const doc = await restoreRevision<Tour>("tour", tour.slug, id);
+      if (doc) {
+        applyTourToRings(doc);
+        setRevsOpen(false);
+        setSaveState("saved");
+        setTimeout(() => setSaveState("idle"), 2200);
+      }
+    } catch (e) {
+      setSaveState("error");
+      setSaveMsg(e instanceof Error ? e.message : "Restore failed");
+    }
+  };
+
   const activeR = rings.find((r) => r.id === activeRing) ?? null;
   const fmtT = (s: number) =>
     `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}.${Math.floor((s % 1) * 10)}`;
@@ -1848,10 +1944,63 @@ export function TourViewer({
               );
             })}
           </div>
-          <button type="button" onClick={() => void copyRings()} disabled={rings.every((r) => !(r.keys?.length))}
-            className="mt-3 rounded border border-champagne/60 px-2 py-1.5 uppercase tracking-[0.14em] text-champagne transition-colors hover:bg-champagne hover:text-ink disabled:opacity-40">
-            {copied ? "Copied ✓" : "Copy rings JSON"}
-          </button>
+          {/* publish to the live site */}
+          <div className="mt-3 flex flex-col gap-1.5">
+            <button
+              type="button"
+              onClick={() => void saveToSite()}
+              disabled={saveState === "saving" || rings.every((r) => !(r.keys?.length))}
+              className="rounded border border-champagne bg-champagne/90 px-2 py-1.5 font-semibold uppercase tracking-[0.14em] text-ink transition-colors hover:bg-champagne disabled:opacity-40"
+            >
+              {saveState === "saving" ? "Saving…" : saveState === "saved" ? "Saved ✓" : "Save to site"}
+            </button>
+            <div className="flex gap-1.5">
+              <button
+                type="button"
+                onClick={() => void copyRings()}
+                disabled={rings.every((r) => !(r.keys?.length))}
+                className="flex-1 rounded border border-paper/30 px-2 py-1 uppercase tracking-[0.14em] text-paper/80 transition-colors hover:border-champagne hover:text-champagne disabled:opacity-40"
+              >
+                {copied ? "Copied ✓" : "Copy JSON"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void revertToSaved()}
+                className="flex-1 rounded border border-paper/30 px-2 py-1 uppercase tracking-[0.14em] text-paper/80 transition-colors hover:border-champagne hover:text-champagne"
+              >
+                Revert
+              </button>
+              <button
+                type="button"
+                onClick={() => void toggleRevisions()}
+                className="rounded border border-paper/30 px-2 py-1 uppercase tracking-[0.14em] text-paper/80 transition-colors hover:border-champagne hover:text-champagne"
+              >
+                History
+              </button>
+            </div>
+            {saveState === "error" && (
+              <p className="text-[0.65rem] leading-snug text-red-400">{saveMsg}</p>
+            )}
+            {revsOpen && (
+              <div className="mt-1 max-h-32 overflow-auto rounded border border-paper/15 bg-ink/60 p-1.5">
+                {revs.length === 0 ? (
+                  <p className="text-[0.65rem] text-paper/40">No saved versions yet.</p>
+                ) : (
+                  revs.map((rv) => (
+                    <button
+                      key={rv.id}
+                      type="button"
+                      onClick={() => void restoreRev(rv.id)}
+                      className="flex w-full items-center justify-between gap-2 rounded px-1.5 py-1 text-left text-[0.65rem] text-paper/70 transition-colors hover:bg-champagne/10 hover:text-champagne"
+                    >
+                      <span className="font-mono">{new Date(rv.created_at).toLocaleString()}</span>
+                      <span className="text-paper/40">restore</span>
+                    </button>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
 
           {/* path keys (for the dot) */}
           <div className="mt-3 border-t border-paper/15 pt-2.5">
