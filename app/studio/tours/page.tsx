@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { Container } from "@/components/ui/container";
 import { TOURS } from "@/data/tours";
+import { NewTour } from "@/components/studio/new-tour";
 
 export const metadata: Metadata = { title: "Tours" };
 
@@ -20,7 +21,11 @@ export default function StudioTours() {
         site.
       </p>
 
-      <div className="mt-8 flex flex-col gap-2.5">
+      <div className="mt-8">
+        <NewTour existingSlugs={TOURS.map((t) => t.slug)} />
+      </div>
+
+      <div className="mt-6 flex flex-col gap-2.5">
         {TOURS.map((t) => (
           <Link
             key={t.slug}

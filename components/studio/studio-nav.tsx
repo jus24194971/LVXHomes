@@ -12,6 +12,7 @@ import { cn } from "@/lib/utils";
  */
 const LINKS: { href: string; label: string; exact?: boolean }[] = [
   { href: "/studio", label: "Dashboard", exact: true },
+  { href: "/studio/library", label: "Library" },
   { href: "/studio/tours", label: "Tours" },
   { href: "/studio/plan", label: "Floorplans" },
   { href: "/studio/pins", label: "Pins" },

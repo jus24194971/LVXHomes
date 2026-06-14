@@ -132,3 +132,127 @@ export async function restoreRevision(
   await putDoc(kind, id, body, who);
   return body;
 }
+
+// ---------- media library (assets) ----------
+
+export type AssetKind = "film" | "video360" | "pano";
+export type AssetStatus = "uploading" | "processing" | "ready" | "error";
+
+export type Asset = {
+  id: string;
+  kind: AssetKind;
+  title: string;
+  status: AssetStatus;
+  stream_uid: string | null;
+  r2_key: string | null;
+  content_type: string | null;
+  bytes: number | null;
+  thumb_url: string | null;
+  archived: number;
+  created_at: number;
+  updated_at: number;
+  created_by: string | null;
+};
+
+export async function listAssets(
+  opts: { kind?: AssetKind; includeArchived?: boolean } = {},
+): Promise<Asset[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const clauses: string[] = [];
+  const binds: unknown[] = [];
+  if (!opts.includeArchived) clauses.push("archived = 0");
+  if (opts.kind) {
+    clauses.push("kind = ?");
+    binds.push(opts.kind);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const res = await db
+    .prepare(`SELECT * FROM asset ${where} ORDER BY created_at DESC LIMIT 500`)
+    .bind(...binds)
+    .all<Asset>();
+  return res.results ?? [];
+}
+
+export async function getAsset(id: string): Promise<Asset | null> {
+  const db = await getDb();
+  if (!db) return null;
+  return db.prepare("SELECT * FROM asset WHERE id = ?").bind(id).first<Asset>();
+}
+
+export async function createAsset(a: {
+  id: string;
+  kind: AssetKind;
+  title: string;
+  status: AssetStatus;
+  stream_uid?: string | null;
+  r2_key?: string | null;
+  content_type?: string | null;
+  bytes?: number | null;
+  thumb_url?: string | null;
+  created_by?: string | null;
+}): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("D1 binding 'DB' is not available");
+  const now = Date.now();
+  await db
+    .prepare(
+      "INSERT INTO asset (id, kind, title, status, stream_uid, r2_key, content_type, bytes, thumb_url, archived, created_at, updated_at, created_by) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+    )
+    .bind(
+      a.id,
+      a.kind,
+      a.title,
+      a.status,
+      a.stream_uid ?? null,
+      a.r2_key ?? null,
+      a.content_type ?? null,
+      a.bytes ?? null,
+      a.thumb_url ?? null,
+      now,
+      now,
+      a.created_by ?? null,
+    )
+    .run();
+}
+
+const ASSET_PATCH_COLS = [
+  "title",
+  "status",
+  "stream_uid",
+  "r2_key",
+  "content_type",
+  "bytes",
+  "thumb_url",
+  "archived",
+] as const;
+type AssetPatch = Partial<Pick<Asset, (typeof ASSET_PATCH_COLS)[number]>>;
+
+export async function updateAsset(id: string, patch: AssetPatch): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("D1 binding 'DB' is not available");
+  const sets: string[] = [];
+  const binds: unknown[] = [];
+  for (const col of ASSET_PATCH_COLS) {
+    const v = patch[col];
+    if (v !== undefined) {
+      sets.push(`${col} = ?`);
+      binds.push(v);
+    }
+  }
+  if (sets.length === 0) return;
+  sets.push("updated_at = ?");
+  binds.push(Date.now());
+  binds.push(id);
+  await db
+    .prepare(`UPDATE asset SET ${sets.join(", ")} WHERE id = ?`)
+    .bind(...binds)
+    .run();
+}
+
+export async function deleteAssetRow(id: string): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("D1 binding 'DB' is not available");
+  await db.prepare("DELETE FROM asset WHERE id = ?").bind(id).run();
+}

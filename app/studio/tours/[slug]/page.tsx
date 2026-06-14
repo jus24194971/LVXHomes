@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 import { TourViewer } from "@/components/tour/viewer";
 import { Container } from "@/components/ui/container";
 import { getPlanLive, getTourLive } from "@/lib/store";
+import { TourSettings } from "@/components/studio/tour-settings";
 
 export const dynamic = "force-dynamic";
 
@@ -51,6 +52,8 @@ export default async function StudioTourAuthor({
         tracking keyframe, then <span className="text-champagne/80">Save to site</span>.
         Use <span className="text-champagne/80">History</span> to roll back a bad save.
       </p>
+
+      <TourSettings tour={tour} />
     </Container>
   );
 }

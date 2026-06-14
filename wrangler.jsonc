@@ -19,7 +19,13 @@
     "ACCESS_AUD": "",
     // Optional: comma-separated emails allowed to write (belt-and-suspenders
     // on top of the Access policy). Leave blank to allow anyone Access lets in.
-    "AUTHOR_ALLOWLIST": ""
+    "AUTHOR_ALLOWLIST": "",
+    // Media library (Stream + R2 uploads). The account id is not secret; the
+    // tokens are set with `wrangler secret put` (see docs/media-uploads.md):
+    // CF_API_TOKEN, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+    "CF_ACCOUNT_ID": "a61cc14bdbaa22ac7c9a5f73b3670446",
+    "R2_BUCKET": "lvx-media",
+    "R2_PUBLIC_HOST": "media.lvxhomes.com"
   },
   "d1_databases": [
     {
@@ -29,6 +35,12 @@
       // BEFORE pushing — a placeholder id will fail the deploy.
       "database_id": "bdf126a0-b0e3-4d4b-98b8-3c672322cf43",
       "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MEDIA",
+      "bucket_name": "lvx-media"
     }
   ]
 }

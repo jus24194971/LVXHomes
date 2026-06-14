@@ -6,6 +6,7 @@ import { streamHls } from "@/lib/stream";
 import { type VideoPin, type VideoPinSet, getVideoPins, pinPosAt } from "@/data/video-pins";
 import { PinOverlay } from "@/components/tour/pin-overlay";
 import { loadDoc, saveDoc } from "@/lib/author-client";
+import { AssetPicker } from "@/components/studio/asset-picker";
 import { cn } from "@/lib/utils";
 
 /**
@@ -42,6 +43,7 @@ export function PinStudio() {
   const [copied, setCopied] = useState(false);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveMsg, setSaveMsg] = useState("");
+  const [pickFilm, setPickFilm] = useState(false);
   const [fps, setFps] = useState(30);
   const fpsRef = useRef(30);
   fpsRef.current = fps;
@@ -409,6 +411,13 @@ export function PinStudio() {
             {p.title}
           </button>
         ))}
+        <button
+          type="button"
+          onClick={() => setPickFilm(true)}
+          className={cn(ctl, "border-dashed")}
+        >
+          Library…
+        </button>
       </div>
 
       {/* ---------- stage ---------- */}
@@ -635,6 +644,15 @@ export function PinStudio() {
           autosaves to this browser as a draft; Copy JSON is a manual backup.
         </p>
       </div>
+
+      {pickFilm && (
+        <AssetPicker
+          kind="film"
+          title="Choose a film"
+          onPick={(a) => a.stream_uid && setUid(a.stream_uid)}
+          onClose={() => setPickFilm(false)}
+        />
+      )}
     </div>
   );
 }
