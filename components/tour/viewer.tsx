@@ -11,6 +11,7 @@ import {
   saveDoc,
   type RevisionMeta,
 } from "@/lib/author-client";
+import { TourTutorial } from "@/components/tour/tour-tutorial";
 import { PlanPanel } from "@/components/tour/plan";
 import { cn } from "@/lib/utils";
 
@@ -105,6 +106,8 @@ export function TourViewer({
   const readoutRef = useRef<HTMLSpanElement | null>(null);
 
   const [started, setStarted] = useState(false);
+  const [isMobileUi, setIsMobileUi] = useState(false);
+  const [showTutorial, setShowTutorial] = useState(false);
   const [loading, setLoading] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [hint, setHint] = useState(false);
@@ -226,6 +229,13 @@ export function TourViewer({
     // CSS overlay) and on any desktop that supports the Fullscreen API.
     setMotionAvail(isMobile && hasOrientation);
     setFsAvail(isMobile || Boolean(document.fullscreenEnabled));
+    setIsMobileUi(isMobile);
+    // First-visit coaching overlay (once per device; replayable from the player).
+    try {
+      if (!localStorage.getItem("lvx-tutorial-seen")) setShowTutorial(true);
+    } catch {
+      setShowTutorial(true);
+    }
     setAuthor(authorMode || new URLSearchParams(window.location.search).has("author"));
 
     // ---------- video ----------
@@ -1623,26 +1633,61 @@ export function TourViewer({
       )}
 
       {/* Pre-flight cover */}
-      {!started && (
-        <button
-          type="button"
-          onClick={start}
-          disabled={loading || failed}
-          className="group absolute inset-0 flex flex-col items-center justify-center gap-5 bg-ink/60"
-        >
-          <span className="flex h-[clamp(5rem,7cqw,9rem)] w-[clamp(5rem,7cqw,9rem)] items-center justify-center rounded-full border border-champagne/70 text-[clamp(1.375rem,1.9cqw,2.5rem)] text-champagne transition-transform duration-300 group-hover:scale-105">
-            {loading ? (
-              <span className="h-[30%] w-[30%] animate-spin rounded-full border-2 border-champagne/30 border-t-champagne" />
-            ) : (
-              <svg width="1em" height="1em" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                <path d="M8 5v14l11-7z" />
-              </svg>
-            )}
-          </span>
-          <span className="font-sans text-[clamp(0.75rem,0.95cqw,1.125rem)] uppercase tracking-[0.22em] text-paper/80">
-            {failed ? "Couldn't start the flight" : "Take the flight"}
-          </span>
-        </button>
+      {!started && showTutorial && !failed && (
+        <TourTutorial
+          isMobile={isMobileUi}
+          hasMotion={motionAvail}
+          onBegin={() => {
+            try {
+              localStorage.setItem("lvx-tutorial-seen", "1");
+            } catch {
+              /* storage unavailable */
+            }
+            setShowTutorial(false);
+            void start();
+          }}
+          onSkip={() => {
+            try {
+              localStorage.setItem("lvx-tutorial-seen", "1");
+            } catch {
+              /* storage unavailable */
+            }
+            setShowTutorial(false);
+          }}
+        />
+      )}
+
+      {!started && (!showTutorial || failed) && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-5 bg-ink/60">
+          <button
+            type="button"
+            onClick={start}
+            disabled={loading || failed}
+            className="group flex flex-col items-center justify-center gap-5"
+          >
+            <span className="flex h-[clamp(5rem,7cqw,9rem)] w-[clamp(5rem,7cqw,9rem)] items-center justify-center rounded-full border border-champagne/70 text-[clamp(1.375rem,1.9cqw,2.5rem)] text-champagne transition-transform duration-300 group-hover:scale-105">
+              {loading ? (
+                <span className="h-[30%] w-[30%] animate-spin rounded-full border-2 border-champagne/30 border-t-champagne" />
+              ) : (
+                <svg width="1em" height="1em" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                  <path d="M8 5v14l11-7z" />
+                </svg>
+              )}
+            </span>
+            <span className="font-sans text-[clamp(0.75rem,0.95cqw,1.125rem)] uppercase tracking-[0.22em] text-paper/80">
+              {failed ? "Couldn't start the flight" : "Take the flight"}
+            </span>
+          </button>
+          {!failed && (
+            <button
+              type="button"
+              onClick={() => setShowTutorial(true)}
+              className="font-sans text-[clamp(0.625rem,0.8cqw,0.95rem)] uppercase tracking-[0.2em] text-paper/45 transition-colors hover:text-champagne"
+            >
+              How to fly?
+            </button>
+          )}
+        </div>
       )}
 
       {/* Hint */}
