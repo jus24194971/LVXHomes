@@ -316,8 +316,10 @@ export function PlanEditor() {
         const r = (lat * Math.PI) / 180;
         return ((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * 2 ** z;
       };
-      // deepest zoom that keeps the stitched image ≲ ~2200px wide
-      let z = 21;
+      // deepest zoom that keeps the image ≲ ~2200px wide. Cap at 19 — Esri
+      // World Imagery returns a "Map data not yet available" placeholder past ~19
+      // for most suburban areas.
+      let z = 19;
       for (; z > 1; z--) {
         if ((lon2x(g.maxLon, z) - lon2x(g.minLon, z)) * 256 <= 2200) break;
       }
@@ -511,6 +513,24 @@ export function PlanEditor() {
               preserveAspectRatio="xMinYMin meet"
             />
           )}
+
+          {/* flight path (read-only context from GPS/VSLAM) */}
+          {sheet.paths &&
+            Object.values(sheet.paths).map((keys, ci) =>
+              keys.length > 1 ? (
+                <polyline
+                  key={`path-${ci}`}
+                  points={keys.map((k) => `${k.x},${k.y}`).join(" ")}
+                  fill="none"
+                  stroke="#B7995C"
+                  strokeOpacity={0.7}
+                  strokeWidth={Math.max(sheet.width, sheet.height) * 0.004}
+                  strokeLinejoin="round"
+                  strokeLinecap="round"
+                  className="pointer-events-none"
+                />
+              ) : null,
+            )}
 
           {/* zones */}
           {sheet.zones.map((z, zi) => {

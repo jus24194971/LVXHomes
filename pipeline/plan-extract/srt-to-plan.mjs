@@ -20,6 +20,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { readGpsExif } from "./exif-gps.mjs";
 
 // ---------- args ----------
 const args = process.argv.slice(2);
@@ -132,22 +133,39 @@ for (let i = 1; i < gps.length; i++) {
   }
 }
 
-// dwell stops → small placeholder zones to refine in the Studio
-const zones = stops.map((s, i) => {
-  const r = Math.max(2, Math.min(width, height) * 0.04);
-  return {
-    id: `stop-${i + 1}`,
-    label: `Amenity ${i + 1}`,
-    kind: "outdoor",
-    videoTime: s.t,
-    points: [
-      [round(s.x - r), round(s.y - r)],
-      [round(s.x + r), round(s.y - r)],
-      [round(s.x + r), round(s.y + r)],
-      [round(s.x - r), round(s.y + r)],
-    ],
-  };
-});
+// ---------- amenity zones: prefer GPS-tagged stills, else dwell stops ----------
+// Each amenity 360 still carries its own GPS — drop a zone at that exact spot
+// (you reshape it in the Studio). Falls back to flight dwell-stops if no stills.
+const stillsDir = opt("stills", path.dirname(srtPath));
+const amenities = [];
+try {
+  const jpgs = fs
+    .readdirSync(stillsDir)
+    .filter((f) => /\.jpe?g$/i.test(f) && !f.startsWith("_"))
+    .sort();
+  for (const f of jpgs) {
+    const g = readGpsExif(path.join(stillsDir, f));
+    if (!g) continue;
+    if (g.lon < minLon || g.lon > maxLon || g.lat < minLat || g.lat > maxLat) continue;
+    amenities.push(toPlan({ lat: g.lat, lon: g.lon }));
+  }
+} catch {
+  /* no stills directory */
+}
+const fromStills = amenities.length > 0;
+const points = fromStills ? amenities : stops;
+const zr = Math.max(2, Math.min(width, height) * 0.04);
+const zones = points.map((p, i) => ({
+  id: `amenity-${i + 1}`,
+  label: `Amenity ${i + 1}`,
+  kind: "outdoor",
+  points: [
+    [round(p.x - zr), round(p.y - zr)],
+    [round(p.x + zr), round(p.y - zr)],
+    [round(p.x + zr), round(p.y + zr)],
+    [round(p.x - zr), round(p.y + zr)],
+  ],
+}));
 
 // ---------- satellite underlay link ----------
 // The cached World Imagery service doesn't support arbitrary-bbox export (and
@@ -185,7 +203,7 @@ fs.writeFileSync(outPath, JSON.stringify(plan, null, 2));
 
 console.log(`\nGeoreferenced ${gps.length} GPS frames.`);
 console.log(`  property bbox  ${minLat.toFixed(6)},${minLon.toFixed(6)}  →  ${maxLat.toFixed(6)},${maxLon.toFixed(6)}`);
-console.log(`  site sheet     ${width} × ${height} m   ·   ${pathKeys.length} path keys   ·   ${stops.length} dwell stops`);
+console.log(`  site sheet     ${width} × ${height} m   ·   ${pathKeys.length} path keys   ·   ${zones.length} amenity zones${fromStills ? " (from stills' GPS)" : " (from dwell)"}`);
 console.log(`  wrote          ${outPath}  (import in /studio/plan)`);
 console.log(`\nSatellite trace underlay — open, screenshot the grounds, import in /studio/plan:`);
 console.log(`  ${mapsUrl}`);
