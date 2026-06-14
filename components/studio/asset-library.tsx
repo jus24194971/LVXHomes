@@ -11,6 +11,7 @@ import {
   type Asset,
   type AssetKind,
 } from "@/lib/library-client";
+import { EmbedManager } from "@/components/studio/embed-manager";
 import { cn } from "@/lib/utils";
 
 const TABS: { key: AssetKind | "all"; label: string }[] = [
@@ -47,6 +48,7 @@ export function AssetLibrary({
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
   const [uploads, setUploads] = useState<Uploading[]>([]);
+  const [embedFor, setEmbedFor] = useState<Asset | null>(null);
   const fileInputs = useRef<Record<AssetKind, HTMLInputElement | null>>({
     film: null,
     video360: null,
@@ -232,8 +234,36 @@ export function AssetLibrary({
               asset={a}
               pick={pick}
               onChange={load}
+              onEmbed={pick ? undefined : setEmbedFor}
             />
           ))}
+        </div>
+      )}
+
+      {embedFor && (
+        <div
+          className="fixed inset-0 z-[80] flex items-start justify-center overflow-auto bg-ink/80 p-4 backdrop-blur-sm sm:p-8"
+          onClick={() => setEmbedFor(null)}
+        >
+          <div
+            className="w-full max-w-2xl rounded-xl border border-champagne/30 bg-ink p-5 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <p className="min-w-0 truncate font-display text-sm uppercase tracking-[0.18em] text-paper">
+                Embed · {embedFor.title}
+              </p>
+              <button
+                type="button"
+                onClick={() => setEmbedFor(null)}
+                aria-label="Close"
+                className="shrink-0 text-paper/50 transition-colors hover:text-champagne"
+              >
+                ✕
+              </button>
+            </div>
+            <EmbedManager kind="film" refId={embedFor.stream_uid ?? ""} title={embedFor.title} />
+          </div>
         </div>
       )}
     </div>
@@ -244,10 +274,12 @@ function AssetCard({
   asset,
   pick,
   onChange,
+  onEmbed,
 }: {
   asset: Asset;
   pick?: (a: Asset) => void;
   onChange: () => Promise<void> | void;
+  onEmbed?: (a: Asset) => void;
 }) {
   const [title, setTitle] = useState(asset.title);
   const [busy, setBusy] = useState(false);
@@ -349,6 +381,15 @@ function AssetCard({
           </span>
           {!pick && (
             <span className="flex items-center gap-2">
+              {asset.kind === "film" && ready && onEmbed && (
+                <button
+                  type="button"
+                  onClick={() => onEmbed(asset)}
+                  className="font-sans text-[0.65rem] uppercase tracking-[0.12em] text-champagne/80 hover:text-champagne"
+                >
+                  Embed
+                </button>
+              )}
               <button
                 type="button"
                 onClick={archive}

@@ -256,3 +256,90 @@ export async function deleteAssetRow(id: string): Promise<void> {
   if (!db) throw new Error("D1 binding 'DB' is not available");
   await db.prepare("DELETE FROM asset WHERE id = ?").bind(id).run();
 }
+
+// ---------- embed grants (permission to embed) ----------
+
+export type EmbedKind = "tour" | "film";
+
+export type EmbedGrant = {
+  id: string;
+  kind: EmbedKind;
+  ref: string;
+  branded: number;
+  label: string | null;
+  revoked: number;
+  created_at: number;
+  created_by: string | null;
+};
+
+export async function createGrant(g: {
+  id: string;
+  kind: EmbedKind;
+  ref: string;
+  branded: boolean;
+  label?: string | null;
+  created_by?: string | null;
+}): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("D1 binding 'DB' is not available");
+  await db
+    .prepare(
+      "INSERT INTO embed_grant (id, kind, ref, branded, label, revoked, created_at, created_by) " +
+        "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+    )
+    .bind(
+      g.id,
+      g.kind,
+      g.ref,
+      g.branded ? 1 : 0,
+      g.label ?? null,
+      Date.now(),
+      g.created_by ?? null,
+    )
+    .run();
+}
+
+export async function getGrant(id: string): Promise<EmbedGrant | null> {
+  const db = await getDb();
+  if (!db) return null;
+  return db.prepare("SELECT * FROM embed_grant WHERE id = ?").bind(id).first<EmbedGrant>();
+}
+
+export async function listGrants(
+  kind?: EmbedKind,
+  ref?: string,
+): Promise<EmbedGrant[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const clauses: string[] = [];
+  const binds: unknown[] = [];
+  if (kind) {
+    clauses.push("kind = ?");
+    binds.push(kind);
+  }
+  if (ref) {
+    clauses.push("ref = ?");
+    binds.push(ref);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const res = await db
+    .prepare(`SELECT * FROM embed_grant ${where} ORDER BY created_at DESC LIMIT 500`)
+    .bind(...binds)
+    .all<EmbedGrant>();
+  return res.results ?? [];
+}
+
+export async function setGrantRevoked(id: string, revoked: boolean): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("D1 binding 'DB' is not available");
+  await db
+    .prepare("UPDATE embed_grant SET revoked = ? WHERE id = ?")
+    .bind(revoked ? 1 : 0, id)
+    .run();
+}
+
+export async function deleteGrant(id: string): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("D1 binding 'DB' is not available");
+  await db.prepare("DELETE FROM embed_grant WHERE id = ?").bind(id).run();
+}
