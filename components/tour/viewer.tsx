@@ -88,10 +88,14 @@ export function TourViewer({
   tour,
   plan,
   className,
+  authorMode = false,
 }: {
   tour: Tour;
   plan?: Plan;
   className?: string;
+  /** Force author mode (used by the gated /studio/tours route). Public tours
+   *  still opt in via ?author=1. */
+  authorMode?: boolean;
 }) {
   const mountRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -222,7 +226,7 @@ export function TourViewer({
     // CSS overlay) and on any desktop that supports the Fullscreen API.
     setMotionAvail(isMobile && hasOrientation);
     setFsAvail(isMobile || Boolean(document.fullscreenEnabled));
-    setAuthor(new URLSearchParams(window.location.search).has("author"));
+    setAuthor(authorMode || new URLSearchParams(window.location.search).has("author"));
 
     // ---------- video ----------
     const video = document.createElement("video");

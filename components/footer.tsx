@@ -108,6 +108,15 @@ export function Footer() {
             © {year} {SITE.name}. All rights reserved.
           </p>
         </div>
+
+        <div className="mt-6 flex justify-center sm:justify-end">
+          <Link
+            href="/studio"
+            className="font-sans text-[0.65rem] uppercase tracking-[0.24em] text-paper/25 transition-colors hover:text-champagne"
+          >
+            Studio
+          </Link>
+        </div>
       </Container>
     </footer>
   );

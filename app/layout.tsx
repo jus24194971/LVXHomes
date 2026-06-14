@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { Cinzel, Cormorant_Garamond, Jost } from "next/font/google";
 import "./globals.css";
-import { Nav } from "@/components/nav";
+import { SiteFrame } from "@/components/site-frame";
 import { Footer } from "@/components/footer";
 import { SITE } from "@/data/site";
 
@@ -66,11 +66,7 @@ export default function RootLayout({
         >
           Skip to content
         </a>
-        <Nav />
-        <main id="main" className="flex-1">
-          {children}
-        </main>
-        <Footer />
+        <SiteFrame footer={<Footer />}>{children}</SiteFrame>
       </body>
     </html>
   );
