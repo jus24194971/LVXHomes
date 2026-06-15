@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import type { Plan, PlanZone } from "@/data/plans";
 import type { Tour, TourPano, TourHotspot } from "@/data/tours";
@@ -185,6 +185,38 @@ export function TourViewer({
   const chapterIdxRef = useRef(0);
   const activeSheetIdRef = useRef("");
   const planIndicatorRef = useRef<SVGGElement | null>(null);
+
+  // Auto-rings: derive an anchored ring per georeferenced amenity straight from
+  // the plan — no hand-authored keyframes. The amenity's box centre is the world
+  // anchor; the viewer tracks it live and fades it by distance. Skips building
+  // footprints (no label) and amenities already covered by an authored hotspot.
+  const autoRings = useMemo<Record<string, TourHotspot[]>>(() => {
+    const out: Record<string, TourHotspot[]> = {};
+    if (!plan) return out;
+    for (const ch of tour.chapters) {
+      const sheet = plan.sheets.find((s) => s.paths?.[ch.id]?.length);
+      if (!sheet) continue;
+      const made: TourHotspot[] = [];
+      for (const z of sheet.zones) {
+        if (!z.label) continue;
+        const panoId = z.panoId ?? matchPanoByLabel(z.label, tour.panos);
+        if (!panoId) continue;
+        if (ch.hotspots.some((h) => h.panoId === panoId)) continue;
+        const [cx, cy] = centroidOf(z.points);
+        made.push({
+          id: `auto-${z.id}`,
+          label: z.label,
+          panoId,
+          anchor: { x: cx, y: cy, h: 0 },
+          fadeNear: 14,
+          fadeFar: 42,
+        });
+      }
+      if (made.length) out[ch.id] = made;
+    }
+    return out;
+  }, [plan, tour.chapters, tour.panos]);
+
   /** Heading + pitch offsets captured at gyro calibration (degrees). */
   const calibLonRef = useRef(0);
   const calibLatRef = useRef(0);
@@ -653,7 +685,9 @@ export function TourViewer({
     const hsScreen = new Map<string, { x: number; y: number; set: boolean }>();
     const EDGE = 0.86; // pin off-screen rings to ±86% of the frame, still tappable
     const flatHotspots = tour.chapters.flatMap((ch, ci) =>
-      ch.hotspots.map((hs) => ({ ci, hs, key: `${ch.id}:${hs.id}` })),
+      ch.hotspots
+        .concat(autoRings[ch.id] ?? [])
+        .map((hs) => ({ ci, hs, key: `${ch.id}:${hs.id}` })),
     );
     renderer.setAnimationLoop(() => {
       const gyro = motionOnRef.current && orient.has;
@@ -711,7 +745,7 @@ export function TourViewer({
       const interpPose = (path: NonNullable<NonNullable<typeof plan>["sheets"][0]["paths"]>[string]) => {
         if (!path || path.length === 0) return null;
         const n = path.length;
-        if (n === 1) return { x: path[0].x, y: path[0].y, heading: path[0].h ?? 0 };
+        if (n === 1) return { x: path[0].x, y: path[0].y, heading: path[0].h ?? 0, alt: path[0].z };
         // Segment [i, i+1] that holds t.
         let i = 0;
         if (t <= path[0].t) i = 0;
@@ -743,6 +777,8 @@ export function TourViewer({
           0.5 * (-p0 + p2 + 2 * (2 * p0 - 5 * p1 + 4 * p2 - p3) * f + 3 * (-p0 + 3 * p1 - 3 * p2 + p3) * f2);
         const x = cr(k0.x, k1.x, k2.x, k3.x);
         const y = cr(k0.y, k1.y, k2.y, k3.y);
+        const alt =
+          k1.z !== undefined ? cr(k0.z ?? k1.z, k1.z, k2.z ?? k1.z, k3.z ?? k1.z) : undefined;
         let heading: number;
         if (k1.h !== undefined && k2.h !== undefined) {
           heading = k1.h + (((k2.h - k1.h + 540) % 360) - 180) * f;
@@ -757,10 +793,10 @@ export function TourViewer({
           }
           heading = (Math.atan2(dx, -dy) * 180) / Math.PI;
         }
-        return { x, y, heading };
+        return { x, y, heading, alt };
       };
       // World pose for anchors: the first sheet carrying this chapter's path.
-      let worldPose: { x: number; y: number; heading: number } | null = null;
+      let worldPose: { x: number; y: number; heading: number; alt?: number } | null = null;
       if (plan) {
         for (const s of plan.sheets) {
           const p = s.paths?.[chId];
@@ -837,16 +873,27 @@ export function TourViewer({
           }
         } else if (hs.anchor && worldPose) {
           // World-anchored: direction + distance from the live camera pose —
-          // the ring is wherever the room actually is, from wherever you are.
+          // the ring is wherever the amenity actually is, from wherever you are.
           const dx = hs.anchor.x - worldPose.x;
           const dyPlan = hs.anchor.y - worldPose.y;
           dist = Math.hypot(dx, dyPlan);
           const bearing = (Math.atan2(dx, -dyPlan) * 180) / Math.PI;
           yawDeg = norm180(bearing - worldPose.heading);
+          // Camera height = the drone's altitude in flight (worldPose.alt), so
+          // aerial rings look correctly DOWN at ground amenities; eye height indoors.
+          const camH = worldPose.alt ?? CAMERA_HEIGHT_M;
           pitchDeg =
-            (Math.atan2((hs.anchor.h ?? 1) - CAMERA_HEIGHT_M, Math.max(dist, 0.1)) * 180) / Math.PI;
+            (Math.atan2((hs.anchor.h ?? 0) - camH, Math.max(dist, 0.1)) * 180) / Math.PI;
           ringScale = Math.min(1.15, Math.max(0.62, 2.6 / Math.max(dist, 0.4)));
-          visible = inChapter && gated;
+          if (hs.fadeFar !== undefined) {
+            // distance-driven fade in/out — the automatic window from the flight
+            // geometry, re-triggering on each pass (no keyframes).
+            const near = hs.fadeNear ?? hs.fadeFar * 0.35;
+            opacity = dist <= near ? 1 : dist >= hs.fadeFar ? 0 : (hs.fadeFar - dist) / (hs.fadeFar - near);
+            visible = inChapter && gated && opacity > 0.02;
+          } else {
+            visible = inChapter && gated;
+          }
         } else if (hs.yaw !== undefined && hs.pitch !== undefined) {
           // Legacy timed mode: fixed frame-relative direction in a window.
           yawDeg = hs.yaw;
@@ -1623,7 +1670,7 @@ export function TourViewer({
           the active chapter's are made visible by the render loop) */}
       <div aria-hidden={!started} className="pointer-events-none absolute inset-0">
         {tour.chapters.flatMap((ch) =>
-          ch.hotspots.map((hs) => (
+          ch.hotspots.concat(autoRings[ch.id] ?? []).map((hs) => (
           <div
             key={`${ch.id}:${hs.id}`}
             ref={(node) => {

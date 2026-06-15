@@ -40,7 +40,7 @@ export type PlanZone = {
  * camera-locked footage. The live view cone = this base heading + the
  * viewer's current look direction.
  */
-export type PlanPathKey = { t: number; x: number; y: number; h?: number };
+export type PlanPathKey = { t: number; x: number; y: number; h?: number; z?: number };
 
 export type PlanSheet = {
   id: string;

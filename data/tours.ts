@@ -29,6 +29,11 @@ export type TourHotspot = {
    * visible from anywhere you look, at any time, scaled down with distance.
    */
   anchor?: { x: number; y: number; h?: number };
+  /** Anchored rings only: distance-driven fade (plan meters). Full opacity within
+   *  `fadeNear`, gone beyond `fadeFar` — an automatic fade in/out window from the
+   *  flight geometry, re-triggering on every pass. Set by auto-rings. */
+  fadeNear?: number;
+  fadeFar?: number;
   /** Optional time gating (defaults: always). Required for legacy mode. */
   start?: number;
   end?: number;
