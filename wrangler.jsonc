@@ -25,7 +25,12 @@
     // CF_API_TOKEN, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
     "CF_ACCOUNT_ID": "a61cc14bdbaa22ac7c9a5f73b3670446",
     "R2_BUCKET": "lvx-media",
-    "R2_PUBLIC_HOST": "media.lvxhomes.com"
+    "R2_PUBLIC_HOST": "media.lvxhomes.com",
+    // Cloud VSLAM (Modal): the `submit` endpoint URL printed by `modal deploy`.
+    // The matching shared secret is VSLAM_CALLBACK_TOKEN, set with
+    // `wrangler secret put VSLAM_CALLBACK_TOKEN` — it MUST equal the
+    // LVX_CALLBACK_TOKEN in your Modal `lvx-callback` secret.
+    "MODAL_SUBMIT_URL": "https://jus2419497--lvx-vslam-submit.modal.run"
   },
   "d1_databases": [
     {

@@ -60,9 +60,7 @@ export function PlanEditor() {
   const [selZone, setSelZone] = useState<number | null>(null);
   const [selVertex, setSelVertex] = useState<number | null>(null);
   const [traces, setTraces] = useState<Record<string, TraceImg>>({});
-  const [showExport, setShowExport] = useState(false);
   const [importText, setImportText] = useState("");
-  const [copied, setCopied] = useState(false);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveMsg, setSaveMsg] = useState("");
   const [satLoading, setSatLoading] = useState(false);
@@ -74,6 +72,7 @@ export function PlanEditor() {
   const undoStack = useRef<string[]>([]);
   const satTried = useRef<Set<string>>(new Set());
   const panRef = useRef<{ cx: number; cy: number; vx: number; vy: number; vw: number; vh: number } | null>(null);
+  const justLoaded = useRef(true); // suppress autosave right after a load / hydrate
 
   const sheet = sheets[sheetIdx];
   const trace = sheet ? traces[sheet.id] : undefined;
@@ -325,6 +324,7 @@ export function PlanEditor() {
   const exportJson = JSON.stringify({ tourSlug, sheets } satisfies Plan, null, 2);
 
   const loadPlan = useCallback((plan: Plan) => {
+    justLoaded.current = true;
     undoStack.current = [];
     setTourSlug(plan.tourSlug);
     setSheets(JSON.parse(JSON.stringify(plan.sheets)) as PlanSheet[]);
@@ -359,36 +359,52 @@ export function PlanEditor() {
     }
   }, [tourSlug, sheets]);
 
-  const loadFromSite = useCallback(async () => {
-    try {
-      const doc = await loadDoc<Plan>("plan", tourSlug);
-      if (doc && Array.isArray(doc.sheets)) loadPlan(doc);
-      else alert(`No saved plan for "${tourSlug}" yet.`);
-    } catch (e) {
-      alert(e instanceof Error ? e.message : "Load failed");
-    }
-  }, [tourSlug, loadPlan]);
-
-  // On open: restore the last-edited tour and silently pull its SAVED plan from
-  // the site, so you always land on the live version (no "Load from site" click).
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => {
-    const saved = typeof window !== "undefined" ? localStorage.getItem("lvx-plan-tourslug") : null;
-    const slug = saved || "the-george";
-    setTourSlug(slug);
-    void (async () => {
+  // Load a tour's plan: saved live doc → baked plan → a fresh blank floor. This
+  // is the "import the default base, then tweak" path — no Load button.
+  const loadForSlug = useCallback(
+    async (slugRaw: string) => {
+      const slug = slugRaw.trim();
+      if (!slug) return;
       try {
         const doc = await loadDoc<Plan>("plan", slug);
-        if (doc && Array.isArray(doc.sheets)) loadPlan(doc);
+        if (doc && Array.isArray(doc.sheets)) {
+          loadPlan(doc);
+          return;
+        }
       } catch {
-        /* no saved plan — keep the seed */
+        /* fall through to baked / blank */
       }
-    })();
+      const baked = PLANS.find((p) => p.tourSlug === slug);
+      loadPlan(baked ?? { tourSlug: slug, sheets: [newSheet("floor", 1)] });
+    },
+    [loadPlan],
+  );
+
+  // On open: land on ?tour=<slug> (deep-link from a property), else the last-edited.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const url =
+      typeof window !== "undefined"
+        ? new URLSearchParams(window.location.search).get("tour")
+        : null;
+    const saved = typeof window !== "undefined" ? localStorage.getItem("lvx-plan-tourslug") : null;
+    void loadForSlug(url || saved || "the-george");
   }, []);
   // remember the tour for next session
   useEffect(() => {
     if (typeof window !== "undefined") localStorage.setItem("lvx-plan-tourslug", tourSlug);
   }, [tourSlug]);
+
+  // Autosave to the live site, debounced — no Save button. Skipped right after a
+  // load/hydrate so opening a plan never re-writes it.
+  useEffect(() => {
+    if (justLoaded.current) {
+      justLoaded.current = false;
+      return;
+    }
+    const t = setTimeout(() => void saveToSite(), 1200);
+    return () => clearTimeout(t);
+  }, [sheets, saveToSite]);
 
   const onTraceFile = useCallback(
     (file: File | undefined) => {
@@ -550,16 +566,10 @@ export function PlanEditor() {
             Trace image…
             <input type="file" accept="image/*" className="hidden" onChange={(e) => onTraceFile(e.target.files?.[0])} />
           </label>
-          {sheet.geo && (
-            <button
-              type="button"
-              onClick={() => void fetchSatellite()}
-              disabled={satLoading}
-              title="Stitch aligned satellite imagery for this GPS-referenced sheet"
-              className="rounded border border-champagne/60 px-3 py-1.5 font-sans text-[0.6875rem] uppercase tracking-[0.14em] text-champagne transition-colors hover:bg-champagne hover:text-ink disabled:opacity-40"
-            >
-              {satLoading ? "Fetching…" : "🛰 Fetch satellite"}
-            </button>
+          {satLoading && (
+            <span className="font-sans text-[0.625rem] uppercase tracking-[0.14em] text-champagne">
+              Stitching satellite…
+            </span>
           )}
           {trace && (
             <>
@@ -580,28 +590,8 @@ export function PlanEditor() {
               </label>
             </>
           )}
-          <div className="flex items-center gap-1">
-            {([["−", 1.5, "Zoom out"], ["+", 1 / 1.5, "Zoom in"]] as const).map(([sym, f, lbl]) => (
-              <button
-                key={lbl}
-                type="button"
-                aria-label={lbl}
-                onClick={() => zoomAt(f, (svgRef.current?.clientWidth ?? 0) / 2, (svgRef.current?.clientHeight ?? 0) / 2)}
-                className="flex h-7 w-7 items-center justify-center rounded border border-paper/30 text-sm leading-none text-paper/70 transition-colors hover:border-champagne/60 hover:text-champagne"
-              >
-                {sym}
-              </button>
-            ))}
-            <button
-              type="button"
-              onClick={() => setView(fitView())}
-              className="rounded border border-paper/30 px-2 py-1 font-sans text-[0.625rem] uppercase tracking-[0.14em] text-paper/70 transition-colors hover:border-champagne/60 hover:text-champagne"
-            >
-              Fit
-            </button>
-          </div>
           <span className="ml-auto font-sans text-[0.625rem] uppercase tracking-[0.14em] text-paper/40">
-            Scroll = zoom · Space-drag = pan · Enter closes · Del removes · Ctrl+Z
+            Scroll = zoom · Double-click = fit · Space-drag = pan · Enter closes · Del removes · Ctrl+Z
           </span>
         </div>
 
@@ -615,6 +605,7 @@ export function PlanEditor() {
             !panMode && tool === "trace" && trace && "cursor-move",
           )}
           onClick={onSvgClick}
+          onDoubleClick={() => setView(fitView())}
           onPointerDown={onSvgPointerDown}
           onPointerMove={onSvgPointerMove}
           onPointerUp={endDrag}
@@ -860,84 +851,57 @@ export function PlanEditor() {
         <div className="rounded border border-paper/15 p-4">
           <p className="font-display text-[0.6875rem] uppercase tracking-[0.2em] text-champagne">Plan</p>
           <label className="mt-3 flex items-center gap-2 text-xs text-paper/60">
-            Tour slug
-            <input
+            Property
+            <select
               value={tourSlug}
-              onChange={(e) => setTourSlug(e.target.value)}
-              className="flex-1 rounded border border-paper/20 bg-transparent px-2 py-1.5 text-sm text-paper outline-none focus:border-champagne"
-            />
-          </label>
-          <div className="mt-3 flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={() => { setShowExport((v) => !v); }}
-              className="rounded border border-champagne/60 px-3 py-1.5 text-xs uppercase tracking-[0.14em] text-champagne transition-colors hover:bg-champagne hover:text-ink"
-            >
-              {showExport ? "Hide JSON" : "Export JSON"}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                void navigator.clipboard?.writeText(exportJson).then(() => {
-                  setCopied(true);
-                  setTimeout(() => setCopied(false), 1500);
-                });
+              onChange={(e) => {
+                setTourSlug(e.target.value);
+                void loadForSlug(e.target.value); // pick → live plan loads from the site
               }}
-              className="rounded border border-paper/30 px-3 py-1.5 text-xs uppercase tracking-[0.14em] text-paper/70 hover:border-champagne/60 hover:text-champagne"
+              className="flex-1 rounded border border-paper/20 bg-ink px-2 py-1.5 text-sm text-paper outline-none focus:border-champagne"
             >
-              {copied ? "Copied" : "Copy"}
-            </button>
-            <button
-              type="button"
-              onClick={() => void saveToSite()}
-              disabled={saveState === "saving"}
-              className="rounded border border-champagne bg-champagne/90 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] text-ink transition-colors hover:bg-champagne disabled:opacity-40"
-            >
-              {saveState === "saving" ? "Saving…" : saveState === "saved" ? "Saved ✓" : "Save to site"}
-            </button>
-            <button
-              type="button"
-              onClick={() => void loadFromSite()}
-              className="rounded border border-paper/30 px-3 py-1.5 text-xs uppercase tracking-[0.14em] text-paper/70 hover:border-champagne/60 hover:text-champagne"
-            >
-              Load from site
-            </button>
-            {PLANS.map((p) => (
-              <button
-                key={p.tourSlug}
-                type="button"
-                onClick={() => loadPlan(p)}
-                className="rounded border border-paper/30 px-3 py-1.5 text-xs uppercase tracking-[0.14em] text-paper/70 hover:border-champagne/60 hover:text-champagne"
-              >
-                Load “{p.tourSlug}”
-              </button>
-            ))}
-          </div>
+              {!PLANS.some((p) => p.tourSlug === tourSlug) && (
+                <option value={tourSlug}>{tourSlug}</option>
+              )}
+              {PLANS.map((p) => (
+                <option key={p.tourSlug} value={p.tourSlug}>
+                  {p.tourSlug}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className="mt-2 font-sans text-[0.625rem] uppercase tracking-[0.14em] text-paper/40">
+            {saveState === "saving"
+              ? "Saving…"
+              : saveState === "saved"
+                ? "Saved ✓"
+                : saveState === "error"
+                  ? ""
+                  : "Autosaves to the live site"}
+          </p>
           {saveState === "error" && (
-            <p className="mt-2 text-xs leading-snug text-red-400">{saveMsg}</p>
+            <p className="mt-1 text-xs leading-snug text-red-400">{saveMsg}</p>
           )}
-          {showExport && (
+          <details className="mt-3 text-xs text-paper/60">
+            <summary className="cursor-pointer uppercase tracking-[0.14em] hover:text-champagne">JSON</summary>
             <textarea
               readOnly
               value={exportJson}
               data-testid="plan-export"
-              className="mt-3 h-40 w-full rounded border border-paper/20 bg-ink/60 p-2 font-mono text-[0.625rem] leading-relaxed text-paper/80"
+              className="mt-2 h-32 w-full rounded border border-paper/20 bg-ink/60 p-2 font-mono text-[0.625rem] leading-relaxed text-paper/80"
             />
-          )}
-          <details className="mt-3 text-xs text-paper/60">
-            <summary className="cursor-pointer uppercase tracking-[0.14em] hover:text-champagne">Import JSON…</summary>
             <textarea
               value={importText}
               onChange={(e) => setImportText(e.target.value)}
-              placeholder='Paste a Plan ({ "tourSlug": …, "sheets": […] })'
-              className="mt-2 h-24 w-full rounded border border-paper/20 bg-ink/60 p-2 font-mono text-[0.625rem] text-paper/80"
+              placeholder='Paste a Plan to import ({ "tourSlug": …, "sheets": […] })'
+              className="mt-2 h-20 w-full rounded border border-paper/20 bg-ink/60 p-2 font-mono text-[0.625rem] text-paper/80"
             />
             <button
               type="button"
               onClick={importFromText}
               className="mt-2 rounded border border-paper/30 px-3 py-1.5 uppercase tracking-[0.14em] text-paper/70 hover:border-champagne/60 hover:text-champagne"
             >
-              Load
+              Import
             </button>
           </details>
         </div>

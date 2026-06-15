@@ -69,4 +69,12 @@ export type AppEnv = {
   R2_ACCESS_KEY_ID?: string;
   /** R2 S3 API secret access key (secret). */
   R2_SECRET_ACCESS_KEY?: string;
+
+  // --- Cloud VSLAM (Modal) ---
+  /** Modal `submit` web-endpoint URL that kicks off cloud processing.
+   *  Set after `modal deploy`. */
+  MODAL_SUBMIT_URL?: string;
+  /** Shared secret used both ways: Worker→Modal (job auth) and Modal→Worker
+   *  (callback auth). Must equal LVX_CALLBACK_TOKEN in the Modal secret. */
+  VSLAM_CALLBACK_TOKEN?: string;
 };

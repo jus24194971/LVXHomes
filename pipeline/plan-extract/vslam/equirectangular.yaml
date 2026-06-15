@@ -1,0 +1,63 @@
+# LVX · stella_vslam equirectangular config for the DJI 360 (Avata) indoor flights.
+# Based on stella_vslam/example/aist/equirectangular.yaml, tuned for our footage.
+#
+# THE ONE THING THAT MATTERS MOST: mask_rectangles must blank out wherever the
+# DRONE BODY / PROPS appear in the equirect (the nadir), or ORB features lock
+# onto the spinning props and tracking dies. Open one exported frame, see where
+# the aircraft is, and adjust the rectangles below. Values are normalized
+# fractions of the frame: [x_min, x_max, y_min, y_max], origin top-left.
+
+Camera:
+  name: "DJI 360 equirect"
+  setup: "monocular"
+  model: "equirectangular"
+  fps: 30.0          # MATCH your re-export (Avata can be 30/50/60)
+  cols: 3840         # MATCH your re-export (3840x1920 or 4096x2048)
+  rows: 1920
+  color_order: "RGB"
+
+Preprocessing:
+  min_size: 800
+  mask_rectangles:
+    - [0.0, 1.0, 0.00, 0.04]   # zenith cap (sky/ceiling smear) — keep small indoors, ceiling lights help
+    - [0.0, 1.0, 0.86, 1.00]   # nadir: DRONE BODY / PROPS — widen until the aircraft is fully covered
+    # add a tighter center-bottom block if props poke above the band, e.g.:
+    # - [0.35, 0.65, 0.78, 0.90]
+
+Feature:
+  name: "ORB"
+  scale_factor: 1.2
+  num_levels: 8
+  ini_fast_threshold: 20
+  min_fast_threshold: 7
+  # Indoor blank walls = few corners. If tracking is sparse, lower the thresholds
+  # (e.g. ini 12 / min 5) and/or raise max_num_keypoints in newer builds.
+
+Mapping:
+  backend: "g2o"
+  baseline_dist_thr_ratio: 0.02   # min translation to triangulate. Pure hover/rotation
+                                   # gives NO depth — fly with steady translation.
+  redundant_obs_ratio_thr: 0.95
+  num_covisibilities_for_landmark_generation: 20
+  num_covisibilities_for_landmark_fusion: 20
+  residual_deg_thr: 0.4
+
+Tracking:
+  backend: "g2o"
+
+LoopDetector:
+  backend: "g2o"
+  enabled: true                   # revisit your start so the loop closes & drift cancels
+  reject_by_graph_distance: true
+  min_distance_on_graph: 50
+
+GraphOptimizer:
+  min_num_shared_lms: 200
+
+GlobalOptimizer:
+  thr_neighbor_keyframes: 100
+
+System:
+  map_format: "msgpack"
+  num_grid_cols: 96
+  num_grid_rows: 48

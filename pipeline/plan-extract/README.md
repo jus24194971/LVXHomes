@@ -5,7 +5,7 @@ Floorplan Studio. Two complementary tracks, by environment:
 
 | | Method | Why |
 |---|---|---|
-| **Outdoor** (grounds, aerial) | **GPS + satellite** (Stage 1–2) | GPS locks outdoors → real-world-accurate path + imagery |
+| **Outdoor** (grounds, aerial) | **GPS + satellite _or_ aerial-360 base** (Stage 1–2) | GPS locks outdoors → real-world-accurate path + imagery |
 | **Indoor** (units) | **VSLAM + telemetry** (Stage 3) | GPS is `0,0` indoors → recover motion from the 360 video |
 
 Source files per clip (on the SD card / in your capture folder): `*.SRT`
@@ -27,43 +27,69 @@ node srt-to-plan.mjs "<clip>.SRT" --slug the-george --label "Grounds" --out the-
 Verified on the exterior George clip → **2,750 GPS frames**, a **195 × 135 m**
 site sheet, **184 path keys** over the real parcel (`33.3889, -111.6804`).
 
-**Use it:**
-1. **`/studio/plan` → Import JSON** → paste `the-george.plan.json` → the flight path renders.
-2. Open the printed **Maps satellite link**, screenshot the grounds, **Trace image…** to import it, then **Move/Size** to align it under the path.
-3. Drop amenity **zones** on the now-accurate base; **Save to site**.
+Amenity **zones are auto-placed from the 360 stills' EXIF GPS** (`exif-gps.mjs`,
+pure-Node EXIF reader) — every `.JPG` in the SRT's folder that carries a GPS fix
+inside the parcel becomes a labeled zone at its real position. Also emits a
+`geo` bbox so the base imagery can be cut to the exact footprint.
+
+**Use it (near-zero-touch):**
+1. Run the tool → `the-george.plan.json` (path + GPS amenities + `geo`).
+2. Push to D1: `node push-d1.mjs the-george.plan.json the-george` → `npx wrangler d1 execute lvx-content --remote --file=_push.sql`.
+3. **`/studio/plan` → Load from site** → the **Studio auto-stitches Esri World Imagery** to the `geo` bbox (tile proxy `app/studio/api/sat`, capped z19 = deepest real tiles; saved to `sheet.satUrl`), and the path + amenity dots are already on it.
+4. Reshape/relabel zones; **Save to site**.
 
 Options: `--pad 0.15` (bbox margin), `--dwell 2` (min hover seconds for a stop).
 Indoor clips (GPS `0,0`) print a heading/altitude summary and point here → Stage 3.
 
-### Planned enhancements
-- **Auto-place amenities** from the tour's authored ring keyframe times (path position at each ring's `t` → labeled zone) — no manual placement.
-- **Per-still GPS**: each 360 amenity still carries its own GPS (EXIF) → exact amenity pins.
-- **Exact-bbox satellite PNG** (tile-stitch Esri World Imagery, or a Mapbox/Google key) so the trace aligns 1:1 with no manual nudging.
+---
+
+## Stage 2b · Aerial-360 base — when satellite is stale ✅ working
+
+New construction (like The George) often isn't in the satellite layer yet, or the
+imagery is months out of date. If you fly **one high-altitude 360 that frames the
+whole property**, `aerial-to-base.mjs` reprojects its downward hemisphere onto the
+ground plane and drops it in as the base — perfectly georeferenced, so the same
+GPS-driven path + amenity dots line up on it.
+
+```bash
+# 1. reproject the high 360 into the plan's GPS bbox (writes <slug>-base.jpg + sets satUrl)
+node aerial-to-base.mjs "DJI_…_0015_D.JPG" the-george.plan.json
+# 2. eyeball registration (aerial + gold path + amenity crosshairs)
+node preview-plan.mjs the-george.plan.json the-george.aerial-preview.png
+# 3. host the base on R2 (data-URLs blow D1's statement-size cap), then push the lean plan
+npx wrangler r2 object put lvx-media/plan-base/the-george.jpg --file=the-george-base.jpg --content-type image/jpeg --remote
+node push-d1.mjs the-george.plan.json the-george --satUrl "https://media.lvxhomes.com/plan-base/the-george.jpg"
+npx wrangler d1 execute lvx-content --remote --file=_push.sql
+```
+
+How it works: each output pixel → its lat/lon → metre offset from the drone's GPS
+→ depression `α = atan2(H, d)` (H = `RelativeAltitude` from XMP) and azimuth, which
+index the equirect (nadir = bottom row; **centre column = drone nose**, i.e.
+`FlightYawDegree`). `readDjiMeta()` pulls GPS + height + heading + dims from
+EXIF/XMP. Pick the **highest** shot (most top-down → least parallax); the ground
+plane (pools, courts, walkways, lawns) is accurate, building tops lean outward a
+little (single-vantage parallax — cosmetic). Heading knobs if it looks rotated:
+`--heading <deg>`, `--flip`. Verified on The George shot `0015` (78 m AGL, heading
+`-90.4°`, no flip) → 100 % coverage, amenity dots landing on the real courts/pool.
 
 ---
 
-## Stage 3 · Indoor: 360 VSLAM (the spike)
+## Stage 3 · Indoor: 360 VSLAM ✅ post-processor built, awaiting first real run
 
-GPS-denied, so recover the camera trajectory + a sparse 3D map from the
-equirectangular video with **stella_vslam** (equirectangular camera model).
+GPS-denied, so recover the camera trajectory **and** room geometry from the
+equirectangular video with monocular equirectangular SLAM, then drop it in as an
+interior sheet (top-down point-cloud base + flight route) — same Studio UX as a
+grounds sheet. Full runbook + the SLAM-build decision (dense GPU vs sparse CPU),
+config, scale/orient strategy, and capture tips: **[`VSLAM.md`](./VSLAM.md)**.
 
-1. **Re-export non-stabilized equirect** from the `.OSV` in DJI Studio
-   (HorizonSteady/EIS OFF — note the SRT already shows `eis: close`, so the raw
-   footage is clean). Stabilization removes the camera rotation SLAM needs.
-2. **Run stella_vslam** (Dockerized, equirectangular config) on the clip →
-   `trajectory.txt` (per-frame 6DoF poses) + `map.msg` (sparse point cloud).
-   See `RoblabWh/stella_vslam_dense` for a 360-action-cam-on-UAV-tuned build.
-3. **Post-process** (Stage-3 script, to build) → our schema:
-   - trajectory, projected top-down → `paths` (the traveling dot),
-   - point cloud, top-down density → wall lines → `zones`/`strokes`,
-   - **scale**: monocular SLAM is up-to-scale — anchor with one known measurement
-     (a measured wall) or the barometer / IMU,
-   - **orient/label**: SRT `gb_yaw` heading constrains rotation; the room you shot
-     a 360 still in labels each segment.
-4. **Import** the resulting `plan.json` in `/studio/plan` and refine.
+- `vslam/equirectangular.yaml` — tuned camera config (the key bit: mask the drone
+  body at the nadir or ORB locks onto the props).
+- `slam-to-plan.mjs` — SLAM trajectory (TUM) + point cloud (PLY) → interior `Plan`
+  (gravity-align → top-down density base + route). **Proven** end-to-end on a
+  synthetic tilted-room fixture: `node slam-to-plan.mjs --selftest`.
 
-Heavy offline GPU compute (your RTX 2080S) — not Cloudflare. Build stella_vslam
-via its Docker image; the post-processor reads its msgpack/txt outputs.
+Runs offline on your machine (dense fork uses the RTX 2080S; sparse is CPU) — not
+Cloudflare. The only piece left is the SLAM run on real footage.
 
 ---
 

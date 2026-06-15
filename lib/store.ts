@@ -343,3 +343,234 @@ export async function deleteGrant(id: string): Promise<void> {
   if (!db) throw new Error("D1 binding 'DB' is not available");
   await db.prepare("DELETE FROM embed_grant WHERE id = ?").bind(id).run();
 }
+
+// ---------- VSLAM jobs (cloud video → floor plan) ----------
+
+export type VslamStatus = "queued" | "processing" | "ready" | "failed";
+
+export type VslamJob = {
+  id: string;
+  slug: string;
+  r2_key: string;
+  status: VslamStatus;
+  scale: number | null;
+  plan_key: string | null;
+  base_key: string | null;
+  error: string | null;
+  created_at: number;
+  updated_at: number;
+  created_by: string | null;
+};
+
+export async function createVslamJob(j: {
+  id: string;
+  slug: string;
+  r2_key: string;
+  status?: VslamStatus;
+  scale?: number | null;
+  created_by?: string | null;
+}): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("D1 binding 'DB' is not available");
+  const now = Date.now();
+  await db
+    .prepare(
+      "INSERT INTO vslam_job (id, slug, r2_key, status, scale, plan_key, base_key, error, created_at, updated_at, created_by) " +
+        "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)",
+    )
+    .bind(
+      j.id,
+      j.slug,
+      j.r2_key,
+      j.status ?? "queued",
+      j.scale ?? null,
+      now,
+      now,
+      j.created_by ?? null,
+    )
+    .run();
+}
+
+export async function getVslamJob(id: string): Promise<VslamJob | null> {
+  const db = await getDb();
+  if (!db) return null;
+  return db.prepare("SELECT * FROM vslam_job WHERE id = ?").bind(id).first<VslamJob>();
+}
+
+export async function latestVslamJobForSlug(slug: string): Promise<VslamJob | null> {
+  const db = await getDb();
+  if (!db) return null;
+  return db
+    .prepare("SELECT * FROM vslam_job WHERE slug = ? ORDER BY created_at DESC LIMIT 1")
+    .bind(slug)
+    .first<VslamJob>();
+}
+
+export async function listVslamJobs(limit = 50): Promise<VslamJob[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const res = await db
+    .prepare("SELECT * FROM vslam_job ORDER BY created_at DESC LIMIT ?")
+    .bind(limit)
+    .all<VslamJob>();
+  return res.results ?? [];
+}
+
+const VSLAM_PATCH_COLS = ["status", "scale", "plan_key", "base_key", "error"] as const;
+type VslamPatch = Partial<Pick<VslamJob, (typeof VSLAM_PATCH_COLS)[number]>>;
+
+export async function updateVslamJob(id: string, patch: VslamPatch): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("D1 binding 'DB' is not available");
+  const sets: string[] = [];
+  const binds: unknown[] = [];
+  for (const col of VSLAM_PATCH_COLS) {
+    const v = patch[col];
+    if (v !== undefined) {
+      sets.push(`${col} = ?`);
+      binds.push(v);
+    }
+  }
+  if (sets.length === 0) return;
+  sets.push("updated_at = ?");
+  binds.push(Date.now());
+  binds.push(id);
+  await db
+    .prepare(`UPDATE vslam_job SET ${sets.join(", ")} WHERE id = ?`)
+    .bind(...binds)
+    .run();
+}
+
+// ---------- capture projects (the workflow folder) ----------
+
+export type ProjectStatus = "draft" | "processing" | "review" | "published";
+export type ProjectFileRole = "video" | "still" | "telemetry" | "other";
+
+export type Project = {
+  id: string;
+  slug: string;
+  title: string;
+  status: ProjectStatus;
+  tour_slug: string | null;
+  notes: string | null;
+  created_at: number;
+  updated_at: number;
+  created_by: string | null;
+};
+
+export type ProjectFile = {
+  id: string;
+  project_id: string;
+  role: ProjectFileRole;
+  r2_key: string;
+  filename: string | null;
+  content_type: string | null;
+  bytes: number | null;
+  created_at: number;
+  created_by: string | null;
+};
+
+export async function createProject(p: {
+  id: string;
+  slug: string;
+  title: string;
+  created_by?: string | null;
+}): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("D1 binding 'DB' is not available");
+  const now = Date.now();
+  await db
+    .prepare(
+      "INSERT INTO project (id, slug, title, status, tour_slug, notes, created_at, updated_at, created_by) " +
+        "VALUES (?, ?, ?, 'draft', ?, NULL, ?, ?, ?)",
+    )
+    .bind(p.id, p.slug, p.title, p.slug, now, now, p.created_by ?? null)
+    .run();
+}
+
+export async function getProjectBySlug(slug: string): Promise<Project | null> {
+  const db = await getDb();
+  if (!db) return null;
+  return db.prepare("SELECT * FROM project WHERE slug = ?").bind(slug).first<Project>();
+}
+
+export async function listProjects(): Promise<Project[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const res = await db
+    .prepare("SELECT * FROM project ORDER BY created_at DESC LIMIT 200")
+    .all<Project>();
+  return res.results ?? [];
+}
+
+const PROJECT_PATCH_COLS = ["title", "status", "tour_slug", "notes"] as const;
+type ProjectPatch = Partial<Pick<Project, (typeof PROJECT_PATCH_COLS)[number]>>;
+
+export async function updateProject(id: string, patch: ProjectPatch): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("D1 binding 'DB' is not available");
+  const sets: string[] = [];
+  const binds: unknown[] = [];
+  for (const col of PROJECT_PATCH_COLS) {
+    const v = patch[col];
+    if (v !== undefined) {
+      sets.push(`${col} = ?`);
+      binds.push(v);
+    }
+  }
+  if (sets.length === 0) return;
+  sets.push("updated_at = ?");
+  binds.push(Date.now());
+  binds.push(id);
+  await db
+    .prepare(`UPDATE project SET ${sets.join(", ")} WHERE id = ?`)
+    .bind(...binds)
+    .run();
+}
+
+export async function addProjectFile(f: {
+  id: string;
+  project_id: string;
+  role: ProjectFileRole;
+  r2_key: string;
+  filename?: string | null;
+  content_type?: string | null;
+  bytes?: number | null;
+  created_by?: string | null;
+}): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("D1 binding 'DB' is not available");
+  await db
+    .prepare(
+      "INSERT INTO project_file (id, project_id, role, r2_key, filename, content_type, bytes, created_at, created_by) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(
+      f.id,
+      f.project_id,
+      f.role,
+      f.r2_key,
+      f.filename ?? null,
+      f.content_type ?? null,
+      f.bytes ?? null,
+      Date.now(),
+      f.created_by ?? null,
+    )
+    .run();
+}
+
+export async function listProjectFiles(projectId: string): Promise<ProjectFile[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const res = await db
+    .prepare("SELECT * FROM project_file WHERE project_id = ? ORDER BY created_at ASC")
+    .bind(projectId)
+    .all<ProjectFile>();
+  return res.results ?? [];
+}
+
+export async function deleteProjectFile(id: string): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("D1 binding 'DB' is not available");
+  await db.prepare("DELETE FROM project_file WHERE id = ?").bind(id).run();
+}

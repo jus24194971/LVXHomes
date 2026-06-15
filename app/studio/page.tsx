@@ -6,9 +6,11 @@ import { TOURS } from "@/data/tours";
 export const metadata: Metadata = { title: "Dashboard" };
 
 const TILES = [
+  { href: "/studio/projects", glyph: "▤", title: "Projects", desc: "A folder per shoot — upload everything, process to a tour." },
   { href: "/studio/tours", glyph: "◎", title: "Tours & Rings", desc: "Keyframe the gold flight rings on each 360 tour." },
   { href: "/studio/plan", glyph: "▦", title: "Floorplans", desc: "Draw and edit the schematic plans + dot paths." },
   { href: "/studio/pins", glyph: "⌖", title: "Pins", desc: "Map where rooms live on flat (non-360) films." },
+  { href: "/studio/process", glyph: "⬡", title: "Process", desc: "Upload a free-flight 360 → cloud VSLAM floor plan." },
   { href: "/studio/render", glyph: "❖", title: "Render", desc: "Transcode + prep captures for delivery." },
 ];
 

@@ -66,6 +66,53 @@ export function readGpsExif(file) {
   return { lat, lon };
 }
 
+/** Full DJI still metadata: GPS + height-above-takeoff (AGL) + heading + the
+ *  equirect dimensions, from EXIF + the DJI XMP block. */
+export function readDjiMeta(file) {
+  const buf = fs.readFileSync(file);
+  const gps = readGpsExif(file);
+
+  let xmp = "";
+  let o = 2;
+  while (o < buf.length - 4) {
+    if (buf[o] !== 0xff) { o++; continue; }
+    const m = buf[o + 1];
+    if (m === 0xda || m === 0xd9) break;
+    const size = buf.readUInt16BE(o + 2);
+    if (m === 0xe1 && buf.toString("ascii", o + 4, o + 32).startsWith("http://ns.adobe.com/xap")) {
+      xmp += buf.toString("utf8", o + 4, o + 2 + size);
+    }
+    o += 2 + size;
+  }
+  const grab = (k) => {
+    const m = xmp.match(new RegExp(k + '[>="\\s]+([+\\-\\d.]+)'));
+    return m ? parseFloat(m[1]) : null;
+  };
+
+  let w = null, h = null, o2 = 2;
+  while (o2 < buf.length - 8) {
+    if (buf[o2] !== 0xff) { o2++; continue; }
+    const m = buf[o2 + 1];
+    if (m >= 0xc0 && m <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(m)) {
+      h = buf.readUInt16BE(o2 + 5);
+      w = buf.readUInt16BE(o2 + 7);
+      break;
+    }
+    if (m === 0xda) break;
+    o2 += 2 + buf.readUInt16BE(o2 + 2);
+  }
+
+  return {
+    lat: gps?.lat ?? null,
+    lon: gps?.lon ?? null,
+    relAlt: grab("RelativeAltitude"),
+    flightYaw: grab("FlightYawDegree"),
+    gimbalYaw: grab("GimbalYawDegree"),
+    width: w,
+    height: h,
+  };
+}
+
 // CLI: node exif-gps.mjs <file...>
 const run = process.argv[1] && process.argv[1].replace(/\\/g, "/").endsWith("exif-gps.mjs");
 if (run && process.argv.length > 2) {
