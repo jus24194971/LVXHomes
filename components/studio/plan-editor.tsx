@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Plan, PlanSheet, PlanZone, PlanZoneKind } from "@/data/plans";
 import { PLANS } from "@/data/plans";
 import { ZONE_FILL } from "@/components/tour/plan";
+import { smoothPathD, zoneFontSize } from "@/lib/plan-geometry";
 import { loadDoc, saveDoc } from "@/lib/author-client";
 import { cn } from "@/lib/utils";
 
@@ -65,11 +66,14 @@ export function PlanEditor() {
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveMsg, setSaveMsg] = useState("");
   const [satLoading, setSatLoading] = useState(false);
+  const [view, setView] = useState({ x: -2, y: -2, w: 104, h: 74 }); // zoom/pan viewBox
+  const [panMode, setPanMode] = useState(false); // hold Space to pan
 
   const svgRef = useRef<SVGSVGElement>(null);
   const dragRef = useRef<Drag>(null);
   const undoStack = useRef<string[]>([]);
   const satTried = useRef<Set<string>>(new Set());
+  const panRef = useRef<{ cx: number; cy: number; vx: number; vy: number; vw: number; vh: number } | null>(null);
 
   const sheet = sheets[sheetIdx];
   const trace = sheet ? traces[sheet.id] : undefined;
@@ -104,6 +108,58 @@ export function PlanEditor() {
     return [snap(p.x), snap(p.y)];
   }, []);
 
+  // ---------- zoom / pan (viewBox-driven; toPlan stays exact via getScreenCTM) ----------
+  const fitView = useCallback(
+    () => ({ x: -2, y: -2, w: (sheet?.width ?? 100) + 4, h: (sheet?.height ?? 70) + 4 }),
+    [sheet?.width, sheet?.height],
+  );
+  // refit when switching sheets
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { setView(fitView()); }, [sheetIdx, sheet?.id]);
+
+  const zoomAt = useCallback(
+    (factor: number, ox: number, oy: number) => {
+      const el = svgRef.current;
+      if (!el || !sheet) return;
+      const rect = el.getBoundingClientRect();
+      setView((v) => {
+        const planX = v.x + (ox / rect.width) * v.w;
+        const planY = v.y + (oy / rect.height) * v.h;
+        const fw = sheet.width + 4, fh = sheet.height + 4;
+        const nw = Math.max(fw * 0.04, Math.min(v.w * factor, fw));
+        const nh = nw * (fh / fw);
+        return { x: planX - (ox / rect.width) * nw, y: planY - (oy / rect.height) * nh, w: nw, h: nh };
+      });
+    },
+    [sheet?.width, sheet?.height],
+  );
+
+  // wheel-to-zoom (non-passive so we can stop the page from scrolling)
+  useEffect(() => {
+    const el = svgRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      zoomAt(e.deltaY > 0 ? 1.18 : 1 / 1.18, e.clientX - rect.left, e.clientY - rect.top);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [zoomAt]);
+
+  // hold Space to pan (Figma-style); middle-mouse drag also pans
+  useEffect(() => {
+    const isField = (t: EventTarget | null) => {
+      const n = (t as HTMLElement)?.tagName;
+      return n === "INPUT" || n === "TEXTAREA" || n === "SELECT";
+    };
+    const down = (e: KeyboardEvent) => { if (e.code === "Space" && !isField(e.target)) { e.preventDefault(); setPanMode(true); } };
+    const up = (e: KeyboardEvent) => { if (e.code === "Space") setPanMode(false); };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); };
+  }, []);
+
   // ---------- drawing ----------
   const commitDraft = useCallback(() => {
     if (tool === "zone" && draft.length >= 3) {
@@ -128,6 +184,7 @@ export function PlanEditor() {
 
   const onSvgClick = useCallback(
     (e: React.MouseEvent) => {
+      if (panMode) return; // Space-drag is panning, not drawing
       if (tool !== "zone" && tool !== "stroke") return;
       const pt = toPlan(e);
       // Closing click on the first vertex finishes a zone.
@@ -140,12 +197,19 @@ export function PlanEditor() {
       }
       setDraft((d) => [...d, pt]);
     },
-    [tool, draft, toPlan, commitDraft],
+    [tool, draft, toPlan, commitDraft, panMode],
   );
 
   // ---------- select / drag ----------
   const onSvgPointerDown = useCallback(
     (e: React.PointerEvent) => {
+      // pan: middle-mouse or Space-held drag
+      if (e.button === 1 || panMode) {
+        e.preventDefault();
+        panRef.current = { cx: e.clientX, cy: e.clientY, vx: view.x, vy: view.y, vw: view.w, vh: view.h };
+        (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+        return;
+      }
       if (tool === "trace" && trace) {
         dragRef.current = { type: "trace", start: toPlan(e), origX: trace.x, origY: trace.y };
         return;
@@ -155,11 +219,21 @@ export function PlanEditor() {
       setSelZone(null);
       setSelVertex(null);
     },
-    [tool, trace, toPlan],
+    [tool, trace, toPlan, panMode, view],
   );
 
   const onSvgPointerMove = useCallback(
     (e: React.PointerEvent) => {
+      const p = panRef.current;
+      if (p) {
+        const el = svgRef.current;
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        const dx = (e.clientX - p.cx) * (p.vw / rect.width);
+        const dy = (e.clientY - p.cy) * (p.vh / rect.height);
+        setView((v) => ({ ...v, x: p.vx - dx, y: p.vy - dy }));
+        return;
+      }
       const drag = dragRef.current;
       if (!drag) return;
       const pt = toPlan(e);
@@ -197,6 +271,7 @@ export function PlanEditor() {
 
   const endDrag = useCallback(() => {
     dragRef.current = null;
+    panRef.current = null;
   }, []);
 
   // ---------- keyboard ----------
@@ -484,18 +559,39 @@ export function PlanEditor() {
               </label>
             </>
           )}
+          <div className="flex items-center gap-1">
+            {([["−", 1.5, "Zoom out"], ["+", 1 / 1.5, "Zoom in"]] as const).map(([sym, f, lbl]) => (
+              <button
+                key={lbl}
+                type="button"
+                aria-label={lbl}
+                onClick={() => zoomAt(f, (svgRef.current?.clientWidth ?? 0) / 2, (svgRef.current?.clientHeight ?? 0) / 2)}
+                className="flex h-7 w-7 items-center justify-center rounded border border-paper/30 text-sm leading-none text-paper/70 transition-colors hover:border-champagne/60 hover:text-champagne"
+              >
+                {sym}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => setView(fitView())}
+              className="rounded border border-paper/30 px-2 py-1 font-sans text-[0.625rem] uppercase tracking-[0.14em] text-paper/70 transition-colors hover:border-champagne/60 hover:text-champagne"
+            >
+              Fit
+            </button>
+          </div>
           <span className="ml-auto font-sans text-[0.625rem] uppercase tracking-[0.14em] text-paper/40">
-            Enter closes · Esc cancels · Del removes · Ctrl+Z undo
+            Scroll = zoom · Space-drag = pan · Enter closes · Del removes · Ctrl+Z
           </span>
         </div>
 
         <svg
           ref={svgRef}
-          viewBox={`-2 -2 ${sheet.width + 4} ${sheet.height + 4}`}
+          viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
+          style={panMode ? { cursor: panRef.current ? "grabbing" : "grab" } : undefined}
           className={cn(
             "block w-full touch-none border border-champagne/30 bg-[#FBF8F1]",
-            (tool === "zone" || tool === "stroke") && "cursor-crosshair",
-            tool === "trace" && trace && "cursor-move",
+            !panMode && (tool === "zone" || tool === "stroke") && "cursor-crosshair",
+            !panMode && tool === "trace" && trace && "cursor-move",
           )}
           onClick={onSvgClick}
           onPointerDown={onSvgPointerDown}
@@ -535,13 +631,13 @@ export function PlanEditor() {
             />
           )}
 
-          {/* flight path (read-only context from GPS/VSLAM) */}
+          {/* flight path (read-only context from GPS/VSLAM) — smoothed */}
           {sheet.paths &&
             Object.values(sheet.paths).map((keys, ci) =>
               keys.length > 1 ? (
-                <polyline
+                <path
                   key={`path-${ci}`}
-                  points={keys.map((k) => `${k.x},${k.y}`).join(" ")}
+                  d={smoothPathD(keys)}
                   fill="none"
                   stroke="#B7995C"
                   strokeOpacity={0.7}
@@ -557,6 +653,7 @@ export function PlanEditor() {
           {sheet.zones.map((z, zi) => {
             const [cx, cy] = centroid(z.points);
             const selected = zi === selZone;
+            const fs = zoneFontSize(z.points, z.label, labelSize, labelSize * 0.34);
             return (
               <g key={z.id}>
                 <path
@@ -567,7 +664,7 @@ export function PlanEditor() {
                   strokeWidth={selected ? 0.6 : 0.3}
                   className={tool === "select" ? "cursor-pointer" : undefined}
                   onPointerDown={(e) => {
-                    if (tool !== "select") return;
+                    if (tool !== "select" || panMode) return;
                     e.stopPropagation();
                     setSelZone(zi);
                     setSelVertex(null);
@@ -576,7 +673,7 @@ export function PlanEditor() {
                 />
                 <text
                   x={cx} y={cy} textAnchor="middle" dominantBaseline="central"
-                  fontSize={labelSize} letterSpacing={labelSize * 0.1}
+                  fontSize={fs} letterSpacing={fs * 0.1}
                   fill="#6B5D45" className="pointer-events-none select-none font-sans uppercase"
                 >
                   {z.label}
@@ -590,6 +687,7 @@ export function PlanEditor() {
                       stroke="#A6863F" strokeWidth={0.3}
                       className="cursor-grab"
                       onPointerDown={(e) => {
+                        if (panMode) return;
                         e.stopPropagation();
                         snapshot();
                         setSelVertex(vi);

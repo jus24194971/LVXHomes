@@ -1,11 +1,14 @@
 "use client";
 
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Plan, PlanSheet, PlanZone } from "@/data/plans";
 import { cn } from "@/lib/utils";
+import { centroidOf, smoothPathD, zoneFontSize } from "@/lib/plan-geometry";
 
 /**
  * The living minimap — renders a plan sheet (floor or grounds) in brand
- * style and lets the viewer tap a zone to jump the flight there.
+ * style and lets the viewer tap a zone to jump the flight there. Zoomable
+ * (wheel / pinch-drag / buttons) so amenities are tappable even on a small map.
  */
 
 // Zone fills per kind, tuned for the cream plan card. (Shared with the Studio.)
@@ -17,15 +20,7 @@ export const ZONE_FILL: Record<PlanZone["kind"], string> = {
   hardscape: "#DCD2BE",
 };
 
-const centroid = (pts: [number, number][]): [number, number] => {
-  let x = 0;
-  let y = 0;
-  for (const [px, py] of pts) {
-    x += px;
-    y += py;
-  }
-  return [x / pts.length, y / pts.length];
-};
+const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
 
 function PlanSheetSVG({
   sheet,
@@ -44,148 +39,264 @@ function PlanSheetSVG({
   authorMode?: boolean;
   onCanvasClick?: (x: number, y: number) => void;
 }) {
-  const labelSize = Math.max(sheet.width, sheet.height) * 0.034;
+  const labelBase = Math.max(sheet.width, sheet.height) * 0.034;
   const indScale = Math.max(sheet.width, sheet.height) * 0.014;
-  return (
-    <svg
-      viewBox={`0 0 ${sheet.width} ${sheet.height}`}
-      className="block h-auto w-full"
-      role="group"
-      aria-label={`${sheet.label} plan`}
-      onClick={
-        authorMode && onCanvasClick
-          ? (e) => {
-              const svg = e.currentTarget;
-              const m = svg.getScreenCTM();
-              if (!m) return;
-              const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(m.inverse());
-              onCanvasClick(Math.round(p.x * 10) / 10, Math.round(p.y * 10) / 10);
-            }
-          : undefined
-      }
-    >
-      {/* Base — the real satellite for georeferenced grounds, else the cream card */}
-      {sheet.satUrl ? (
-        <image
-          href={sheet.satUrl}
-          x={0}
-          y={0}
-          width={sheet.width}
-          height={sheet.height}
-          preserveAspectRatio="none"
-        />
-      ) : (
-        <rect x={0} y={0} width={sheet.width} height={sheet.height} fill="#FBF8F1" />
-      )}
 
-      {/* Flight path in gold */}
-      {sheet.paths &&
-        Object.values(sheet.paths).map((keys, ci) =>
-          keys.length > 1 ? (
-            <polyline
-              key={`path-${ci}`}
-              points={keys.map((k) => `${k.x},${k.y}`).join(" ")}
-              fill="none"
-              stroke="#E9C77E"
-              strokeOpacity={0.9}
-              strokeWidth={Math.max(sheet.width, sheet.height) * 0.005}
-              strokeLinejoin="round"
-              strokeLinecap="round"
-              className="pointer-events-none"
-            />
-          ) : null,
+  // ----- zoom / pan (viewBox-driven, so the click→plan mapping stays exact) -----
+  const full = { x: 0, y: 0, w: sheet.width, h: sheet.height };
+  const [view, setView] = useState(full);
+  const svgRef = useRef<SVGSVGElement>(null);
+  const pan = useRef<{ cx: number; cy: number; vx: number; vy: number; vw: number; vh: number } | null>(null);
+  const didPan = useRef(false);
+
+  // reset the view whenever the sheet changes
+  useEffect(() => {
+    setView({ x: 0, y: 0, w: sheet.width, h: sheet.height });
+  }, [sheet.id, sheet.width, sheet.height]);
+
+  const zoomAt = useCallback(
+    (factor: number, ox: number, oy: number) => {
+      const el = svgRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      setView((v) => {
+        const fw = sheet.width, fh = sheet.height;
+        const planX = v.x + (ox / rect.width) * v.w;
+        const planY = v.y + (oy / rect.height) * v.h;
+        let nw = clamp(v.w * factor, fw * 0.06, fw);
+        let nh = clamp(v.h * factor, fh * 0.06, fh);
+        // keep aspect locked to the sheet
+        nh = nw * (fh / fw);
+        let nx = clamp(planX - (ox / rect.width) * nw, 0, fw - nw);
+        let ny = clamp(planY - (oy / rect.height) * nh, 0, fh - nh);
+        return { x: nx, y: ny, w: nw, h: nh };
+      });
+    },
+    [sheet.width, sheet.height],
+  );
+
+  // non-passive wheel so we can preventDefault the page scroll
+  useEffect(() => {
+    const el = svgRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      zoomAt(e.deltaY > 0 ? 1.18 : 1 / 1.18, e.clientX - rect.left, e.clientY - rect.top);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [zoomAt]);
+
+  const onDown = (e: React.PointerEvent) => {
+    didPan.current = false;
+    if (view.w >= sheet.width - 0.5) return; // not zoomed → let taps fall straight through to jump
+    pan.current = { cx: e.clientX, cy: e.clientY, vx: view.x, vy: view.y, vw: view.w, vh: view.h };
+    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+  };
+  const onMove = (e: React.PointerEvent) => {
+    const p = pan.current;
+    const el = svgRef.current;
+    if (!p || !el) return;
+    const rect = el.getBoundingClientRect();
+    if (Math.hypot(e.clientX - p.cx, e.clientY - p.cy) > 4) didPan.current = true;
+    const dx = (e.clientX - p.cx) * (p.vw / rect.width);
+    const dy = (e.clientY - p.cy) * (p.vh / rect.height);
+    setView((v) => ({
+      ...v,
+      x: clamp(p.vx - dx, 0, sheet.width - v.w),
+      y: clamp(p.vy - dy, 0, sheet.height - v.h),
+    }));
+  };
+  const onUp = () => {
+    pan.current = null;
+  };
+
+  const zoomed = view.w < sheet.width - 0.5;
+
+  return (
+    <div className="relative">
+      <svg
+        ref={svgRef}
+        viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
+        className="block h-auto w-full"
+        style={{ touchAction: "none", cursor: zoomed ? "grab" : undefined }}
+        role="group"
+        aria-label={`${sheet.label} plan`}
+        onPointerDown={onDown}
+        onPointerMove={onMove}
+        onPointerUp={onUp}
+        onPointerLeave={onUp}
+        onClick={
+          authorMode && onCanvasClick
+            ? (e) => {
+                if (didPan.current) return;
+                const svg = e.currentTarget;
+                const m = svg.getScreenCTM();
+                if (!m) return;
+                const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(m.inverse());
+                onCanvasClick(Math.round(p.x * 10) / 10, Math.round(p.y * 10) / 10);
+              }
+            : undefined
+        }
+      >
+        {/* Base — the real satellite/aerial for georeferenced grounds, else the cream card */}
+        {sheet.satUrl ? (
+          <image
+            href={sheet.satUrl}
+            x={0}
+            y={0}
+            width={sheet.width}
+            height={sheet.height}
+            preserveAspectRatio="none"
+          />
+        ) : (
+          <rect x={0} y={0} width={sheet.width} height={sheet.height} fill="#FBF8F1" />
         )}
 
-      {sheet.zones.map((z) => {
-        const active = z.id === activeZoneId;
-        const interactive =
-          !authorMode && (z.panoId !== undefined || z.videoTime !== undefined);
-        const [cx, cy] = centroid(z.points);
-        const d = `M ${z.points.map(([x, y]) => `${x} ${y}`).join(" L ")} Z`;
-        return (
-          <g key={z.id}>
-            <path
-              d={d}
-              fill={active ? "#B7995C" : sheet.satUrl ? "#B7995C" : ZONE_FILL[z.kind]}
-              fillOpacity={active ? 0.55 : sheet.satUrl ? 0.22 : 1}
-              stroke={active ? "#A6863F" : sheet.satUrl ? "#E9C77E" : "#CBBC9C"}
-              strokeWidth={sheet.width * 0.004}
-              className={cn(
-                interactive &&
-                  "cursor-pointer transition-[fill-opacity] hover:fill-champagne hover:fill-opacity-40",
-              )}
-              role={interactive ? "button" : undefined}
-              tabIndex={interactive ? 0 : undefined}
-              aria-label={
-                interactive
-                  ? `${z.label} — ${z.panoId ? "step inside" : "fly there"}`
-                  : z.label
-              }
-              onClick={interactive ? () => onZoneClick(z) : undefined}
-              onKeyDown={
-                interactive
-                  ? (e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        onZoneClick(z);
-                      }
-                    }
-                  : undefined
-              }
-            />
-            <text
-              x={cx}
-              y={cy}
-              textAnchor="middle"
-              dominantBaseline="central"
-              fontSize={labelSize}
-              letterSpacing={labelSize * 0.12}
-              fill={active ? "#211C16" : sheet.satUrl ? "#FBF8F1" : "#6B5D45"}
-              className="pointer-events-none select-none font-sans uppercase [paint-order:stroke]"
-              stroke={sheet.satUrl && !active ? "#211C16" : undefined}
-              strokeWidth={sheet.satUrl && !active ? labelSize * 0.12 : undefined}
-              strokeOpacity={0.5}
-            >
-              {z.label}
-            </text>
-            {interactive && (
-              <circle
-                cx={cx}
-                cy={cy + labelSize * 1.3}
-                r={sheet.width * 0.008}
-                fill="#B7995C"
+        {/* Flight path in gold — smoothed (hand-flown paths are jagged) */}
+        {sheet.paths &&
+          Object.values(sheet.paths).map((keys, ci) =>
+            keys.length > 1 ? (
+              <path
+                key={`path-${ci}`}
+                d={smoothPathD(keys)}
+                fill="none"
+                stroke="#E9C77E"
+                strokeOpacity={0.9}
+                strokeWidth={Math.max(sheet.width, sheet.height) * 0.005}
+                strokeLinejoin="round"
+                strokeLinecap="round"
                 className="pointer-events-none"
               />
-            )}
-          </g>
-        );
-      })}
+            ) : null,
+          )}
 
-      {/* Exterior walls / boundaries */}
-      {sheet.strokes?.map((line, i) => (
-        <polyline
-          key={i}
-          points={line.map(([x, y]) => `${x},${y}`).join(" ")}
-          fill="none"
-          stroke={sheet.kind === "floor" ? "#3A3026" : "#6B5D45"}
-          strokeWidth={sheet.width * (sheet.kind === "floor" ? 0.012 : 0.006)}
-          strokeDasharray={sheet.kind === "site" ? `${sheet.width * 0.015} ${sheet.width * 0.012}` : undefined}
-          strokeLinejoin="miter"
-        />
-      ))}
+        {sheet.zones.map((z) => {
+          const active = z.id === activeZoneId;
+          const interactive =
+            !authorMode && (z.panoId !== undefined || z.videoTime !== undefined);
+          const [cx, cy] = centroidOf(z.points);
+          const fs = zoneFontSize(z.points, z.label, labelBase, labelBase * 0.34);
+          const d = `M ${z.points.map(([x, y]) => `${x} ${y}`).join(" L ")} Z`;
+          return (
+            <g key={z.id}>
+              <path
+                d={d}
+                fill={active ? "#B7995C" : sheet.satUrl ? "#B7995C" : ZONE_FILL[z.kind]}
+                fillOpacity={active ? 0.55 : sheet.satUrl ? 0.22 : 1}
+                stroke={active ? "#A6863F" : sheet.satUrl ? "#E9C77E" : "#CBBC9C"}
+                strokeWidth={sheet.width * 0.004}
+                className={cn(
+                  interactive &&
+                    "cursor-pointer transition-[fill-opacity] hover:fill-champagne hover:fill-opacity-40",
+                )}
+                role={interactive ? "button" : undefined}
+                tabIndex={interactive ? 0 : undefined}
+                aria-label={
+                  interactive
+                    ? `${z.label} — ${z.panoId ? "step inside" : "fly there"}`
+                    : z.label
+                }
+                onClick={interactive ? () => { if (!didPan.current) onZoneClick(z); } : undefined}
+                onKeyDown={
+                  interactive
+                    ? (e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          onZoneClick(z);
+                        }
+                      }
+                    : undefined
+                }
+              />
+              {z.label && (
+                <text
+                  x={cx}
+                  y={cy}
+                  textAnchor="middle"
+                  dominantBaseline="central"
+                  fontSize={fs}
+                  letterSpacing={fs * 0.12}
+                  fill={active ? "#211C16" : sheet.satUrl ? "#FBF8F1" : "#6B5D45"}
+                  className="pointer-events-none select-none font-sans uppercase [paint-order:stroke]"
+                  stroke={sheet.satUrl && !active ? "#211C16" : undefined}
+                  strokeWidth={sheet.satUrl && !active ? fs * 0.12 : undefined}
+                  strokeOpacity={0.5}
+                >
+                  {z.label}
+                </text>
+              )}
+              {interactive && (
+                <circle
+                  cx={cx}
+                  cy={cy + fs * 1.3}
+                  r={sheet.width * 0.008}
+                  fill="#B7995C"
+                  className="pointer-events-none"
+                />
+              )}
+            </g>
+          );
+        })}
 
-      {/* You-are-here — positioned/rotated each frame by the player loop */}
-      {indicatorRef && (
-        <g ref={indicatorRef} style={{ display: "none" }} aria-hidden>
-          <g transform={`scale(${indScale})`}>
-            {/* view cone points "up"; the loop rotates the outer group */}
-            <path d="M 0 0 L -2.4 -5.6 A 6.1 6.1 0 0 1 2.4 -5.6 Z" fill="#B7995C" fillOpacity={0.35} />
-            <circle r={2.6} fill="none" stroke="#B7995C" strokeOpacity={0.45} strokeWidth={0.35} className="motion-safe:animate-ping" style={{ transformOrigin: "0 0" }} />
-            <circle r={1.5} fill="#A6863F" stroke="#FBF8F1" strokeWidth={0.45} />
+        {/* Exterior walls / boundaries */}
+        {sheet.strokes?.map((line, i) => (
+          <polyline
+            key={i}
+            points={line.map(([x, y]) => `${x},${y}`).join(" ")}
+            fill="none"
+            stroke={sheet.kind === "floor" ? "#3A3026" : "#6B5D45"}
+            strokeWidth={sheet.width * (sheet.kind === "floor" ? 0.012 : 0.006)}
+            strokeDasharray={sheet.kind === "site" ? `${sheet.width * 0.015} ${sheet.width * 0.012}` : undefined}
+            strokeLinejoin="miter"
+            className="pointer-events-none"
+          />
+        ))}
+
+        {/* You-are-here — positioned/rotated each frame by the player loop */}
+        {indicatorRef && (
+          <g ref={indicatorRef} style={{ display: "none" }} aria-hidden>
+            <g transform={`scale(${indScale})`}>
+              {/* view cone points "up"; the loop rotates the outer group */}
+              <path d="M 0 0 L -2.4 -5.6 A 6.1 6.1 0 0 1 2.4 -5.6 Z" fill="#B7995C" fillOpacity={0.35} />
+              <circle r={2.6} fill="none" stroke="#B7995C" strokeOpacity={0.45} strokeWidth={0.35} className="motion-safe:animate-ping" style={{ transformOrigin: "0 0" }} />
+              <circle r={1.5} fill="#A6863F" stroke="#FBF8F1" strokeWidth={0.45} />
+            </g>
           </g>
-        </g>
-      )}
-    </svg>
+        )}
+      </svg>
+
+      {/* zoom controls */}
+      <div className="absolute right-1.5 top-1.5 flex flex-col gap-1">
+        <button
+          type="button"
+          aria-label="Zoom in"
+          onClick={() => zoomAt(1 / 1.5, (svgRef.current?.clientWidth ?? 0) / 2, (svgRef.current?.clientHeight ?? 0) / 2)}
+          className="flex h-6 w-6 items-center justify-center rounded border border-champagne/50 bg-ink/80 text-sm leading-none text-paper/90 backdrop-blur transition-colors hover:border-champagne hover:text-champagne"
+        >
+          +
+        </button>
+        <button
+          type="button"
+          aria-label="Zoom out"
+          onClick={() => zoomAt(1.5, (svgRef.current?.clientWidth ?? 0) / 2, (svgRef.current?.clientHeight ?? 0) / 2)}
+          className="flex h-6 w-6 items-center justify-center rounded border border-champagne/50 bg-ink/80 text-sm leading-none text-paper/90 backdrop-blur transition-colors hover:border-champagne hover:text-champagne"
+        >
+          −
+        </button>
+        {zoomed && (
+          <button
+            type="button"
+            aria-label="Reset zoom"
+            onClick={() => setView({ x: 0, y: 0, w: sheet.width, h: sheet.height })}
+            className="flex h-6 w-6 items-center justify-center rounded border border-champagne/50 bg-ink/80 text-[0.7rem] leading-none text-paper/90 backdrop-blur transition-colors hover:border-champagne hover:text-champagne"
+          >
+            ⤢
+          </button>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -259,7 +370,7 @@ export function PlanPanel({
         />
       </div>
       <p className="px-3 pb-2 font-sans text-[clamp(0.5625rem,0.65cqw,0.8125rem)] uppercase tracking-[0.14em] text-paper/45">
-        {authorMode ? "Author mode · click the plan to drop a path key" : "Tap a space to fly there"}
+        {authorMode ? "Author mode · click the plan to drop a path key" : "Scroll/pinch to zoom · tap a space to fly there"}
       </p>
     </div>
   );
