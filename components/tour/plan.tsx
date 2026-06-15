@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Plan, PlanSheet, PlanZone } from "@/data/plans";
 import { cn } from "@/lib/utils";
-import { centroidOf, smoothPathD, zoneFontSize } from "@/lib/plan-geometry";
+import { centroidOf, zoneFontSize } from "@/lib/plan-geometry";
 
 /**
  * The living minimap — renders a plan sheet (floor or grounds) in brand
@@ -41,6 +41,7 @@ function PlanSheetSVG({
 }) {
   const labelBase = Math.max(sheet.width, sheet.height) * 0.034;
   const indScale = Math.max(sheet.width, sheet.height) * 0.014;
+  const hasFlightPath = !!(sheet.paths && Object.keys(sheet.paths).length);
 
   // ----- zoom / pan (viewBox-driven, so the click→plan mapping stays exact) -----
   const full = { x: 0, y: 0, w: sheet.width, h: sheet.height };
@@ -154,28 +155,17 @@ function PlanSheetSVG({
           <rect x={0} y={0} width={sheet.width} height={sheet.height} fill="#FBF8F1" />
         )}
 
-        {/* Flight path in gold — smoothed (hand-flown paths are jagged) */}
-        {sheet.paths &&
-          Object.values(sheet.paths).map((keys, ci) =>
-            keys.length > 1 ? (
-              <path
-                key={`path-${ci}`}
-                d={smoothPathD(keys)}
-                fill="none"
-                stroke="#E9C77E"
-                strokeOpacity={0.9}
-                strokeWidth={Math.max(sheet.width, sheet.height) * 0.005}
-                strokeLinejoin="round"
-                strokeLinecap="round"
-                className="pointer-events-none"
-              />
-            ) : null,
-          )}
+        {/* The flight path line is intentionally omitted — the living gold dot
+            (position + heading, driven each frame) carries the motion. */}
 
         {sheet.zones.map((z) => {
           const active = z.id === activeZoneId;
+          // Any named amenity is tappable: it has a pano/time, OR the sheet has a
+          // georeferenced flight path we can fly to (GPS/VSLAM closest approach).
           const interactive =
-            !authorMode && (z.panoId !== undefined || z.videoTime !== undefined);
+            !authorMode &&
+            !!z.label &&
+            (z.panoId !== undefined || z.videoTime !== undefined || hasFlightPath);
           const [cx, cy] = centroidOf(z.points);
           const fs = zoneFontSize(z.points, z.label, labelBase, labelBase * 0.34);
           const d = `M ${z.points.map(([x, y]) => `${x} ${y}`).join(" L ")} Z`;

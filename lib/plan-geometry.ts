@@ -56,6 +56,26 @@ export function centroidOf(points: Pt[]): [number, number] {
 }
 
 /**
+ * Time at which a flight path passes closest to a point — the GPS/VSLAM-driven
+ * "fly me to this amenity" target, so a map jump resumes at the right moment
+ * without any hand-authored keyframe. Returns null if there's no path.
+ */
+export function closestApproachT(
+  flightKeys: Array<{ t: number; x: number; y: number }>,
+  point: [number, number],
+): number | null {
+  if (!flightKeys?.length) return null;
+  const [px, py] = point;
+  let best = Infinity;
+  let bt = flightKeys[0].t;
+  for (const k of flightKeys) {
+    const d = (k.x - px) ** 2 + (k.y - py) ** 2;
+    if (d < best) { best = d; bt = k.t; }
+  }
+  return bt;
+}
+
+/**
  * Font size (in plan units) that keeps `label` inside the zone's bounding box.
  * Shrinks to fit width AND height, floored at `min` so it never vanishes.
  * Returns `base` for empty labels (unused). Solves the "label overflows a small

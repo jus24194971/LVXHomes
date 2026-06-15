@@ -52,7 +52,7 @@ const slugify = (s: string) =>
   s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "zone";
 
 export function PlanEditor() {
-  const [tourSlug, setTourSlug] = useState("test");
+  const [tourSlug, setTourSlug] = useState("the-george");
   const [sheets, setSheets] = useState<PlanSheet[]>([newSheet("floor", 1)]);
   const [sheetIdx, setSheetIdx] = useState(0);
   const [tool, setTool] = useState<Tool>("zone");
@@ -368,6 +368,27 @@ export function PlanEditor() {
       alert(e instanceof Error ? e.message : "Load failed");
     }
   }, [tourSlug, loadPlan]);
+
+  // On open: restore the last-edited tour and silently pull its SAVED plan from
+  // the site, so you always land on the live version (no "Load from site" click).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const saved = typeof window !== "undefined" ? localStorage.getItem("lvx-plan-tourslug") : null;
+    const slug = saved || "the-george";
+    setTourSlug(slug);
+    void (async () => {
+      try {
+        const doc = await loadDoc<Plan>("plan", slug);
+        if (doc && Array.isArray(doc.sheets)) loadPlan(doc);
+      } catch {
+        /* no saved plan — keep the seed */
+      }
+    })();
+  }, []);
+  // remember the tour for next session
+  useEffect(() => {
+    if (typeof window !== "undefined") localStorage.setItem("lvx-plan-tourslug", tourSlug);
+  }, [tourSlug]);
 
   const onTraceFile = useCallback(
     (file: File | undefined) => {

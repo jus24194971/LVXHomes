@@ -13,6 +13,7 @@ import {
 } from "@/lib/author-client";
 import { TourTutorial } from "@/components/tour/tour-tutorial";
 import { PlanPanel } from "@/components/tour/plan";
+import { centroidOf, closestApproachT } from "@/lib/plan-geometry";
 import { cn } from "@/lib/utils";
 
 /**
@@ -64,6 +65,28 @@ function ringWindow(
 }
 
 const norm180 = (d: number) => ((((d + 180) % 360) + 360) % 360) - 180;
+
+/** Best-effort link from a plan zone's label to a tour pano id — exact label
+ *  match first, then a shared significant word — so naming an amenity to match
+ *  its 360 photo is enough to wire the "step inside" jump (no manual linking). */
+function matchPanoByLabel(
+  label: string | undefined,
+  panos: { id: string; label: string }[],
+): string | undefined {
+  if (!label) return undefined;
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const L = norm(label);
+  const exact = panos.find((p) => norm(p.label) === L);
+  if (exact) return exact.id;
+  const want = new Set(L.split(" ").filter((w) => w.length >= 4));
+  let best: string | undefined;
+  let score = 0;
+  for (const p of panos) {
+    const s = norm(p.label).split(" ").filter((w) => w.length >= 4 && want.has(w)).length;
+    if (s > score) { score = s; best = p.id; }
+  }
+  return score > 0 ? best : undefined;
+}
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 
@@ -1236,24 +1259,38 @@ export function TourViewer({
 
   const handleZoneClick = useCallback(
     (zone: PlanZone) => {
-      if (zone.panoId) {
-        // A map jump resumes the flight at the amenity's ring keyframe (facing
-        // it), falling back to the zone's videoTime if it has no ring yet.
-        let resumeAt: { t: number; yaw: number } | null = null;
-        for (const ch of tour.chapters) {
-          const ring = ch.hotspots.find((h) => h.panoId === zone.panoId && h.keys?.length);
-          if (ring?.keys?.length) {
-            resumeAt = { t: ring.keys[0].t, yaw: ring.keys[0].yaw };
+      // The static 360 for this amenity: explicit panoId, else match by name, so
+      // a boxed + named zone "just works" with no manual linking.
+      const panoId = zone.panoId ?? matchPanoByLabel(zone.label, tour.panos);
+      const chId = zone.chapterId ?? tour.chapters[0]?.id ?? "";
+
+      // GPS/VSLAM resume: the moment the flight passes CLOSEST to this amenity —
+      // no hand-authored keyframe. Falls back to a ring key, then videoTime.
+      let resumeT: number | null = null;
+      if (plan) {
+        for (const s of plan.sheets) {
+          const keys = s.paths?.[chId];
+          if (keys?.length) {
+            resumeT = closestApproachT(keys, centroidOf(zone.points));
             break;
           }
         }
-        if (!resumeAt && zone.videoTime !== undefined) resumeAt = { t: zone.videoTime, yaw: 0 };
-        void enterPano(zone.panoId, resumeAt);
-      } else if (zone.videoTime !== undefined) {
-        void seekFlight(zone.videoTime, zone.chapterId);
       }
+      if (resumeT == null) {
+        for (const ch of tour.chapters) {
+          const ring = ch.hotspots.find((h) => h.panoId === panoId && h.keys?.length);
+          if (ring?.keys?.length) { resumeT = ring.keys[0].t; break; }
+        }
+      }
+      if (resumeT == null && zone.videoTime !== undefined) resumeT = zone.videoTime;
+
+      const startYaw = tour.chapters.find((c) => c.id === chId)?.startYaw ?? 0;
+      const resumeAt = resumeT != null ? { t: resumeT, yaw: startYaw } : null;
+
+      if (panoId) void enterPano(panoId, resumeAt);
+      else if (resumeAt) void seekFlight(resumeAt.t, zone.chapterId);
     },
-    [enterPano, seekFlight, tour.chapters],
+    [enterPano, seekFlight, tour.chapters, tour.panos, plan],
   );
 
   // ---------- basic controls ----------
