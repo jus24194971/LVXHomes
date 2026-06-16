@@ -111,12 +111,13 @@ export function PlanEditor() {
     if (!rot && !flip) return [snap(p.x), snap(p.y)];
     const cx = (sheet?.width ?? 0) / 2, cy = (sheet?.height ?? 0) / 2;
     let rx = p.x, ry = p.y;
+    if (flip) rx = 2 * cx - rx; // un-flip in screen space first (flip is applied after rotate)
     if (rot) {
-      const a = (rot * Math.PI) / 180, dx = p.x - cx, dy = p.y - cy;
-      rx = cx + dx * Math.cos(a) + dy * Math.sin(a);
-      ry = cy - dx * Math.sin(a) + dy * Math.cos(a);
+      const a = (rot * Math.PI) / 180, dx = rx - cx, dy = ry - cy;
+      const nx = cx + dx * Math.cos(a) + dy * Math.sin(a);
+      const ny = cy - dx * Math.sin(a) + dy * Math.cos(a);
+      rx = nx; ry = ny;
     }
-    if (flip) rx = 2 * cx - rx; // un-mirror so drawing lands in the flipped frame
     return [snap(rx), snap(ry)];
   }, [sheet?.rotation, sheet?.flipX, sheet?.width, sheet?.height]);
 
@@ -688,8 +689,9 @@ export function PlanEditor() {
           <g
             transform={
               [
-                (sheet.rotation ?? 0) ? `rotate(${sheet.rotation} ${sheet.width / 2} ${sheet.height / 2})` : "",
+                // flip listed first → applied LAST (after rotate) = mirror in screen space
                 sheet.flipX ? `translate(${sheet.width} 0) scale(-1 1)` : "",
+                (sheet.rotation ?? 0) ? `rotate(${sheet.rotation} ${sheet.width / 2} ${sheet.height / 2})` : "",
               ]
                 .filter(Boolean)
                 .join(" ") || undefined
