@@ -28,28 +28,37 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ slug: stri
   }
   const files = await listProjectFiles(project.id);
   const video = files.find((f) => f.role === "video");
-  if (!video) {
-    return NextResponse.json({ error: "Add a 360 video before processing" }, { status: 400 });
+  const stills = files.filter((f) => f.role === "still");
+  const raw = files.filter((f) => f.role === "raw");
+  if (!video && stills.length === 0) {
+    const hint =
+      raw.length > 0
+        ? "Those .osv files are raw 360 — export the equirect MP4 in DJI Studio, then upload that."
+        : "Add a 360 video (or dedicated nadir stills) before processing.";
+    return NextResponse.json({ error: hint }, { status: 400 });
   }
 
   const id = crypto.randomUUID();
   await createVslamJob({
     id,
     slug: project.slug,
-    r2_key: video.r2_key,
+    r2_key: video?.r2_key ?? stills[0]?.r2_key ?? "",
     status: "processing",
     created_by: email,
   });
   await updateProject(project.id, { status: "processing" });
 
   try {
+    // Fan out by role: video → VSLAM + ortho, stills → stitch. ceiling_ft anchors
+    // the GPS-denied scale (AZ standard 9 ft). raw/.osv is flagged above, not sent.
     const res = await fetch(env.MODAL_SUBMIT_URL, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         slug: project.slug,
-        r2_key: video.r2_key,
-        scale: 1,
+        video_key: video?.r2_key,
+        still_keys: stills.map((s) => s.r2_key),
+        ceiling_ft: 9,
         token: env.VSLAM_CALLBACK_TOKEN ?? "",
       }),
     });

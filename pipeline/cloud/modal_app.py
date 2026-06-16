@@ -346,13 +346,23 @@ def _notify(payload: dict):
 
 @app.function(secrets=[cb_secret], timeout=4200)
 def process(job: dict) -> dict:
-    """One full job: VSLAM -> floor -> callback. Sequential (floor needs the .ply)."""
-    slug, r2_key = job["slug"], job["r2_key"]
+    """One full job, fanned out by what was uploaded:
+         video  -> run_vslam (cloud + trajectory -> /scratch) -> make_ortho
+                   (top-down photo + flight path + feet-scaled plan.json)
+         stills -> stitch_stills (dedicated-still orthomosaic)
+       Sequential where there's a dependency (the ortho reads the VSLAM volume)."""
+    slug = job["slug"]
+    video_key = job.get("video_key") or job.get("r2_key")
+    still_keys = job.get("still_keys") or []
+    ceiling_ft = float(job.get("ceiling_ft", 9.0))
     try:
-        v = run_vslam.remote(r2_key, slug)
-        f = make_floor.remote(slug, scale=float(job.get("scale", 1.0)),
-                              cut=float(job.get("cut", 1.5)), pxm=int(job.get("pxm", 50)))
-        payload = {"slug": slug, "status": "ready", **v, **f}
+        payload = {"slug": slug, "status": "ready"}
+        if video_key:
+            run_vslam.remote(video_key, slug)                       # GPU -> commits /scratch
+            payload.update(make_ortho.remote(slug, video_key, ceiling_ft=ceiling_ft))
+        if still_keys:
+            st = stitch_stills.remote(slug, ",".join(still_keys), ceiling_ft=ceiling_ft)
+            payload["stitch"] = st.get("ortho")
     except Exception as e:
         payload = {"slug": slug, "status": "failed", "error": str(e)}
     _notify(payload)
@@ -369,8 +379,10 @@ def submit(job: dict):
     if os.environ.get("LVX_CALLBACK_TOKEN") and \
        job.get("token") != os.environ["LVX_CALLBACK_TOKEN"]:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    if not job.get("slug") or not job.get("r2_key"):
-        return JSONResponse({"error": "need slug + r2_key"}, status_code=400)
+    if not job.get("slug"):
+        return JSONResponse({"error": "need slug"}, status_code=400)
+    if not (job.get("r2_key") or job.get("video_key") or job.get("still_keys")):
+        return JSONResponse({"error": "need a video or stills to process"}, status_code=400)
     process.spawn(job)
     return {"accepted": True, "slug": job["slug"]}
 
@@ -1072,6 +1084,42 @@ def make_overlay(slug: str, ceiling_ft: float = 9.0, pxm: float = 60.0,
     print(f"[overlay] {slug}: {W}x{H}, photo+path, {n} poses, "
           f"{int((valid > 0).mean() * 100)}% photo -> R2 plan-walls/{slug}.overlay.jpg")
     return {"px": [W, H], "poses": int(n), "preview": f"plan-walls/{slug}.overlay.jpg"}
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], timeout=2400)
+def stitch_stills(slug: str, keys_csv: str, ceiling_ft: float = 9.0) -> dict:
+    """Orthomosaic from dedicated nadir STILLS — the real top-down path. Feature-match
+    + blend overlapping perspective stills via OpenCV's scan-mode stitcher (affine,
+    flat-scene) → one clean top-down image. `keys_csv` = comma-separated R2 keys of the
+    uploaded stills. Scale/registration to the VSLAM frame is the follow-up; this proves
+    the mosaic. Sharpens automatically as the stills get better (overlap/altitude)."""
+    import os
+    import cv2
+
+    s3 = _r2()
+    keys = [k.strip() for k in keys_csv.split(",") if k.strip()]
+    imgs = []
+    for k in keys:
+        p = f"/tmp/{os.path.basename(k)}"
+        try:
+            s3.download_file(R2_BUCKET, k, p)
+            im = cv2.imread(p)
+            if im is not None:
+                imgs.append(im)
+        except Exception as e:
+            print(f"[stitch] skip {k}: {e}")
+    if len(imgs) < 2:
+        return {"error": f"need >=2 stills, got {len(imgs)}"}
+    st = cv2.Stitcher_create(cv2.Stitcher_SCANS)   # affine / flat-scene mode for nadir
+    status, pano = st.stitch(imgs)
+    if status != cv2.Stitcher_OK:
+        return {"error": f"stitch failed (status {status}) — needs more overlap", "n": len(imgs)}
+    out = "/tmp/stitch.jpg"
+    cv2.imwrite(out, pano, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    key = f"ortho/{slug}.stitch.jpg"
+    s3.upload_file(out, R2_BUCKET, key)
+    print(f"[stitch] {slug}: {len(imgs)} stills -> {pano.shape[1]}x{pano.shape[0]} -> R2 {key}")
+    return {"ortho": key, "px": [int(pano.shape[1]), int(pano.shape[0])], "stills": len(imgs)}
 
 
 @app.local_entrypoint()

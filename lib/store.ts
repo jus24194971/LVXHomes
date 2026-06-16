@@ -444,7 +444,11 @@ export async function updateVslamJob(id: string, patch: VslamPatch): Promise<voi
 // ---------- capture projects (the workflow folder) ----------
 
 export type ProjectStatus = "draft" | "processing" | "review" | "published";
-export type ProjectFileRole = "video" | "still" | "telemetry" | "other";
+// video = processable equirect/standard clip · still = image for the stitch ·
+// hero = designated room pano → tour zoom-point · telemetry = SRT/GPS ·
+// proxy = .lrf/.lrv low-res (preview only) · raw = .osv/.insv (needs vendor stitch first)
+export type ProjectFileRole =
+  | "video" | "still" | "hero" | "telemetry" | "proxy" | "raw" | "other";
 
 export type Project = {
   id: string;

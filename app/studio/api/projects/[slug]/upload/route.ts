@@ -5,11 +5,15 @@ import { getProjectBySlug, addProjectFile, type ProjectFileRole } from "@/lib/st
 
 export const dynamic = "force-dynamic";
 
-const VIDEO = /\.(mp4|mov|m4v|webm|insv|lrv)$/i;
+const VIDEO = /\.(mp4|mov|m4v|webm)$/i; // processable equirect / standard clip
+const RAW360 = /\.(osv|insv)$/i; // proprietary raw — needs DJI/Insta360 stitch first
+const PROXY = /\.(lrf|lrv)$/i; // low-res proxy — preview only, not processed
 const STILL = /\.(jpe?g|png|webp|avif|dng|tiff?|insp)$/i;
 const TELEM = /\.(srt|csv|gpx|json|txt)$/i;
 
 function roleFor(name: string): ProjectFileRole {
+  if (RAW360.test(name)) return "raw";
+  if (PROXY.test(name)) return "proxy";
   if (VIDEO.test(name)) return "video";
   if (STILL.test(name)) return "still";
   if (TELEM.test(name)) return "telemetry";
