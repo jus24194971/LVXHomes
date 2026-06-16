@@ -798,17 +798,20 @@ export function PlanEditor() {
             );
           })}
 
-          {/* committed strokes */}
-          {sheet.strokes?.map((line, i) => (
-            <polyline
-              key={i}
-              points={line.map(([x, y]) => `${x},${y}`).join(" ")}
-              fill="none"
-              stroke={sheet.kind === "floor" ? "#3A3026" : "#6B5D45"}
-              strokeWidth={sheet.width * (sheet.kind === "floor" ? 0.012 : 0.006)}
-              strokeDasharray={sheet.kind === "site" ? `${sheet.width * 0.015} ${sheet.width * 0.012}` : undefined}
-            />
-          ))}
+          {/* committed strokes — walls. Light halo + dark core so they read over a photo base. */}
+          {sheet.strokes?.map((line, i) => {
+            const pts = line.map(([x, y]) => `${x},${y}`).join(" ");
+            const w = Math.max(sheet.width, sheet.height);
+            const dash = sheet.kind === "site" ? `${sheet.width * 0.015} ${sheet.width * 0.012}` : undefined;
+            return (
+              <g key={i}>
+                <polyline points={pts} fill="none" stroke="#FBF8F1" strokeOpacity={0.85}
+                  strokeWidth={w * 0.02} strokeLinejoin="round" strokeLinecap="round" />
+                <polyline points={pts} fill="none" stroke="#1F1812"
+                  strokeWidth={w * 0.009} strokeLinejoin="round" strokeLinecap="round" strokeDasharray={dash} />
+              </g>
+            );
+          })}
 
           {/* draft */}
           {draft.length > 0 && (
