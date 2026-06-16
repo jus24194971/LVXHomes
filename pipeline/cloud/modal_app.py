@@ -453,7 +453,7 @@ def _quat2rot(q):
 @app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=2400)
 def make_ortho(slug: str, video_key: str, pxm: float = 60.0, kf_step: int = 1,
                yflip: int = 1, lonsign: int = 1, cone_deg: float = 55.0,
-               blend: int = 0) -> dict:
+               blend: int = 0, path: int = 0, ceiling_ft: float = 0.0) -> dict:
     """Project each keyframe's downward (nadir) view onto the SLAM floor plane and
     mosaic → a top-down photographic interior 'sat image'. Conventions are flags
     (yflip / lonsign) so we can correct the render without re-running VSLAM."""
@@ -557,12 +557,47 @@ def make_ortho(slug: str, video_key: str, pxm: float = 60.0, kf_step: int = 1,
         img[hit] = (acc[hit] / wsum[hit][..., None]).astype(np.uint8)
     else:
         img = best; hit = bestw > 1e-6
+    import json
+    import time
     out = "/tmp/ortho.jpg"
-    cv2.imwrite(out, cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 90])
+    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    if path:                                   # optionally bake the path into the image too
+        Pc = cams - c
+        a1 = (Pc @ e1 - lo[0]) / (hi[0] - lo[0]) * (W - 1)
+        a2 = (Pc @ e2 - lo[1]) / (hi[1] - lo[1]) * (H - 1)
+        bx = np.clip(a1, 0, W - 1).astype(int); by = np.clip(a2, 0, H - 1).astype(int)
+        for i in range(1, len(bx)):
+            tt = i / len(bx)
+            cv2.line(bgr, (bx[i - 1], by[i - 1]), (bx[i], by[i]),
+                     (45, int(225 * (1 - tt) + 20), int(225 * tt + 20)), 3, cv2.LINE_AA)
+        cv2.circle(bgr, (int(bx[0]), int(by[0])), 11, (90, 210, 90), -1)
+        cv2.circle(bgr, (int(bx[-1]), int(by[-1])), 11, (60, 60, 240), -1)
+    cv2.imwrite(out, bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
     key = f"ortho/{slug}.jpg"
     s3.upload_file(out, R2_BUCKET, key)
-    print(f"[ortho] {slug}: {W}x{H}px from {used} keyframes ({int(hit.mean()*100)}% filled) -> R2 {key}")
-    return {"ortho": key, "px": [W, H], "keyframes_used": used, "filled_pct": int(hit.mean() * 100)}
+
+    # scale + flight path as VECTOR feet-coords (a real toggle-able layer, not baked)
+    hcol = Xc @ up
+    fpu = ceiling_ft / (np.percentile(hcol, 99) - np.percentile(hcol, 1.5)) if ceiling_ft > 0 else 0.0
+    ftw = round(float((hi[0] - lo[0]) * fpu), 1); fth = round(float((hi[1] - lo[1]) * fpu), 1)
+    Pcam = cams - c
+    fxs = (Pcam @ e1 - lo[0]) * fpu; fys = (Pcam @ e2 - lo[1]) * fpu
+    stepf = max(1, len(fxs) // 140)
+    flight = [{"t": int(i), "x": round(float(fxs[i]), 2), "y": round(float(fys[i]), 2)}
+              for i in range(0, len(fxs), stepf)]
+    if fpu > 0:                                # compose a ready-to-load plan (feet + path)
+        plan = {"tourSlug": slug, "sheets": [{
+            "id": "floor-1", "label": slug, "kind": "floor",
+            "width": ftw, "height": fth, "zones": [],
+            "satUrl": f"https://media.lvxhomes.com/{key}?v={int(time.time())}",
+            "paths": {"flight": flight},
+        }]}
+        s3.put_object(Bucket=R2_BUCKET, Key=f"plans/{slug}.plan.json",
+                      Body=json.dumps(plan).encode(), ContentType="application/json")
+    print(f"[ortho] {slug}: {W}x{H}px from {used} keyframes ({int(hit.mean()*100)}% filled), "
+          f"{ftw}x{fth}ft, {len(flight)} path pts -> R2 {key} + plans/{slug}.plan.json")
+    return {"ortho": key, "px": [W, H], "keyframes_used": used, "filled_pct": int(hit.mean() * 100),
+            "ft": [ftw, fth], "flight_pts": len(flight)}
 
 
 @app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=1200)
@@ -663,6 +698,380 @@ def make_dims(slug: str, flight_ft: float = 4.4167, ceiling_ft: float = 0.0,
     }
     print("[dims]", out)
     return out
+
+
+def _read_ply_xyzrgb(path):
+    """Read x,y,z (+ red,green,blue if present) from a PLY → (xyz f32, rgb u8|None)."""
+    import numpy as np
+
+    with open(path, "rb") as f:
+        if f.readline().strip() != b"ply":
+            raise ValueError("not a PLY")
+        fmt, n, props, hlen = b"", 0, [], 1
+        while True:
+            ln = f.readline(); hlen += 1
+            if not ln or ln.strip() == b"end_header":
+                break
+            t = ln.split()
+            if t[0] == b"format":
+                fmt = t[1]
+            elif t[0] == b"element" and t[1] == b"vertex":
+                n = int(t[2])
+            elif t[0] == b"property" and len(t) >= 3:
+                props.append((t[2].decode(), t[1].decode()))
+        tymap = {"float": "<f4", "float32": "<f4", "double": "<f8", "uchar": "u1",
+                 "uint8": "u1", "int": "<i4", "uint": "<u4", "short": "<i2", "ushort": "<u2"}
+        names = [p[0] for p in props]
+
+        def find_rgb(getter):
+            for trip in (("red", "green", "blue"), ("r", "g", "b"), ("diffuse_red", "diffuse_green", "diffuse_blue")):
+                if all(k in names for k in trip):
+                    return np.stack([getter(k) for k in trip], 1).astype("u1")
+            return None
+
+        if fmt == b"ascii":
+            arr = np.loadtxt(path, skiprows=hlen)
+            xyz = arr[:, [names.index("x"), names.index("y"), names.index("z")]].astype("f4")
+            rgb = find_rgb(lambda k: arr[:, names.index(k)])
+            return xyz, rgb
+        dt = np.dtype([(nm, tymap.get(ty, "<f4")) for nm, ty in props])
+        d = np.frombuffer(f.read(n * dt.itemsize), dtype=dt, count=n)
+        xyz = np.stack([d["x"], d["y"], d["z"]], 1).astype("f4")
+        rgb = find_rgb(lambda k: d[k])
+        return xyz, rgb
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=1800)
+def make_topdown(slug: str, ceiling_ft: float = 9.0, pxm: float = 70.0,
+                 ceil_cut: float = 0.86, splat: int = 2) -> dict:
+    """The RIGHT top-down: orthographic z-buffer render of the dense COLORED cloud
+    from straight above, ceiling sliced off. Every surface sits at its true (x,y),
+    so no parallax ghosting; the cloud covers the whole room, so no coverage lobes.
+    A still 'from the floor above'. Overwrites ortho/{slug}.jpg (the plan's base)."""
+    import os
+    import numpy as np
+    import cv2
+
+    s3 = _r2()
+    sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, rgb = _read_ply_xyzrgb(ply)
+    if rgb is None:
+        raise RuntimeError("dense cloud has no per-point color")
+
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False)
+    up = Vt[2].astype("f4")
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = f"{sd}/keyframe_trajectory.txt"
+    if os.path.exists(traj):
+        T = np.loadtxt(traj); cams = T[:, 1:4] if T.ndim > 1 else T[None, 1:4]
+        if np.dot(cams.mean(0) - c, up) < 0:
+            up = -up
+
+    h = X @ up
+    floor = float(np.percentile(h, 1.5)); ceil = float(np.percentile(h, 99))
+    cut = floor + ceil_cut * (ceil - floor)   # slice off the ceiling
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1)
+    e2 = np.cross(up, e1)
+    px = X @ e1; py = X @ e2
+    lo1, hi1 = np.percentile(px, [0.5, 99.5]); lo2, hi2 = np.percentile(py, [0.5, 99.5])
+    W = min(1600, int((hi1 - lo1) * pxm) + 1)
+    H = min(1600, int((hi2 - lo2) * pxm) + 1)
+
+    keep = (h < cut) & (px >= lo1) & (px <= hi1) & (py >= lo2) & (py <= hi2)
+    pxk, pyk, hk, col = px[keep], py[keep], h[keep], rgb[keep]
+    ix = np.clip(((pxk - lo1) / (hi1 - lo1) * (W - 1)), 0, W - 1).astype(np.int64)
+    iy = np.clip(((pyk - lo2) / (hi2 - lo2) * (H - 1)), 0, H - 1).astype(np.int64)
+    cell = iy * W + ix
+    # z-buffer: per cell keep the color of the HIGHEST point (top surface seen from above)
+    order = np.lexsort((hk, cell))
+    cs = cell[order]; cols = col[order]
+    last = np.ones(len(cs), bool)
+    if len(cs) > 1:
+        last[:-1] = cs[1:] != cs[:-1]
+    cells_f = cs[last]; cols_f = cols[last]
+
+    flat = np.zeros((H * W, 3), np.uint8)
+    hit = np.zeros(H * W, bool)
+    flat[cells_f] = cols_f; hit[cells_f] = True
+    img = flat.reshape(H, W, 3); hitm = hit.reshape(H, W)
+    # --- clean: trim stray specks, fill interior holes, denoise ---
+    fm = hit.reshape(H, W).astype(np.uint8)
+    n_lab, lab = cv2.connectedComponents(fm, connectivity=8)
+    if n_lab > 2:
+        sizes = np.bincount(lab.ravel()); sizes[0] = 0
+        big = int(sizes.argmax())
+        stray = (lab != big) & (lab != 0)
+        img[stray] = 0; fm[stray] = 0
+    # fill ONLY small gaps within ~1ft of real data; uncaptured periphery stays black
+    valid = cv2.morphologyEx(fm * 255, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
+    holes = ((valid > 0) & (fm == 0)).astype(np.uint8)
+    img = cv2.inpaint(img, holes, 4, cv2.INPAINT_TELEA)
+    img[valid == 0] = 0
+    img = cv2.medianBlur(img, 3)
+    hitm = valid > 0
+
+    out = "/tmp/topdown.jpg"
+    cv2.imwrite(out, cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 92])
+    s3.upload_file(out, R2_BUCKET, f"ortho/{slug}.jpg")
+    print(f"[topdown] {slug}: {W}x{H} ({int(hitm.mean() * 100)}% filled, {int(keep.sum())} pts below cut) -> R2 ortho/{slug}.jpg")
+    return {"px": [W, H], "filled": int(hitm.mean() * 100), "ortho": f"ortho/{slug}.jpg"}
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=1800)
+def make_walls(slug: str, ceiling_ft: float = 9.0, pxm: float = 60.0) -> dict:
+    """Detect WALLS from the cloud → clean line floorplan. A cell is a wall where the
+    cloud has points in BOTH a low band and a high band (i.e. a surface that runs
+    floor→ceiling). Exterior outline from occupancy; interior walls via Hough. Feet via
+    ceiling calibration. Renders a preview to review BEFORE wiring strokes into the editor."""
+    import os
+    import numpy as np
+    import cv2
+
+    s3 = _r2(); sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False); up = Vt[2].astype("f4")
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = f"{sd}/keyframe_trajectory.txt"
+    if os.path.exists(traj):
+        T = np.loadtxt(traj); cams = T[:, 1:4] if T.ndim > 1 else T[None, 1:4]
+        if np.dot(cams.mean(0) - c, up) < 0:
+            up = -up
+
+    h = X @ up
+    floor = float(np.percentile(h, 1.5)); ceil = float(np.percentile(h, 99))
+    room = ceil - floor
+    fpu = ceiling_ft / room if ceiling_ft > 0 and room > 0 else 1.0
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    px = X @ e1; py = X @ e2
+    lo1, hi1 = np.percentile(px, [0.5, 99.5]); lo2, hi2 = np.percentile(py, [0.5, 99.5])
+    W = min(1400, int((hi1 - lo1) * pxm) + 1); H = min(1400, int((hi2 - lo2) * pxm) + 1)
+    hn = (h - floor) / room
+    inb = (px >= lo1) & (px <= hi1) & (py >= lo2) & (py <= hi2)
+    ix = np.clip(((px - lo1) / (hi1 - lo1) * (W - 1)), 0, W - 1).astype(np.int64)
+    iy = np.clip(((py - lo2) / (hi2 - lo2) * (H - 1)), 0, H - 1).astype(np.int64)
+    cell = iy * W + ix
+
+    def bandmask(a0, a1):
+        m = inb & (hn >= a0) & (hn < a1)
+        g = np.zeros(H * W, bool); g[cell[m]] = True
+        return g.reshape(H, W)
+
+    lo_m = bandmask(0.12, 0.42); hi_m = bandmask(0.60, 0.92)
+    occ = np.zeros(H * W, bool); occ[cell[inb]] = True; occ = occ.reshape(H, W)
+    wall = (lo_m & hi_m).astype(np.uint8) * 255            # full-height cells = walls
+    wall = cv2.morphologyEx(wall, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    wall = cv2.morphologyEx(wall, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats((wall > 0).astype(np.uint8), 8)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < (0.4 * pxm) ** 2:  # drop blobs < ~0.4ft
+            wall[lab == i] = 0
+
+    occu = cv2.morphologyEx(occ.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((19, 19), np.uint8))
+    cnts, _ = cv2.findContours(occu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    prev = np.full((H, W, 3), 248, np.uint8)
+    poly = None
+    if cnts:
+        big = max(cnts, key=cv2.contourArea)
+        poly = cv2.approxPolyDP(big, 0.008 * cv2.arcLength(big, True), True)
+        cv2.polylines(prev, [poly], True, (40, 40, 45), 4)
+    inner = cv2.erode(occu, np.ones((int(0.5 * pxm), int(0.5 * pxm)), np.uint8))
+    interior = cv2.bitwise_and(wall, inner)
+    lines = cv2.HoughLinesP(interior, 1, np.pi / 180, threshold=int(0.6 * pxm),
+                            minLineLength=int(1.5 * pxm), maxLineGap=int(0.6 * pxm))
+    nseg = 0
+    if lines is not None:
+        nseg = len(lines)
+        for l in lines[:, 0, :]:
+            cv2.line(prev, (l[0], l[1]), (l[2], l[3]), (70, 100, 175), 3)
+
+    cv2.imwrite("/tmp/walls.jpg", prev, [cv2.IMWRITE_JPEG_QUALITY, 94])
+    s3.upload_file("/tmp/walls.jpg", R2_BUCKET, f"plan-walls/{slug}.preview.jpg")
+    ftw = round(float((hi1 - lo1) * fpu), 1); fth = round(float((hi2 - lo2) * fpu), 1)
+    print(f"[walls] {slug}: {W}x{H}, outline={'Y' if poly is not None else 'N'}"
+          f"({0 if poly is None else len(poly)}pts), {nseg} interior segs, {ftw}x{fth}ft")
+    return {"px": [W, H], "outline_pts": 0 if poly is None else int(len(poly)),
+            "interior_segs": int(nseg), "ft": [ftw, fth],
+            "preview": f"plan-walls/{slug}.preview.jpg"}
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=900)
+def make_path(slug: str, ceiling_ft: float = 9.0, pxm: float = 60.0, rooms: str = "") -> dict:
+    """Trace the drone PATH (VSLAM trajectory) top-down over the footprint outline:
+    green->red by time, start/end marked, dwell stops detected and labeled in the given
+    room sequence. `rooms` = comma-separated room names, in flight order."""
+    import os
+    import numpy as np
+    import cv2
+
+    s3 = _r2(); sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = f"{sd}/keyframe_trajectory.txt"
+    T = np.loadtxt(traj)
+    cams = T[:, 1:4] if T.ndim > 1 else T[None, 1:4]    # tx ty tz, time order
+
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False); up = Vt[2].astype("f4")
+    if np.dot(cams.mean(0) - c, up) < 0:
+        up = -up
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    px = X @ e1; py = X @ e2
+    lo1, hi1 = np.percentile(px, [0.5, 99.5]); lo2, hi2 = np.percentile(py, [0.5, 99.5])
+    W = min(1400, int((hi1 - lo1) * pxm) + 1); H = min(1400, int((hi2 - lo2) * pxm) + 1)
+
+    inb = (px >= lo1) & (px <= hi1) & (py >= lo2) & (py <= hi2)
+    ix = np.clip(((px - lo1) / (hi1 - lo1) * (W - 1)), 0, W - 1).astype(int)[inb]
+    iy = np.clip(((py - lo2) / (hi2 - lo2) * (H - 1)), 0, H - 1).astype(int)[inb]
+    occ = np.zeros((H, W), np.uint8); occ[iy, ix] = 255
+    occ = cv2.morphologyEx(occ, cv2.MORPH_CLOSE, np.ones((19, 19), np.uint8))
+    cnts, _ = cv2.findContours(occ, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    prev = np.full((H, W, 3), 250, np.uint8)
+    if cnts:
+        big = max(cnts, key=cv2.contourArea)
+        poly = cv2.approxPolyDP(big, 0.008 * cv2.arcLength(big, True), True)
+        cv2.polylines(prev, [poly], True, (205, 205, 210), 3)
+
+    Pc = cams - c
+    a1 = (Pc @ e1 - lo1) / (hi1 - lo1) * (W - 1)
+    a2 = (Pc @ e2 - lo2) / (hi2 - lo2) * (H - 1)
+    pxs = np.clip(a1, 0, W - 1).astype(int); pys = np.clip(a2, 0, H - 1).astype(int)
+    n = len(pxs)
+    for i in range(1, n):
+        t = i / n
+        col = (40, int(210 * (1 - t) + 20), int(210 * t + 20))   # BGR: green -> red
+        cv2.line(prev, (pxs[i - 1], pys[i - 1]), (pxs[i], pys[i]), col, 3, cv2.LINE_AA)
+    cv2.circle(prev, (int(pxs[0]), int(pys[0])), 11, (70, 190, 70), -1)
+    cv2.circle(prev, (int(pxs[-1]), int(pys[-1])), 11, (60, 60, 230), -1)
+
+    d = np.r_[0.0, np.hypot(np.diff(pxs.astype(float)), np.diff(pys.astype(float)))]
+    spd = np.convolve(d, np.ones(15) / 15, mode="same")
+    slow = spd < (np.median(spd) * 0.5 + 1e-6)
+    stops = []
+    i = 0
+    while i < n:
+        if slow[i]:
+            j = i
+            while j < n and slow[j]:
+                j += 1
+            if j - i > 18:
+                stops.append((int(np.mean(pxs[i:j])), int(np.mean(pys[i:j]))))
+            i = j
+        else:
+            i += 1
+    labels = [r.strip() for r in rooms.split(",") if r.strip()]
+    for k, (cx, cy) in enumerate(stops):
+        cv2.circle(prev, (cx, cy), 6, (30, 30, 30), -1)
+        if k < len(labels):                       # only label when names are given
+            cv2.putText(prev, labels[k], (cx + 10, cy + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+                        (255, 255, 255), 4, cv2.LINE_AA)
+            cv2.putText(prev, labels[k], (cx + 10, cy + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+                        (25, 25, 30), 2, cv2.LINE_AA)
+
+    cv2.imwrite("/tmp/path.jpg", prev, [cv2.IMWRITE_JPEG_QUALITY, 94])
+    s3.upload_file("/tmp/path.jpg", R2_BUCKET, f"plan-walls/{slug}.path.jpg")
+    print(f"[path] {slug}: {n} poses, {len(stops)} dwell stops, {len(labels)} labels")
+    return {"poses": int(n), "stops": len(stops), "labels": len(labels),
+            "preview": f"plan-walls/{slug}.path.jpg"}
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=1800)
+def make_overlay(slug: str, ceiling_ft: float = 9.0, pxm: float = 60.0,
+                 ceil_cut: float = 0.86, dim: float = 0.82) -> dict:
+    """The flat top-down PHOTO (colored cloud z-buffer) with the drone PATH drawn on top —
+    same basis/extent so they register exactly. The visual + the journey in one image to
+    break rooms up from. -> plan-walls/{slug}.overlay.jpg"""
+    import os
+    import numpy as np
+    import cv2
+
+    s3 = _r2(); sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, rgb = _read_ply_xyzrgb(ply)
+    if rgb is None:
+        raise RuntimeError("dense cloud has no per-point color")
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = f"{sd}/keyframe_trajectory.txt"
+    T = np.loadtxt(traj); cams = T[:, 1:4] if T.ndim > 1 else T[None, 1:4]
+
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False); up = Vt[2].astype("f4")
+    if np.dot(cams.mean(0) - c, up) < 0:
+        up = -up
+    hgt = X @ up
+    floor = float(np.percentile(hgt, 1.5)); ceil = float(np.percentile(hgt, 99))
+    cut = floor + ceil_cut * (ceil - floor)
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    px = X @ e1; py = X @ e2
+    lo1, hi1 = np.percentile(px, [0.5, 99.5]); lo2, hi2 = np.percentile(py, [0.5, 99.5])
+    W = min(1600, int((hi1 - lo1) * pxm) + 1); H = min(1600, int((hi2 - lo2) * pxm) + 1)
+
+    # --- top-down z-buffer photo (max-height color per cell, ceiling sliced) ---
+    keep = (hgt < cut) & (px >= lo1) & (px <= hi1) & (py >= lo2) & (py <= hi2)
+    pxk, pyk, hk, col = px[keep], py[keep], hgt[keep], rgb[keep]
+    ix = np.clip(((pxk - lo1) / (hi1 - lo1) * (W - 1)), 0, W - 1).astype(np.int64)
+    iy = np.clip(((pyk - lo2) / (hi2 - lo2) * (H - 1)), 0, H - 1).astype(np.int64)
+    cell = iy * W + ix
+    order = np.lexsort((hk, cell))
+    cs = cell[order]; cols = col[order]
+    last = np.ones(len(cs), bool)
+    if len(cs) > 1:
+        last[:-1] = cs[1:] != cs[:-1]
+    flat = np.zeros((H * W, 3), np.uint8); hit = np.zeros(H * W, bool)
+    flat[cs[last]] = cols[last]; hit[cs[last]] = True
+    img = flat.reshape(H, W, 3); fm = hit.reshape(H, W).astype(np.uint8)
+    n_lab, lab = cv2.connectedComponents(fm, 8)
+    if n_lab > 2:
+        sizes = np.bincount(lab.ravel()); sizes[0] = 0
+        big = int(sizes.argmax()); stray = (lab != big) & (lab != 0)
+        img[stray] = 0; fm[stray] = 0
+    valid = cv2.morphologyEx(fm * 255, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
+    holes = ((valid > 0) & (fm == 0)).astype(np.uint8)
+    img = cv2.inpaint(img, holes, 4, cv2.INPAINT_TELEA)
+    img[valid == 0] = 0
+    img = cv2.medianBlur(img, 3)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    img = (img * dim).astype(np.uint8)                    # dim so the path pops
+
+    # --- drone path on top ---
+    Pc = cams - c
+    a1 = (Pc @ e1 - lo1) / (hi1 - lo1) * (W - 1)
+    a2 = (Pc @ e2 - lo2) / (hi2 - lo2) * (H - 1)
+    pxs = np.clip(a1, 0, W - 1).astype(int); pys = np.clip(a2, 0, H - 1).astype(int)
+    n = len(pxs)
+    for i in range(1, n):
+        t = i / n
+        colr = (45, int(225 * (1 - t) + 20), int(225 * t + 20))    # BGR green->red
+        cv2.line(img, (pxs[i - 1], pys[i - 1]), (pxs[i], pys[i]), colr, 3, cv2.LINE_AA)
+    cv2.circle(img, (int(pxs[0]), int(pys[0])), 11, (90, 210, 90), -1)
+    cv2.circle(img, (int(pxs[-1]), int(pys[-1])), 11, (60, 60, 240), -1)
+
+    cv2.imwrite("/tmp/overlay.jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    s3.upload_file("/tmp/overlay.jpg", R2_BUCKET, f"plan-walls/{slug}.overlay.jpg")
+    print(f"[overlay] {slug}: {W}x{H}, photo+path, {n} poses, "
+          f"{int((valid > 0).mean() * 100)}% photo -> R2 plan-walls/{slug}.overlay.jpg")
+    return {"px": [W, H], "poses": int(n), "preview": f"plan-walls/{slug}.overlay.jpg"}
 
 
 @app.local_entrypoint()

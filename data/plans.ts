@@ -61,6 +61,10 @@ export type PlanSheet = {
    *  the Studio stitches it from the bbox, and both the Studio and the player
    *  minimap render the flight path + amenity dots over it. */
   satUrl?: string;
+  /** Degrees to rotate the base image + drawn content for display — straightens
+   *  a diagonally-captured floorplan. Drawing accounts for it; the viewer applies
+   *  the same rotation so zones stay locked to the image. */
+  rotation?: number;
 };
 
 export type Plan = {

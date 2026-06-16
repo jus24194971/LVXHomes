@@ -66,6 +66,8 @@ export function PlanEditor() {
   const [satLoading, setSatLoading] = useState(false);
   const [view, setView] = useState({ x: -2, y: -2, w: 104, h: 74 }); // zoom/pan viewBox
   const [panMode, setPanMode] = useState(false); // hold Space to pan
+  const [showPath, setShowPath] = useState(true); // toggle the flight-path layer
+  const [clip, setClip] = useState(false); // trim the base image to drawn walls/zones
 
   const svgRef = useRef<SVGSVGElement>(null);
   const dragRef = useRef<Drag>(null);
@@ -97,21 +99,29 @@ export function PlanEditor() {
     [sheetIdx],
   );
 
-  /** Client coords → snapped plan units. */
+  /** Client coords → snapped plan units, un-rotating the content group so drawing
+   *  lands in the same frame as the (rotated) image. */
   const toPlan = useCallback((e: { clientX: number; clientY: number }): [number, number] => {
     const svg = svgRef.current;
     if (!svg) return [0, 0];
     const m = svg.getScreenCTM();
     if (!m) return [0, 0];
     const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(m.inverse());
-    return [snap(p.x), snap(p.y)];
-  }, []);
+    const rot = sheet?.rotation ?? 0;
+    if (!rot) return [snap(p.x), snap(p.y)];
+    const cx = (sheet?.width ?? 0) / 2, cy = (sheet?.height ?? 0) / 2;
+    const a = (rot * Math.PI) / 180, dx = p.x - cx, dy = p.y - cy;
+    return [snap(cx + dx * Math.cos(a) + dy * Math.sin(a)), snap(cy - dx * Math.sin(a) + dy * Math.cos(a))];
+  }, [sheet?.rotation, sheet?.width, sheet?.height]);
 
   // ---------- zoom / pan (viewBox-driven; toPlan stays exact via getScreenCTM) ----------
-  const fitView = useCallback(
-    () => ({ x: -2, y: -2, w: (sheet?.width ?? 100) + 4, h: (sheet?.height ?? 70) + 4 }),
-    [sheet?.width, sheet?.height],
-  );
+  const fitView = useCallback(() => {
+    const w = sheet?.width ?? 100, h = sheet?.height ?? 70;
+    const a = ((sheet?.rotation ?? 0) * Math.PI) / 180;
+    const bw = Math.abs(w * Math.cos(a)) + Math.abs(h * Math.sin(a)); // rotated bbox
+    const bh = Math.abs(w * Math.sin(a)) + Math.abs(h * Math.cos(a));
+    return { x: w / 2 - bw / 2 - 2, y: h / 2 - bh / 2 - 2, w: bw + 4, h: bh + 4 };
+  }, [sheet?.width, sheet?.height, sheet?.rotation]);
   // refit when switching sheets
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { setView(fitView()); }, [sheetIdx, sheet?.id]);
@@ -590,6 +600,37 @@ export function PlanEditor() {
               </label>
             </>
           )}
+          {sheet.satUrl && (
+            <>
+              <span className="flex items-center gap-1">
+                <button type="button" title="Rotate left 5°"
+                  onClick={() => mutateSheet((s) => ({ ...s, rotation: Math.round(((s.rotation ?? 0) - 5) * 10) / 10 }))}
+                  className="rounded border border-paper/30 px-2 py-1.5 text-paper/70 hover:border-champagne/60 hover:text-champagne">⟲</button>
+                <button type="button" title="Rotate right 5°"
+                  onClick={() => mutateSheet((s) => ({ ...s, rotation: Math.round(((s.rotation ?? 0) + 5) * 10) / 10 }))}
+                  className="rounded border border-paper/30 px-2 py-1.5 text-paper/70 hover:border-champagne/60 hover:text-champagne">⟳</button>
+                {(sheet.rotation ?? 0) !== 0 && (
+                  <button type="button" title="Reset rotation"
+                    onClick={() => mutateSheet((s) => ({ ...s, rotation: 0 }))}
+                    className="rounded border border-paper/30 px-2 py-1.5 font-sans text-[0.6rem] tabular-nums tracking-[0.1em] text-paper/60 hover:text-champagne">{Math.round(sheet.rotation ?? 0)}°</button>
+                )}
+              </span>
+              <button type="button"
+                onClick={() => setClip((c) => !c)}
+                className={cn(
+                  "rounded border px-3 py-1.5 font-sans text-[0.6875rem] uppercase tracking-[0.14em] transition-colors",
+                  clip ? "border-champagne bg-champagne text-ink" : "border-paper/30 text-paper/70 hover:border-champagne/60 hover:text-champagne",
+                )}>Trim to walls</button>
+            </>
+          )}
+          {sheet.paths && Object.keys(sheet.paths).length > 0 && (
+            <button type="button"
+              onClick={() => setShowPath((p) => !p)}
+              className={cn(
+                "rounded border px-3 py-1.5 font-sans text-[0.6875rem] uppercase tracking-[0.14em] transition-colors",
+                showPath ? "border-champagne bg-champagne text-ink" : "border-paper/30 text-paper/70 hover:border-champagne/60 hover:text-champagne",
+              )}>Flight path</button>
+          )}
           <span className="ml-auto font-sans text-[0.625rem] uppercase tracking-[0.14em] text-paper/40">
             Scroll = zoom · Double-click = fit · Space-drag = pan · Enter closes · Del removes · Ctrl+Z
           </span>
@@ -619,7 +660,22 @@ export function PlanEditor() {
           </defs>
           <rect x={0} y={0} width={sheet.width} height={sheet.height} fill="url(#grid)" stroke="#CBBC9C" strokeWidth={0.3} />
 
-          {/* satellite base (georeferenced grounds) */}
+          {/* clip mask from drawn walls/zones — "Trim to walls" crops the base to it */}
+          <defs>
+            <clipPath id="planclip" clipPathUnits="userSpaceOnUse">
+              {sheet.zones.map((z) => (
+                <polygon key={z.id} points={z.points.map(([x, y]) => `${x},${y}`).join(" ")} />
+              ))}
+              {sheet.strokes?.map((line, i) => (
+                <polygon key={`s${i}`} points={line.map(([x, y]) => `${x},${y}`).join(" ")} />
+              ))}
+            </clipPath>
+          </defs>
+
+          {/* rotatable content (base image + flight path + zones + walls + draft) */}
+          <g transform={`rotate(${sheet.rotation ?? 0} ${sheet.width / 2} ${sheet.height / 2})`}>
+
+          {/* base image (satellite / orthomosaic / SLAM top-down) */}
           {sheet.satUrl && (
             <image
               href={sheet.satUrl}
@@ -628,6 +684,11 @@ export function PlanEditor() {
               width={sheet.width}
               height={sheet.height}
               preserveAspectRatio="none"
+              clipPath={
+                clip && (sheet.zones.length > 0 || (sheet.strokes?.length ?? 0) > 0)
+                  ? "url(#planclip)"
+                  : undefined
+              }
             />
           )}
 
@@ -643,21 +704,24 @@ export function PlanEditor() {
             />
           )}
 
-          {/* flight path (read-only context from GPS/VSLAM) — smoothed */}
-          {sheet.paths &&
+          {/* flight path (read-only context from GPS/VSLAM) — smoothed, toggle-able */}
+          {showPath &&
+            sheet.paths &&
             Object.values(sheet.paths).map((keys, ci) =>
               keys.length > 1 ? (
-                <path
-                  key={`path-${ci}`}
-                  d={smoothPathD(keys)}
-                  fill="none"
-                  stroke="#B7995C"
-                  strokeOpacity={0.7}
-                  strokeWidth={Math.max(sheet.width, sheet.height) * 0.004}
-                  strokeLinejoin="round"
-                  strokeLinecap="round"
-                  className="pointer-events-none"
-                />
+                <g key={`path-${ci}`} className="pointer-events-none">
+                  <path
+                    d={smoothPathD(keys)}
+                    fill="none"
+                    stroke="#B7995C"
+                    strokeOpacity={0.85}
+                    strokeWidth={Math.max(sheet.width, sheet.height) * 0.005}
+                    strokeLinejoin="round"
+                    strokeLinecap="round"
+                  />
+                  <circle cx={keys[0].x} cy={keys[0].y} r={Math.max(sheet.width, sheet.height) * 0.011} fill="#4CAF50" />
+                  <circle cx={keys[keys.length - 1].x} cy={keys[keys.length - 1].y} r={Math.max(sheet.width, sheet.height) * 0.011} fill="#E0533D" />
+                </g>
               ) : null,
             )}
 
@@ -735,6 +799,7 @@ export function PlanEditor() {
               ))}
             </g>
           )}
+          </g>
         </svg>
       </div>
 
