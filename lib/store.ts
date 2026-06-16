@@ -578,3 +578,10 @@ export async function deleteProjectFile(id: string): Promise<void> {
   if (!db) throw new Error("D1 binding 'DB' is not available");
   await db.prepare("DELETE FROM project_file WHERE id = ?").bind(id).run();
 }
+
+/** Re-tag a file's role — e.g. promote a pano to `hero` (a tour zoom-point). */
+export async function setProjectFileRole(id: string, role: ProjectFileRole): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("D1 binding 'DB' is not available");
+  await db.prepare("UPDATE project_file SET role = ? WHERE id = ?").bind(role, id).run();
+}

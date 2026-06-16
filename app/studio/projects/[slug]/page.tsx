@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { Container } from "@/components/ui/container";
 
-type Role = "video" | "still" | "telemetry" | "other";
+type Role = "video" | "still" | "hero" | "telemetry" | "proxy" | "raw" | "other";
 type ProjectFile = {
   id: string;
   role: Role;
@@ -18,11 +18,14 @@ type Job = { id: string; status: string; error: string | null };
 
 const ROLE_LABEL: Record<Role, string> = {
   video: "360 video",
-  still: "Stills",
+  hero: "Hero rooms · tour zoom-points",
+  still: "Stills · floorplan stitch",
   telemetry: "Positioning data",
+  proxy: "Low-res proxy",
+  raw: "Raw 360 · needs DJI export",
   other: "Other",
 };
-const ROLE_ORDER: Role[] = ["video", "still", "telemetry", "other"];
+const ROLE_ORDER: Role[] = ["video", "hero", "still", "telemetry", "proxy", "raw", "other"];
 
 const fmtBytes = (b: number | null) =>
   b == null ? "" : b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(0)} MB` : `${(b / 1e3).toFixed(0)} KB`;
@@ -108,20 +111,36 @@ export default function ProjectDetail() {
     poll(d.jobId);
   }
 
+  async function setRole(fileId: string, role: Role) {
+    await fetch(`/studio/api/projects/${slug}/files`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileId, role }),
+    }).catch(() => {});
+    void load();
+  }
+
   // --- missing-files alerts (your "alert on missing files" for a 360 upload) ---
   const hasVideo = files.some((f) => f.role === "video");
   const hasTelem = files.some((f) => f.role === "telemetry");
-  const hasStill = files.some((f) => f.role === "still");
+  const hasStill = files.some((f) => f.role === "still" || f.role === "hero");
+  const hasRaw = files.some((f) => f.role === "raw");
   const alerts: { tone: "warn" | "info" | "note"; text: string }[] = [];
-  if (!hasVideo)
-    alerts.push({ tone: "info", text: "Add a 360 video — it's what gets processed into the map + floor." });
+  if (hasRaw)
+    alerts.push({
+      tone: "warn",
+      text: "Raw .osv / .insv can't be processed directly — export the equirect MP4 in DJI Studio and upload that. Everything else here still processes.",
+    });
+  if (!hasVideo && !hasStill)
+    alerts.push({ tone: "info", text: "Add a 360 video (→ map + floor) or dedicated nadir stills (→ orthomosaic) to process." });
   if (hasVideo && !hasTelem)
     alerts.push({
       tone: "warn",
       text: "No positioning data (.SRT) for this video. Without it the GPS map and flight path can't be built, and VSLAM runs scale-free — add the drone's .SRT.",
     });
   if (hasVideo && !hasStill)
-    alerts.push({ tone: "note", text: "No stills uploaded — 360 detail points will fall back to video frames." });
+    alerts.push({ tone: "note", text: "No stills tagged — 360 detail points fall back to video frames. Mark room panos hero below." });
 
   const toneCls: Record<string, string> = {
     warn: "border-amber-400/40 bg-amber-400/[0.06] text-amber-200/90",
@@ -194,9 +213,25 @@ export default function ProjectDetail() {
                   {files
                     .filter((f) => f.role === role)
                     .map((f) => (
-                      <li key={f.id} className="flex justify-between font-sans text-sm text-paper/75">
+                      <li key={f.id} className="flex items-center justify-between gap-3 font-sans text-sm text-paper/75">
                         <span className="truncate">{f.filename}</span>
-                        <span className="ml-3 shrink-0 text-paper/35">{fmtBytes(f.bytes)}</span>
+                        <span className="flex shrink-0 items-center gap-3">
+                          {(f.role === "still" || f.role === "hero") && (
+                            <button
+                              type="button"
+                              onClick={() => setRole(f.id, f.role === "hero" ? "still" : "hero")}
+                              className={
+                                "rounded-full border px-2.5 py-0.5 text-[0.65rem] uppercase tracking-[0.12em] transition-colors " +
+                                (f.role === "hero"
+                                  ? "border-champagne bg-champagne/15 text-champagne"
+                                  : "border-paper/25 text-paper/50 hover:border-champagne/60 hover:text-champagne")
+                              }
+                            >
+                              {f.role === "hero" ? "★ Hero" : "Make hero"}
+                            </button>
+                          )}
+                          <span className="text-paper/35">{fmtBytes(f.bytes)}</span>
+                        </span>
                       </li>
                     ))}
                 </ul>
@@ -210,7 +245,7 @@ export default function ProjectDetail() {
         <button
           type="button"
           onClick={process}
-          disabled={!hasVideo || busy}
+          disabled={(!hasVideo && !hasStill) || busy}
           className="rounded-full border border-champagne/60 bg-champagne/[0.06] px-5 py-2 font-sans text-xs uppercase tracking-[0.16em] text-champagne transition-colors hover:bg-champagne/[0.12] disabled:cursor-not-allowed disabled:opacity-40"
         >
           {busy ? "Processing…" : "Process in cloud"}
