@@ -65,6 +65,9 @@ export type PlanSheet = {
    *  a diagonally-captured floorplan. Drawing accounts for it; the viewer applies
    *  the same rotation so zones stay locked to the image. */
   rotation?: number;
+  /** Mirror the base image + content across the vertical axis — corrects a
+   *  handedness-flipped orthomosaic. Composes with rotation; drawing accounts for it. */
+  flipX?: boolean;
 };
 
 export type Plan = {

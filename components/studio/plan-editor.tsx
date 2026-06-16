@@ -107,12 +107,18 @@ export function PlanEditor() {
     const m = svg.getScreenCTM();
     if (!m) return [0, 0];
     const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(m.inverse());
-    const rot = sheet?.rotation ?? 0;
-    if (!rot) return [snap(p.x), snap(p.y)];
+    const rot = sheet?.rotation ?? 0, flip = sheet?.flipX ?? false;
+    if (!rot && !flip) return [snap(p.x), snap(p.y)];
     const cx = (sheet?.width ?? 0) / 2, cy = (sheet?.height ?? 0) / 2;
-    const a = (rot * Math.PI) / 180, dx = p.x - cx, dy = p.y - cy;
-    return [snap(cx + dx * Math.cos(a) + dy * Math.sin(a)), snap(cy - dx * Math.sin(a) + dy * Math.cos(a))];
-  }, [sheet?.rotation, sheet?.width, sheet?.height]);
+    let rx = p.x, ry = p.y;
+    if (rot) {
+      const a = (rot * Math.PI) / 180, dx = p.x - cx, dy = p.y - cy;
+      rx = cx + dx * Math.cos(a) + dy * Math.sin(a);
+      ry = cy - dx * Math.sin(a) + dy * Math.cos(a);
+    }
+    if (flip) rx = 2 * cx - rx; // un-mirror so drawing lands in the flipped frame
+    return [snap(rx), snap(ry)];
+  }, [sheet?.rotation, sheet?.flipX, sheet?.width, sheet?.height]);
 
   // ---------- zoom / pan (viewBox-driven; toPlan stays exact via getScreenCTM) ----------
   const fitView = useCallback(() => {
@@ -616,6 +622,12 @@ export function PlanEditor() {
                 )}
               </span>
               <button type="button"
+                onClick={() => mutateSheet((s) => ({ ...s, flipX: !s.flipX }))}
+                className={cn(
+                  "rounded border px-3 py-1.5 font-sans text-[0.6875rem] uppercase tracking-[0.14em] transition-colors",
+                  sheet.flipX ? "border-champagne bg-champagne text-ink" : "border-paper/30 text-paper/70 hover:border-champagne/60 hover:text-champagne",
+                )}>Flip</button>
+              <button type="button"
                 onClick={() => setClip((c) => !c)}
                 className={cn(
                   "rounded border px-3 py-1.5 font-sans text-[0.6875rem] uppercase tracking-[0.14em] transition-colors",
@@ -672,8 +684,17 @@ export function PlanEditor() {
             </clipPath>
           </defs>
 
-          {/* rotatable content (base image + flight path + zones + walls + draft) */}
-          <g transform={`rotate(${sheet.rotation ?? 0} ${sheet.width / 2} ${sheet.height / 2})`}>
+          {/* rotatable + flippable content (base image + flight path + zones + walls + draft) */}
+          <g
+            transform={
+              [
+                (sheet.rotation ?? 0) ? `rotate(${sheet.rotation} ${sheet.width / 2} ${sheet.height / 2})` : "",
+                sheet.flipX ? `translate(${sheet.width} 0) scale(-1 1)` : "",
+              ]
+                .filter(Boolean)
+                .join(" ") || undefined
+            }
+          >
 
           {/* base image (satellite / orthomosaic / SLAM top-down) */}
           {sheet.satUrl && (
