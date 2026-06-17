@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { Container } from "@/components/ui/container";
 
-type Role = "video" | "still" | "hero" | "telemetry" | "proxy" | "raw" | "other";
+type Role = "video" | "nadir" | "still" | "hero" | "telemetry" | "proxy" | "raw" | "other";
 type ProjectFile = {
   id: string;
   role: Role;
@@ -17,7 +17,8 @@ type Project = { id: string; slug: string; title: string; status: string };
 type Job = { id: string; status: string; error: string | null };
 
 const ROLE_LABEL: Record<Role, string> = {
-  video: "360 video",
+  video: "Cinematic 360 · tour",
+  nadir: "Nadir pass · floorplan + dimensions",
   hero: "Hero rooms · tour zoom-points",
   still: "Stills · floorplan stitch",
   telemetry: "Positioning data",
@@ -25,7 +26,7 @@ const ROLE_LABEL: Record<Role, string> = {
   raw: "Raw 360 · needs DJI export",
   other: "Other",
 };
-const ROLE_ORDER: Role[] = ["video", "hero", "still", "telemetry", "proxy", "raw", "other"];
+const ROLE_ORDER: Role[] = ["video", "nadir", "hero", "still", "telemetry", "proxy", "raw", "other"];
 
 const fmtBytes = (b: number | null) =>
   b == null ? "" : b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(0)} MB` : `${(b / 1e3).toFixed(0)} KB`;
@@ -216,6 +217,21 @@ export default function ProjectDetail() {
                       <li key={f.id} className="flex items-center justify-between gap-3 font-sans text-sm text-paper/75">
                         <span className="truncate">{f.filename}</span>
                         <span className="flex shrink-0 items-center gap-3">
+                          {(f.role === "video" || f.role === "nadir") && (
+                            <button
+                              type="button"
+                              onClick={() => setRole(f.id, f.role === "nadir" ? "video" : "nadir")}
+                              title="Tag the down-facing pass that builds the floorplan + dimensions"
+                              className={
+                                "rounded-full border px-2.5 py-0.5 text-[0.65rem] uppercase tracking-[0.12em] transition-colors " +
+                                (f.role === "nadir"
+                                  ? "border-champagne bg-champagne/15 text-champagne"
+                                  : "border-paper/25 text-paper/50 hover:border-champagne/60 hover:text-champagne")
+                              }
+                            >
+                              {f.role === "nadir" ? "▦ Floorplan pass" : "Mark floorplan pass"}
+                            </button>
+                          )}
                           {(f.role === "still" || f.role === "hero") && (
                             <button
                               type="button"

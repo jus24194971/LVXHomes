@@ -27,10 +27,12 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ slug: stri
     );
   }
   const files = await listProjectFiles(project.id);
-  const video = files.find((f) => f.role === "video");
+  const cinematic = files.find((f) => f.role === "video"); // the immersive tour walkthrough
+  const nadir = files.find((f) => f.role === "nadir");     // the dedicated down-facing floorplan pass
+  const floorVideo = nadir ?? cinematic; // floorplan/VSLAM runs on the nadir pass when present; else the cinematic (1112 demo)
   const stills = files.filter((f) => f.role === "still");
   const raw = files.filter((f) => f.role === "raw");
-  if (!video && stills.length === 0) {
+  if (!floorVideo && stills.length === 0) {
     const hint =
       raw.length > 0
         ? "Those .osv files are raw 360 — export the equirect MP4 in DJI Studio, then upload that."
@@ -42,7 +44,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ slug: stri
   await createVslamJob({
     id,
     slug: project.slug,
-    r2_key: video?.r2_key ?? stills[0]?.r2_key ?? "",
+    r2_key: floorVideo?.r2_key ?? stills[0]?.r2_key ?? "",
     status: "processing",
     created_by: email,
   });
@@ -56,7 +58,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ slug: stri
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         slug: project.slug,
-        video_key: video?.r2_key,
+        video_key: floorVideo?.r2_key,        // floorplan source: nadir pass preferred
+        cinematic_key: cinematic?.r2_key,     // the tour walkthrough (for path/context)
+        is_nadir: !!nadir,                    // true once a dedicated nadir pass exists
         still_keys: stills.map((s) => s.r2_key),
         ceiling_ft: 9,
         token: env.VSLAM_CALLBACK_TOKEN ?? "",

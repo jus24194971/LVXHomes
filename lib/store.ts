@@ -448,7 +448,7 @@ export type ProjectStatus = "draft" | "processing" | "review" | "published";
 // hero = designated room pano → tour zoom-point · telemetry = SRT/GPS ·
 // proxy = .lrf/.lrv low-res (preview only) · raw = .osv/.insv (needs vendor stitch first)
 export type ProjectFileRole =
-  | "video" | "still" | "hero" | "telemetry" | "proxy" | "raw" | "other";
+  | "video" | "nadir" | "still" | "hero" | "telemetry" | "proxy" | "raw" | "other";
 
 export type Project = {
   id: string;
