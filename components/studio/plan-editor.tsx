@@ -750,9 +750,7 @@ export function PlanEditor() {
 
           {/* zones */}
           {sheet.zones.map((z, zi) => {
-            const [cx, cy] = centroid(z.points);
             const selected = zi === selZone;
-            const fs = zoneFontSize(z.points, z.label, labelSize, labelSize * 0.34);
             return (
               <g key={z.id}>
                 <path
@@ -770,13 +768,6 @@ export function PlanEditor() {
                     dragRef.current = { type: "zone", zi, start: toPlan(e), orig: z.points.map((p) => [...p] as [number, number]) };
                   }}
                 />
-                <text
-                  x={cx} y={cy} textAnchor="middle" dominantBaseline="central"
-                  fontSize={fs} letterSpacing={fs * 0.1}
-                  fill="#6B5D45" className="pointer-events-none select-none font-sans uppercase"
-                >
-                  {z.label}
-                </text>
                 {selected && tool === "select" &&
                   z.points.map(([x, y], vi) => (
                     <circle
@@ -826,6 +817,31 @@ export function PlanEditor() {
             </g>
           )}
           </g>
+
+          {/* zone labels — drawn OUTSIDE the rotate/flip group, at each room's screen
+              position, so they stay upright and readable no matter the sheet rotation */}
+          {sheet.zones.map((z) => {
+            const [cx, cy] = centroid(z.points);
+            const fs = zoneFontSize(z.points, z.label, labelSize, labelSize * 0.34);
+            const rotg = sheet.rotation ?? 0, flg = sheet.flipX ?? false;
+            let lx = cx, ly = cy;
+            if (rotg) {
+              const a = (rotg * Math.PI) / 180, hx = sheet.width / 2, hy = sheet.height / 2;
+              const dx = cx - hx, dy = cy - hy;
+              lx = hx + dx * Math.cos(a) - dy * Math.sin(a);
+              ly = hy + dx * Math.sin(a) + dy * Math.cos(a);
+            }
+            if (flg) lx = sheet.width - lx;
+            return (
+              <text
+                key={`lbl-${z.id}`} x={lx} y={ly} textAnchor="middle" dominantBaseline="central"
+                fontSize={fs} letterSpacing={fs * 0.1}
+                fill="#6B5D45" className="pointer-events-none select-none font-sans uppercase"
+              >
+                {z.label}
+              </text>
+            );
+          })}
         </svg>
       </div>
 
