@@ -1122,6 +1122,798 @@ def stitch_stills(slug: str, keys_csv: str, ceiling_ft: float = 9.0) -> dict:
     return {"ortho": key, "px": [int(pano.shape[1]), int(pano.shape[0])], "stills": len(imgs)}
 
 
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=900)
+def add_walls(slug: str, ceiling_ft: float = 9.0, pxm: float = 60.0) -> dict:
+    """Detect walls from the cloud and MERGE them into {slug}'s plan as editable
+    stroke lines — the structure the nadir photo can't show (exterior/back walls +
+    interior dividers). Uses the SAME [1,99] frame + ceiling scale as make_ortho, so
+    the lines register exactly on the photo. Cloud-only (no video) → fast."""
+    import os
+    import json
+    import numpy as np
+    import cv2
+
+    s3 = _r2(); sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False); up = Vt[2].astype("f4")
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = f"{sd}/keyframe_trajectory.txt"
+    if os.path.exists(traj):
+        T = np.loadtxt(traj); cams = T[:, 1:4] if T.ndim > 1 else T[None, 1:4]
+        if np.dot(cams.mean(0) - c, up) < 0:
+            up = -up
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    px = X @ e1; py = X @ e2; h = X @ up
+    lo1, hi1 = np.percentile(px, [1, 99]); lo2, hi2 = np.percentile(py, [1, 99])   # MATCH make_ortho
+    floor = float(np.percentile(h, 1.5)); ceil = float(np.percentile(h, 99)); room = ceil - floor
+    fpu = ceiling_ft / room if room > 0 else 1.0
+    ftw = (hi1 - lo1) * fpu; fth = (hi2 - lo2) * fpu
+    W = min(1400, int((hi1 - lo1) * pxm) + 1); H = min(1400, int((hi2 - lo2) * pxm) + 1)
+    hn = (h - floor) / room
+    inb = (px >= lo1) & (px <= hi1) & (py >= lo2) & (py <= hi2)
+    ix = np.clip(((px - lo1) / (hi1 - lo1) * (W - 1)), 0, W - 1).astype(np.int64)
+    iy = np.clip(((py - lo2) / (hi2 - lo2) * (H - 1)), 0, H - 1).astype(np.int64)
+    cell = iy * W + ix
+
+    def bandmask(a0, a1):
+        m = inb & (hn >= a0) & (hn < a1)
+        g = np.zeros(H * W, bool); g[cell[m]] = True
+        return g.reshape(H, W)
+
+    wall = ((bandmask(0.12, 0.42) & bandmask(0.60, 0.92)).astype(np.uint8) * 255)  # full-height = wall
+    wall = cv2.morphologyEx(wall, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    wall = cv2.morphologyEx(wall, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    nlab, lab, stats, _ = cv2.connectedComponentsWithStats((wall > 0).astype(np.uint8), 8)
+    for i in range(1, nlab):
+        if stats[i, cv2.CC_STAT_AREA] < (0.4 * pxm) ** 2:
+            wall[lab == i] = 0
+    occ = np.zeros(H * W, bool); occ[cell[inb]] = True
+    occu = cv2.morphologyEx(occ.reshape(H, W).astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((19, 19), np.uint8))
+    occu = cv2.morphologyEx(occu, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))   # drop thin spikes/noise
+
+    def to_ft(xp, yp):
+        return [round(float(xp / (W - 1) * ftw), 2), round(float(yp / (H - 1) * fth), 2)]
+
+    strokes = []
+    cnts, _ = cv2.findContours(occu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts:
+        big = max(cnts, key=cv2.contourArea)
+        poly = cv2.approxPolyDP(big, 0.012 * cv2.arcLength(big, True), True).reshape(-1, 2)  # cleaner outline
+        outline = [to_ft(p[0], p[1]) for p in poly]
+        outline.append(outline[0])
+        strokes.append(outline)                       # exterior / back walls
+    inner = cv2.erode(occu, np.ones((int(0.5 * pxm), int(0.5 * pxm)), np.uint8))
+    lines = cv2.HoughLinesP(cv2.bitwise_and(wall, inner), 1, np.pi / 180,
+                            threshold=int(0.7 * pxm), minLineLength=int(2.0 * pxm), maxLineGap=int(0.5 * pxm))
+    if lines is not None:
+        segs = lines[:, 0, :].astype(np.float64)
+        angs = np.degrees(np.arctan2(segs[:, 3] - segs[:, 1], segs[:, 2] - segs[:, 0])) % 180.0
+        hist, edges = np.histogram(angs, bins=18, range=(0, 180))
+        theta = float(edges[int(np.argmax(hist))]) + 5.0          # dominant wall axis (deg)
+        kept = []
+        for (x1, y1, x2, y2), a in zip(segs, angs):
+            length = float(np.hypot(x2 - x1, y2 - y1))
+            d0 = min((a - theta) % 180, (theta - a) % 180)
+            d1 = min((a - theta - 90) % 180, (theta + 90 - a) % 180)
+            if min(d0, d1) < 18.0:                                 # snap near-axis walls clean
+                rad = np.radians(theta if d0 < d1 else theta + 90.0)
+                mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+                dx, dy = np.cos(rad) * length / 2, np.sin(rad) * length / 2
+                p1, p2 = (mx - dx, my - dy), (mx + dx, my + dy)
+            else:
+                p1, p2 = (x1, y1), (x2, y2)
+            kept.append((length, [to_ft(p1[0], p1[1]), to_ft(p2[0], p2[1])]))
+        kept.sort(key=lambda t: -t[0])
+        for _, seg in kept[:22]:                                  # significant dividers, snapped
+            strokes.append(seg)
+
+    pk = f"plans/{slug}.plan.json"
+    plan = json.loads(s3.get_object(Bucket=R2_BUCKET, Key=pk)["Body"].read())
+    plan["sheets"][0]["strokes"] = strokes
+    s3.put_object(Bucket=R2_BUCKET, Key=pk, Body=json.dumps(plan).encode(), ContentType="application/json")
+    print(f"[walls] {slug}: outline {len(strokes[0]) if strokes else 0}pts + {max(0, len(strokes) - 1)} interior segs -> merged into {pk}")
+    return {"strokes": len(strokes), "ft": [round(ftw, 1), round(fth, 1)]}
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=3600)
+def make_render(slug: str, video_key: str, ceiling_ft: float = 9.0, pxm: float = 48.0,
+                ceil_cut: float = 0.9, yflip: int = 1, lonsign: int = 1, kf_step: int = 1) -> dict:
+    """DEPTH-AWARE top-down — the realistic flat photo. Build the 3D surface (z-buffer of
+    the cloud), then color each cell by sampling the frame that saw THAT 3D point most
+    head-on (normal-weighted best view). Uses the full hemisphere of every frame and
+    projects to true depth, so no flat-plane smear and no coverage gaps. Cloud geometry
+    + real frame imaging, fused. Production replacement for make_ortho's flat projection."""
+    import os
+    import json
+    import time
+    import numpy as np
+    import cv2
+
+    s3 = _r2(); sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = f"{sd}/keyframe_trajectory.txt"
+    T = np.loadtxt(traj)
+    if T.ndim == 1:
+        T = T[None, :]
+    vid = f"{sd}/slam.mp4"
+    if not os.path.exists(vid):
+        vid = "/tmp/v.mp4"; s3.download_file(R2_BUCKET, video_key, vid)
+
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False); up = Vt[2].astype("f4")
+    cams = T[:, 1:4]
+    if np.dot(cams.mean(0) - c, up) < 0:
+        up = -up
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    px = X @ e1; py = X @ e2; h = X @ up
+    lo1, hi1 = np.percentile(px, [1, 99]); lo2, hi2 = np.percentile(py, [1, 99])
+    floor = float(np.percentile(h, 1.5)); ceil = float(np.percentile(h, 99)); room = ceil - floor
+    cut = floor + ceil_cut * room
+    fpu = ceiling_ft / room if room > 0 else 1.0
+    W = min(1400, int((hi1 - lo1) * pxm) + 1); H = min(1400, int((hi2 - lo2) * pxm) + 1)
+
+    # 1. surface geometry — z-buffer the cloud to a top height per cell, then DENSIFY
+    #    (interpolate the height map) so EVERY footprint cell has a true 3D surface
+    #    point to sample a frame at — turns sparse-cloud speckle into full coverage.
+    keep = (h < cut) & (px >= lo1) & (px <= hi1) & (py >= lo2) & (py <= hi2)
+    ixk = np.clip(((px[keep] - lo1) / (hi1 - lo1) * (W - 1)), 0, W - 1).astype(np.int64)
+    iyk = np.clip(((py[keep] - lo2) / (hi2 - lo2) * (H - 1)), 0, H - 1).astype(np.int64)
+    hk = h[keep]; cellk = iyk * W + ixk
+    order = np.lexsort((hk, cellk)); cs = cellk[order]; hs = hk[order]
+    last = np.ones(len(cs), bool)
+    if len(cs) > 1:
+        last[:-1] = cs[1:] != cs[:-1]
+    surf2d = np.full(H * W, np.nan, np.float32); surf2d[cs[last]] = hs[last]
+    surf2d = surf2d.reshape(H, W)
+    occ = np.zeros(H * W, bool); occ[cellk] = True
+    fp = cv2.morphologyEx(occ.reshape(H, W).astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8)) > 0
+    hmin = float(np.nanmin(surf2d)); hspan = float(np.nanmax(surf2d)) - hmin + 1e-6
+    h8 = np.where(np.isnan(surf2d), 0, (surf2d - hmin) / hspan * 255).astype(np.uint8)
+    h8 = cv2.inpaint(h8, (np.isnan(surf2d) & fp).astype(np.uint8), 7, cv2.INPAINT_TELEA)
+    dense = cv2.GaussianBlur(cv2.medianBlur(h8, 5), (9, 9), 0).astype(np.float32) / 255.0 * hspan + hmin  # dense, smoothed height/cell
+    iy_g, ix_g = np.mgrid[0:H, 0:W]
+    plx = lo1 + ix_g / (W - 1) * (hi1 - lo1)
+    ply = lo2 + iy_g / (H - 1) * (hi2 - lo2)
+    P3 = (plx[..., None] * e1 + ply[..., None] * e2 + dense[..., None] * up).astype(np.float32).reshape(H * W, 3)
+    gy, gx = np.gradient(cv2.GaussianBlur(dense, (5, 5), 0))   # dense slope → per-cell normal
+    cellu = (hi1 - lo1) / (W - 1)
+    nx, ny, nz = -gx.ravel(), -gy.ravel(), np.full(H * W, cellu * 2.0, np.float32)
+    nl = np.sqrt(nx * nx + ny * ny + nz * nz) + 1e-9
+    normal3 = ((nx / nl)[:, None] * e1 + (ny / nl)[:, None] * e2 + (nz / nl)[:, None] * up).astype(np.float32)
+    cell_idx = np.where(fp.ravel())[0]
+    Pv = P3[cell_idx]; Nv = normal3[cell_idx]                  # dense surface points + normals
+
+    # 2. for each frame, project the surface points, keep the most head-on sample
+    cap = cv2.VideoCapture(vid)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    nfr = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    Hv = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)); Wv = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    ts = T[:, 0].copy()
+    if nfr and ts.max() > (nfr / fps) * 2:
+        ts = ts / fps
+    step = kf_step if kf_step > 1 else max(1, len(T) // 320)
+    bestw = np.zeros(len(Pv), np.float32); bestc = np.zeros((len(Pv), 3), np.uint8); used = 0
+    for i in range(0, len(T), step):
+        C = T[i, 1:4] - c; R = _quat2rot(T[i, 4:8])
+        ray = Pv - C
+        dist = np.linalg.norm(ray, axis=1) + 1e-9
+        head = -(np.sum(Nv * (ray / dist[:, None]), axis=1))   # camera-facing surface
+        w = np.where(head > 0.02, head, 0.0).astype(np.float32)
+        if not np.any(w > bestw):
+            continue
+        cap.set(cv2.CAP_PROP_POS_MSEC, float(ts[i]) * 1000.0)
+        ok, fr = cap.read()
+        if not ok:
+            continue
+        used += 1
+        fr = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+        rc = ray @ R
+        rcn = rc / (np.linalg.norm(rc, axis=1, keepdims=True) + 1e-9)
+        lon = lonsign * np.arctan2(rcn[:, 0], rcn[:, 2])
+        lat = np.arcsin(np.clip(yflip * (-rcn[:, 1]), -1, 1))
+        u = (((lon / (2 * np.pi)) + 0.5) * Wv).astype(np.int32) % Wv
+        v = np.clip((0.5 - lat / np.pi) * Hv, 0, Hv - 1).astype(np.int32)
+        col = fr[v, u]
+        better = w > bestw
+        bestc[better] = col[better]; bestw[better] = w[better]
+    cap.release()
+
+    img = np.zeros((H * W, 3), np.uint8); img[cell_idx] = bestc
+    hit = np.zeros(H * W, bool); hit[cell_idx[bestw > 0]] = True
+    img = cv2.cvtColor(img.reshape(H, W, 3), cv2.COLOR_RGB2BGR)
+    fm = hit.reshape(H, W).astype(np.uint8)
+    holes = (fp & (fm == 0)).astype(np.uint8)     # fill every uncolored footprint cell
+    img = cv2.inpaint(img, holes, 5, cv2.INPAINT_TELEA)
+    img[~fp] = 0                                   # outside the room stays black
+    img = cv2.medianBlur(img, 3)
+    out = "/tmp/render.jpg"; cv2.imwrite(out, img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    key = f"ortho/{slug}.jpg"; s3.upload_file(out, R2_BUCKET, key)
+
+    # feet + flight path vector + plan (preserve any wall strokes already merged)
+    ftw = round(float((hi1 - lo1) * fpu), 1); fth = round(float((hi2 - lo2) * fpu), 1)
+    Pcam = cams - c
+    fxs = (Pcam @ e1 - lo1) * fpu; fys = (Pcam @ e2 - lo2) * fpu
+    stp = max(1, len(fxs) // 140)
+    flight = [{"t": int(i), "x": round(float(fxs[i]), 2), "y": round(float(fys[i]), 2)} for i in range(0, len(fxs), stp)]
+    pk = f"plans/{slug}.plan.json"
+    try:
+        plan = json.loads(s3.get_object(Bucket=R2_BUCKET, Key=pk)["Body"].read())
+        sh = plan["sheets"][0]
+    except Exception:
+        plan = {"tourSlug": slug, "sheets": [{"id": "floor-1", "label": slug, "kind": "floor", "zones": []}]}
+        sh = plan["sheets"][0]
+    sh.update({"width": ftw, "height": fth,
+               "satUrl": f"https://media.lvxhomes.com/{key}?v={int(time.time())}",
+               "paths": {"flight": flight}})
+    s3.put_object(Bucket=R2_BUCKET, Key=pk, Body=json.dumps(plan).encode(), ContentType="application/json")
+    print(f"[render] {slug}: {W}x{H}, {used} frames, {int(hit.mean() * 100)}% colored, {ftw}x{fth}ft -> {key} + {pk}")
+    return {"ortho": key, "px": [int(W), int(H)], "frames": int(used), "filled_pct": int(hit.mean() * 100),
+            "ft": [ftw, fth], "flight_pts": int(len(flight))}
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=3600)
+def make_fused(slug: str, video_key: str, ceiling_ft: float = 9.0, pxm: float = 48.0,
+               ceil_cut: float = 0.9, yflip: int = 1, lonsign: int = 1, cone_deg: float = 60.0) -> dict:
+    """FUSE nadir + depth from all the data. Per frame, sample each cell two ways:
+       (a) NADIR — project the cell's floor-plane point, weight by how straight-down the
+           view is (clean on the dominant flat floor);
+       (b) DEPTH — project the cell's true 3D surface point, weight by how head-on
+           (recovers furniture/edges without flat-plane smear).
+    Best-view across ALL frames for each, then composite: nadir where it has a confident
+    sample, depth fills the gaps. Cloud geometry + every 360 frame + the VSLAM pose, fused."""
+    import os
+    import json
+    import time
+    import numpy as np
+    import cv2
+
+    s3 = _r2(); sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = f"{sd}/keyframe_trajectory.txt"
+    T = np.loadtxt(traj)
+    if T.ndim == 1:
+        T = T[None, :]
+    vid = f"{sd}/slam.mp4"
+    if not os.path.exists(vid):
+        vid = "/tmp/v.mp4"; s3.download_file(R2_BUCKET, video_key, vid)
+
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False); up = Vt[2].astype("f4")
+    cams = T[:, 1:4]
+    if np.dot(cams.mean(0) - c, up) < 0:
+        up = -up
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    pxa = X @ e1; pya = X @ e2; hgt = X @ up
+    lo1, hi1 = np.percentile(pxa, [1, 99]); lo2, hi2 = np.percentile(pya, [1, 99])
+    floor = float(np.percentile(hgt, 1.5)); ceil = float(np.percentile(hgt, 99)); room = ceil - floor
+    cut = floor + ceil_cut * room
+    fpu = ceiling_ft / room if room > 0 else 1.0
+    W = min(1400, int((hi1 - lo1) * pxm) + 1); H = min(1400, int((hi2 - lo2) * pxm) + 1)
+
+    # densified surface (dense top height per cell) + footprint
+    keep = (hgt < cut) & (pxa >= lo1) & (pxa <= hi1) & (pya >= lo2) & (pya <= hi2)
+    ixk = np.clip(((pxa[keep] - lo1) / (hi1 - lo1) * (W - 1)), 0, W - 1).astype(np.int64)
+    iyk = np.clip(((pya[keep] - lo2) / (hi2 - lo2) * (H - 1)), 0, H - 1).astype(np.int64)
+    hk = hgt[keep]; cellk = iyk * W + ixk
+    order = np.lexsort((hk, cellk)); cssort = cellk[order]; hssort = hk[order]
+    lastm = np.ones(len(cssort), bool)
+    if len(cssort) > 1:
+        lastm[:-1] = cssort[1:] != cssort[:-1]
+    s2 = np.full(H * W, np.nan, np.float32); s2[cssort[lastm]] = hssort[lastm]; s2 = s2.reshape(H, W)
+    occ = np.zeros(H * W, bool); occ[cellk] = True
+    fp = cv2.morphologyEx(occ.reshape(H, W).astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8)) > 0
+    hmin = float(np.nanmin(s2)); hspan = float(np.nanmax(s2)) - hmin + 1e-6
+    h8 = np.where(np.isnan(s2), 0, (s2 - hmin) / hspan * 255).astype(np.uint8)
+    h8 = cv2.inpaint(h8, (np.isnan(s2) & fp).astype(np.uint8), 7, cv2.INPAINT_TELEA)
+    dense = cv2.GaussianBlur(cv2.medianBlur(h8, 5), (9, 9), 0).astype(np.float32) / 255.0 * hspan + hmin
+    iy_g, ix_g = np.mgrid[0:H, 0:W]
+    plx = lo1 + ix_g / (W - 1) * (hi1 - lo1); ply = lo2 + iy_g / (H - 1) * (hi2 - lo2)
+    surfP = (plx[..., None] * e1 + ply[..., None] * e2 + dense[..., None] * up).astype(np.float32).reshape(H * W, 3)
+    floorP = (plx[..., None] * e1 + ply[..., None] * e2 + floor * up).astype(np.float32).reshape(H * W, 3)
+    gy, gx = np.gradient(cv2.GaussianBlur(dense, (5, 5), 0))
+    cellu = (hi1 - lo1) / (W - 1)
+    nx, ny, nz = -gx.ravel(), -gy.ravel(), np.full(H * W, cellu * 2.0, np.float32)
+    nl = np.sqrt(nx * nx + ny * ny + nz * nz) + 1e-9
+    Nrm = ((nx / nl)[:, None] * e1 + (ny / nl)[:, None] * e2 + (nz / nl)[:, None] * up).astype(np.float32)
+    idx = np.where(fp.ravel())[0]
+    Pd = surfP[idx]; Pn = floorP[idx]; Nv = Nrm[idx]
+
+    cap = cv2.VideoCapture(vid)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0; nfr = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    Hv = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)); Wv = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    ts = T[:, 0].copy()
+    if nfr and ts.max() > (nfr / fps) * 2:
+        ts = ts / fps
+    step = max(1, len(T) // 360)
+    cos_cone = np.cos(np.radians(cone_deg))
+    dW = np.zeros(len(idx), np.float32); dC = np.zeros((len(idx), 3), np.uint8)
+    nW = np.zeros(len(idx), np.float32); nC = np.zeros((len(idx), 3), np.uint8)
+    used = 0
+
+    def sample(P, C, R, fr):
+        ray = P - C
+        rc = ray @ R
+        rcn = rc / (np.linalg.norm(rc, axis=1, keepdims=True) + 1e-9)
+        lon = lonsign * np.arctan2(rcn[:, 0], rcn[:, 2])
+        lat = np.arcsin(np.clip(yflip * (-rcn[:, 1]), -1, 1))
+        u = (((lon / (2 * np.pi)) + 0.5) * Wv).astype(np.int32) % Wv
+        v = np.clip((0.5 - lat / np.pi) * Hv, 0, Hv - 1).astype(np.int32)
+        return fr[v, u], ray
+
+    for i in range(0, len(T), step):
+        C = T[i, 1:4] - c; R = _quat2rot(T[i, 4:8])
+        rayd = Pd - C; dist = np.linalg.norm(rayd, axis=1) + 1e-9
+        wd = np.maximum(0.0, -(np.sum(Nv * (rayd / dist[:, None]), axis=1))).astype(np.float32)
+        rayn = Pn - C; dn = np.linalg.norm(rayn, axis=1) + 1e-9
+        vert = -(rayn @ up) / dn
+        wn = np.where(vert > cos_cone, vert, 0.0).astype(np.float32)
+        if not (np.any(wd > dW) or np.any(wn > nW)):
+            continue
+        cap.set(cv2.CAP_PROP_POS_MSEC, float(ts[i]) * 1000.0)
+        ok, fr = cap.read()
+        if not ok:
+            continue
+        used += 1
+        fr = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+        cold, _ = sample(Pd, C, R, fr)
+        coln, _ = sample(Pn, C, R, fr)
+        bd = wd > dW; dC[bd] = cold[bd]; dW[bd] = wd[bd]
+        bn = wn > nW; nC[bn] = coln[bn]; nW[bn] = wn[bn]
+    cap.release()
+
+    # composite: nadir base where it has a confident sample, depth fills the gaps
+    out = np.zeros((len(idx), 3), np.uint8)
+    hasn = nW > 0.05; hasd = dW > 0.05
+    out[hasd] = dC[hasd]; out[hasn] = nC[hasn]            # nadir overwrites depth (base)
+    img = np.zeros((H * W, 3), np.uint8); img[idx] = out
+    hit = np.zeros(H * W, bool); hit[idx[hasn | hasd]] = True
+    img = cv2.cvtColor(img.reshape(H, W, 3), cv2.COLOR_RGB2BGR)
+    hm = cv2.morphologyEx(hit.reshape(H, W).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    holes = (fp & (hm == 0)).astype(np.uint8)       # all uncovered footprint cells, speckle bridged
+    img = cv2.inpaint(img, holes, 6, cv2.INPAINT_TELEA)
+    img[~fp] = 0                                     # outside the room stays black
+    img = cv2.medianBlur(img, 5)                     # knock down best-view speckle
+    o = "/tmp/fused.jpg"; cv2.imwrite(o, img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    key = f"ortho/{slug}.jpg"; s3.upload_file(o, R2_BUCKET, key)
+
+    ftw = round(float((hi1 - lo1) * fpu), 1); fth = round(float((hi2 - lo2) * fpu), 1)
+    Pcam = cams - c; fxs = (Pcam @ e1 - lo1) * fpu; fys = (Pcam @ e2 - lo2) * fpu
+    stp = max(1, len(fxs) // 140)
+    flight = [{"t": int(i), "x": round(float(fxs[i]), 2), "y": round(float(fys[i]), 2)} for i in range(0, len(fxs), stp)]
+    pk = f"plans/{slug}.plan.json"
+    try:
+        plan = json.loads(s3.get_object(Bucket=R2_BUCKET, Key=pk)["Body"].read()); sh = plan["sheets"][0]
+    except Exception:
+        plan = {"tourSlug": slug, "sheets": [{"id": "floor-1", "label": slug, "kind": "floor", "zones": []}]}; sh = plan["sheets"][0]
+    sh.update({"width": ftw, "height": fth, "satUrl": f"https://media.lvxhomes.com/{key}?v={int(time.time())}", "paths": {"flight": flight}})
+    s3.put_object(Bucket=R2_BUCKET, Key=pk, Body=json.dumps(plan).encode(), ContentType="application/json")
+    nadir_pct = int(hasn.mean() * 100); fill_pct = int((hasd & ~hasn).mean() * 100)
+    print(f"[fused] {slug}: {W}x{H}, {used} frames, nadir {nadir_pct}% + depth-fill {fill_pct}%, {ftw}x{fth}ft -> {key}")
+    return {"ortho": key, "px": [int(W), int(H)], "frames": int(used),
+            "nadir_pct": nadir_pct, "depth_fill_pct": fill_pct, "ft": [ftw, fth]}
+
+
+# --- AI wall layout from 360 panos (Phase 1 of the fused-floorplan stack) ----------
+# HorizonNet predicts a room's wall layout from a single equirect pano — from learned
+# structure, NOT texture — so blank white dividers the MVS cloud can't reconstruct still
+# get walls. We feed it panos sampled across the flight; later phases fuse per-pano
+# layouts via the VSLAM poses (360-DFPE style) into one multi-room plan.
+horizon_image = (
+    modal.Image.from_registry("pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime")
+    .env({"DEBIAN_FRONTEND": "noninteractive", "TZ": "Etc/UTC"})   # tzdata must not prompt
+    .apt_install("git", "libgl1", "libglib2.0-0", "build-essential", "wget", "tzdata")
+    .pip_install("numpy", "scipy", "scikit-learn", "Pillow", "tqdm", "tensorboardX",
+                 "opencv-python-headless", "shapely", "open3d", "pylsd-nova", "huggingface_hub")
+    .pip_install("boto3", "numpy<2")   # boto3 for R2; pin numpy<2 (torch 2.1 ABI needs numpy 1.x)
+    .run_commands(
+        "git clone https://github.com/sunset1995/HorizonNet /horizon",
+        # HorizonNet hardcodes ResNet50_Weights for all backbones -> breaks resnet34 on new
+        # torchvision. We load the full checkpoint anyway, so drop the ImageNet pretrain.
+        "sed -i 's/weights=ResNet50_Weights.IMAGENET1K_V1/weights=None/g' /horizon/model.py",
+        "python -c \"from huggingface_hub import hf_hub_download as d; d('sunset1995/HorizonNet','resnet50_rnn__zind.pth',local_dir='/horizon/ckpt')\"",
+    )
+)
+
+
+@app.function(image=horizon_image, gpu="T4", secrets=[r2_secret], volumes={"/scratch": vol}, timeout=2400)
+def make_layout(slug: str, video_key: str, n: int = 6) -> dict:
+    """Predict per-pano wall layouts across the flight (HorizonNet). Proves the model
+    draws walls — white ones included — on YOUR panos before we build the fusion."""
+    import os
+    import glob
+    import subprocess
+    import cv2
+
+    s3 = _r2(); sd = f"/scratch/{slug}"
+    vid = f"{sd}/slam.mp4"
+    if not os.path.exists(vid):
+        vid = "/tmp/v.mp4"; s3.download_file(R2_BUCKET, video_key, vid)
+    for d in ("/tmp/fr", "/tmp/al", "/tmp/out"):
+        os.makedirs(d, exist_ok=True)
+    cap = cv2.VideoCapture(vid); nfr = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    saved = []
+    for k in range(n):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(nfr * (k + 0.5) / n))
+        ok, fr = cap.read()
+        if ok:
+            cv2.imwrite(f"/tmp/fr/f{k:02d}.png", cv2.resize(fr, (1024, 512)))   # equirect 2:1
+            saved.append(f"f{k:02d}")
+    cap.release()
+
+    done = []
+    for base in saved:
+        subprocess.run(["python", "preprocess.py", "--img_glob", f"/tmp/fr/{base}.png", "--output_dir", "/tmp/al/"],
+                       cwd="/horizon", capture_output=True, text=True)
+        al = glob.glob(f"/tmp/al/{base}_aligned_rgb.png")
+        if not al:
+            print(f"[layout] {base}: preprocess produced no aligned pano"); continue
+        r = subprocess.run(["python", "inference.py", "--pth", "/horizon/ckpt/resnet50_rnn__zind.pth",
+                            "--img_glob", al[0], "--output_dir", "/tmp/out/", "--visualize"],
+                           cwd="/horizon", capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"[layout] {base}: inference failed -> {r.stderr[-400:]}"); continue
+        done.append(base)
+
+    up = 0
+    for o in glob.glob("/tmp/out/*") + glob.glob("/tmp/al/*_aligned_rgb.png"):
+        s3.upload_file(o, R2_BUCKET, f"layout/{slug}/{os.path.basename(o)}"); up += 1
+    print(f"[layout] {slug}: {len(saved)} panos, {len(done)} predicted, {up} files -> R2 layout/{slug}/")
+    return {"panos": len(saved), "predicted": len(done), "files": up}
+
+
+@app.function(image=horizon_image, gpu="T4", secrets=[r2_secret], volumes={"/scratch": vol}, timeout=3600)
+def still_layout(slug: str) -> dict:
+    """HorizonNet on the dedicated full-res 360 STILLS (uploaded to stills/{slug}/), whose
+    measured XMP attitude orients the projection locally. Uploads layout JSON + aligned pano +
+    original pano + viz to stilllayout/{slug}/ (original+aligned let me recover the preprocess
+    yaw and add it to the measured gimbal yaw)."""
+    import os
+    import glob
+    import subprocess
+    import cv2
+
+    s3 = _r2()
+    for d in ("/tmp/fr", "/tmp/al", "/tmp/out"):
+        os.makedirs(d, exist_ok=True)
+    resp = s3.list_objects_v2(Bucket=R2_BUCKET, Prefix=f"stills/{slug}/")
+    keys = sorted(o["Key"] for o in resp.get("Contents", []) if o["Key"].lower().endswith(".jpg"))
+    saved = []
+    for key in keys:
+        name = os.path.splitext(os.path.basename(key))[0]
+        dl = f"/tmp/dl_{name}.jpg"
+        s3.download_file(R2_BUCKET, key, dl)
+        im = cv2.imread(dl)
+        if im is None:
+            continue
+        cv2.imwrite(f"/tmp/fr/{name}.png", cv2.resize(im, (1024, 512)))
+        saved.append(name)
+
+    done = []
+    for base in saved:
+        subprocess.run(["python", "preprocess.py", "--img_glob", f"/tmp/fr/{base}.png", "--output_dir", "/tmp/al/"],
+                       cwd="/horizon", capture_output=True, text=True)
+        al = glob.glob(f"/tmp/al/{base}_aligned_rgb.png")
+        if not al:
+            print(f"[still_layout] {base}: no aligned pano"); continue
+        r = subprocess.run(["python", "inference.py", "--pth", "/horizon/ckpt/resnet50_rnn__zind.pth",
+                            "--img_glob", al[0], "--output_dir", "/tmp/out/", "--visualize"],
+                           cwd="/horizon", capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"[still_layout] {base}: inference failed -> {r.stderr[-300:]}"); continue
+        done.append(base)
+
+    up = 0
+    for o in glob.glob("/tmp/out/*") + glob.glob("/tmp/al/*_aligned_rgb.png") + glob.glob("/tmp/fr/*.png"):
+        s3.upload_file(o, R2_BUCKET, f"stilllayout/{slug}/{os.path.basename(o)}"); up += 1
+    print(f"[still_layout] {slug}: {len(saved)} stills, {len(done)} predicted, {up} files -> R2 stilllayout/{slug}/")
+    return {"stills": len(saved), "predicted": len(done), "files": up}
+
+
+@app.function(image=horizon_image, gpu="T4", secrets=[r2_secret], volumes={"/scratch": vol}, timeout=3600)
+def make_walls_ai(slug: str, video_key: str, ceiling_ft: float = 9.0, spacing_ft: float = 4.0,
+                  pxm: float = 18.0, yflip: int = 1, lonsign: int = 1) -> dict:
+    """Phase 2 — fuse 360 room-layout (HorizonNet) into a wall composite. Sample panos by
+    TRAJECTORY DISTANCE (every spacing_ft), predict each room's layout, recover its align
+    rotation, project the floor-wall corners to the global floor through that frame's VSLAM
+    pose, and overlay all of them + the flight path in the make_fused feet frame."""
+    import os
+    import glob
+    import json
+    import subprocess
+    import numpy as np
+    import cv2
+
+    s3 = _r2(); sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = f"{sd}/keyframe_trajectory.txt"
+    T = np.loadtxt(traj)
+    vid = f"{sd}/slam.mp4"
+    if not os.path.exists(vid):
+        vid = "/tmp/v.mp4"; s3.download_file(R2_BUCKET, video_key, vid)
+
+    # basis / extent / scale — SAME frame as make_fused so walls register on the photo
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False); up = Vt[2].astype("f4")
+    cams = T[:, 1:4]
+    if np.dot(cams.mean(0) - c, up) < 0:
+        up = -up
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    h = X @ up
+    lo1, hi1 = np.percentile(X @ e1, [1, 99]); lo2, hi2 = np.percentile(X @ e2, [1, 99])
+    floor = float(np.percentile(h, 1.5)); ceil = float(np.percentile(h, 99))
+    fpu = ceiling_ft / (ceil - floor)
+    ftw = (hi1 - lo1) * fpu; fth = (hi2 - lo2) * fpu
+    W = int(ftw * pxm) + 1; H = int(fth * pxm) + 1
+
+    # sample frame indices by cumulative trajectory distance (in feet)
+    Pc = cams - c
+    fxs = (Pc @ e1 - lo1) * fpu; fys = (Pc @ e2 - lo2) * fpu
+    seg = np.r_[0.0, np.hypot(np.diff(fxs), np.diff(fys))]
+    cum = np.cumsum(seg)
+    picks = []
+    nextd = 0.0
+    for i in range(len(cum)):
+        if cum[i] >= nextd:
+            picks.append(i); nextd = cum[i] + spacing_ft
+    cap = cv2.VideoCapture(vid)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0; nfr = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    ts = T[:, 0].copy()
+    if nfr and ts.max() > (nfr / fps) * 2:
+        ts = ts / fps
+
+    def floor_uv_to_feet(u, v, C, R, shift):
+        u0 = (u - shift) % 1.0                                  # un-roll the align yaw
+        lon = lonsign * (u0 - 0.5) * 2 * np.pi
+        lat = (0.5 - v) * np.pi
+        rc = np.array([np.cos(lat) * np.sin(lon), -yflip * np.sin(lat), np.cos(lat) * np.cos(lon)])
+        rw = R.T @ rc                                           # camera -> world
+        denom = rw @ up
+        if abs(denom) < 1e-4:
+            return None
+        t = (floor - (C @ up)) / denom
+        if t <= 0:
+            return None
+        p = C + t * rw
+        return [(p @ e1 - lo1) * fpu, (p @ e2 - lo2) * fpu]
+
+    rooms = []
+    used = 0
+    for i in picks:
+        cap.set(cv2.CAP_PROP_POS_MSEC, float(ts[i]) * 1000.0)
+        ok, fr = cap.read()
+        if not ok:
+            continue
+        pano = cv2.resize(fr, (1024, 512))
+        cv2.imwrite("/tmp/p.png", pano)
+        subprocess.run(["python", "preprocess.py", "--img_glob", "/tmp/p.png", "--output_dir", "/tmp/al/"],
+                       cwd="/horizon", capture_output=True, text=True)
+        al = glob.glob("/tmp/al/p_aligned_rgb.png")
+        if not al:
+            continue
+        r = subprocess.run(["python", "inference.py", "--pth", "/horizon/ckpt/resnet50_rnn__zind.pth",
+                            "--img_glob", al[0], "--output_dir", "/tmp/out/"], cwd="/horizon", capture_output=True, text=True)
+        jp = "/tmp/out/p_aligned_rgb.json"
+        if r.returncode != 0 or not os.path.exists(jp):
+            continue
+        aligned = cv2.imread(al[0])
+        # recover align yaw: circular cross-correlation of the horizon band
+        oa = cv2.cvtColor(pano, cv2.COLOR_BGR2GRAY)[200:312].mean(0)
+        ob = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)[200:312].mean(0)
+        cc = np.fft.irfft(np.fft.rfft(oa - oa.mean()) * np.conj(np.fft.rfft(ob - ob.mean())), n=len(oa))
+        shift = float(np.argmax(cc)) / len(oa)
+        lay = json.loads(open(jp).read())
+        uv = lay["uv"]
+        floor_corners = uv[1::2]                                # odd indices = floor corners
+        C = T[i, 1:4] - c; R = _quat2rot(T[i, 4:8])
+        poly = [floor_uv_to_feet(u, v, C, R, shift) for (u, v) in floor_corners]
+        poly = [p for p in poly if p is not None]
+        if len(poly) >= 3:
+            rooms.append({"poly": poly, "cam": [(Pc[i] @ e1 - lo1) * fpu, (Pc[i] @ e2 - lo2) * fpu]})
+        used += 1
+    cap.release()
+
+    # cache the raw room polys + cams + flight (feet) so the reconciliation can iterate locally
+    flight_ft = [[round(float(fxs[i]), 2), round(float(fys[i]), 2)]
+                 for i in range(0, len(fxs), max(1, len(fxs) // 140))]
+    s3.put_object(Bucket=R2_BUCKET, Key=f"layout/{slug}/rooms.json",
+                  Body=json.dumps({
+                      "ftw": round(float(ftw), 2), "fth": round(float(fth), 2),
+                      "rooms": [{"poly": [[round(float(p[0]), 2), round(float(p[1]), 2)] for p in rm["poly"]],
+                                 "cam": [round(float(rm["cam"][0]), 2), round(float(rm["cam"][1]), 2)]} for rm in rooms],
+                      "flight": flight_ft}).encode(),
+                  ContentType="application/json")
+
+    def px(p):
+        return (int(np.clip(p[0] / ftw * (W - 1), 0, W - 1)), int(np.clip(p[1] / fth * (H - 1), 0, H - 1)))
+
+    # --- reconcile: vote wall edges (near edges weigh more), extract consensus walls ---
+    acc = np.zeros((H, W), np.float32)
+    for rm in rooms:
+        cam = rm["cam"]; pts = rm["poly"]
+        for a in range(len(pts)):
+            p1, p2 = pts[a], pts[(a + 1) % len(pts)]
+            mid = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+            wgt = 1.0 / (1.0 + np.hypot(mid[0] - cam[0], mid[1] - cam[1]) / 6.0)   # feet
+            tmp = np.zeros((H, W), np.float32)
+            cv2.line(tmp, px(p1), px(p2), 1.0, max(2, int(pxm * 0.3)))
+            acc += tmp * wgt
+    acc = cv2.GaussianBlur(acc, (0, 0), pxm * 0.25)
+    mask = (acc > acc.max() * 0.3).astype(np.uint8) * 255
+    lines = cv2.HoughLinesP(mask, 1, np.pi / 180, threshold=int(pxm * 1.4),
+                            minLineLength=int(pxm * 2.5), maxLineGap=int(pxm * 1.2))
+    strokes = []; vsegs = []
+    if lines is not None:
+        segs = lines[:, 0, :].astype(np.float64)
+        angs = np.degrees(np.arctan2(segs[:, 3] - segs[:, 1], segs[:, 2] - segs[:, 0])) % 180.0
+        hist, edg = np.histogram(angs, bins=18, range=(0, 180))
+        theta = float(edg[int(np.argmax(hist))]) + 5.0
+        kept = []
+        for (x1, y1, x2, y2), an in zip(segs, angs):
+            length = float(np.hypot(x2 - x1, y2 - y1))
+            d0 = min((an - theta) % 180, (theta - an) % 180)
+            d1 = min((an - theta - 90) % 180, (theta + 90 - an) % 180)
+            if min(d0, d1) < 16:
+                rad = np.radians(theta if d0 < d1 else theta + 90.0)
+                mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+                dx, dy = np.cos(rad) * length / 2, np.sin(rad) * length / 2
+                q = [(mx - dx, my - dy), (mx + dx, my + dy)]
+            else:
+                q = [(x1, y1), (x2, y2)]
+            kept.append((length, q))
+        kept.sort(key=lambda t: -t[0])
+        for _, q in kept[:30]:
+            vsegs.append(q)
+            strokes.append([[round(float(q[0][0] / (W - 1) * ftw), 2), round(float(q[0][1] / (H - 1) * fth), 2)],
+                            [round(float(q[1][0] / (W - 1) * ftw), 2), round(float(q[1][1] / (H - 1) * fth), 2)]])
+
+    pk = f"plans/{slug}.plan.json"
+    try:
+        plan = json.loads(s3.get_object(Bucket=R2_BUCKET, Key=pk)["Body"].read())
+        plan["sheets"][0]["strokes"] = strokes
+        s3.put_object(Bucket=R2_BUCKET, Key=pk, Body=json.dumps(plan).encode(), ContentType="application/json")
+    except Exception as e:
+        print("[walls_ai] plan merge skip:", e)
+
+    base = np.full((H, W, 3), 250, np.uint8)
+    try:
+        s3.download_file(R2_BUCKET, f"ortho/{slug}.jpg", "/tmp/o.jpg")
+        ph = cv2.imread("/tmp/o.jpg")
+        if ph is not None:
+            base = cv2.resize(ph, (W, H))
+    except Exception:
+        pass
+    comp = base.copy()
+    for k, rm in enumerate(rooms):
+        col = ((37 * k) % 255, (91 * k + 60) % 255, (150 * k + 90) % 255)
+        cv2.polylines(comp, [np.array([px(p) for p in rm["poly"]], np.int32)], True, col, 1, cv2.LINE_AA)
+    cv2.imwrite("/tmp/comp.jpg", comp, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    s3.upload_file("/tmp/comp.jpg", R2_BUCKET, f"layout/{slug}/composite.jpg")
+    clean = base.copy()
+    for q in vsegs:
+        a2, b2 = (int(q[0][0]), int(q[0][1])), (int(q[1][0]), int(q[1][1]))
+        cv2.line(clean, a2, b2, (255, 255, 255), 4, cv2.LINE_AA)
+        cv2.line(clean, a2, b2, (30, 25, 20), 2, cv2.LINE_AA)
+    cv2.imwrite("/tmp/clean.jpg", clean, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    s3.upload_file("/tmp/clean.jpg", R2_BUCKET, f"layout/{slug}/walls.jpg")
+    print(f"[walls_ai] {slug}: {len(picks)} panos, {len(rooms)} polys, {len(strokes)} consensus walls, "
+          f"{round(ftw,1)}x{round(fth,1)}ft -> composite.jpg + walls.jpg + plan")
+    return {"panos": int(len(picks)), "rooms": int(len(rooms)), "walls": int(len(strokes)),
+            "ft": [round(float(ftw), 1), round(float(fth), 1)]}
+
+
+@app.function(image=horizon_image, gpu="T4", secrets=[r2_secret], volumes={"/scratch": vol}, timeout=3600)
+def localize_stills(slug: str, video_key: str, ceiling_ft: float = 9.0, n_frames: int = 160) -> dict:
+    """Localize each dedicated 360 STILL into the VSLAM frame: ORB-match it to the video
+    frame it overlaps (the 'common frames'), inherit that frame's pose -> the still's true
+    feet position in the make_fused plan frame. -> layout/{slug}/localize.json."""
+    import os
+    import json
+    import numpy as np
+    import cv2
+
+    s3 = _r2(); sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = f"{sd}/keyframe_trajectory.txt"
+    T = np.loadtxt(traj)
+    vid = f"{sd}/slam.mp4"
+    if not os.path.exists(vid):
+        vid = "/tmp/v.mp4"; s3.download_file(R2_BUCKET, video_key, vid)
+
+    # basis / scale — identical to make_fused so positions land in the plan's feet frame
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False); up = Vt[2].astype("f4")
+    cams = T[:, 1:4]
+    if np.dot(cams.mean(0) - c, up) < 0:
+        up = -up
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    h = X @ up
+    lo1, hi1 = np.percentile(X @ e1, [1, 99]); lo2, hi2 = np.percentile(X @ e2, [1, 99])
+    floor = float(np.percentile(h, 1.5)); ceil = float(np.percentile(h, 99))
+    fpu = ceiling_ft / (ceil - floor)
+    ftw = float((hi1 - lo1) * fpu); fth = float((hi2 - lo2) * fpu)
+
+    cap = cv2.VideoCapture(vid)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0; nfr = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    ts = T[:, 0].copy()
+    if nfr and ts.max() > (nfr / fps) * 2:
+        ts = ts / fps
+
+    orb = cv2.ORB_create(1000)
+    frames = []
+    for k in range(n_frames):
+        fi = int(nfr * (k + 0.5) / n_frames)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        ok, fr = cap.read()
+        if not ok:
+            continue
+        g = cv2.cvtColor(cv2.resize(fr, (1024, 512)), cv2.COLOR_BGR2GRAY)
+        _, des = orb.detectAndCompute(g, None)
+        if des is None:
+            continue
+        idx = int(np.argmin(np.abs(ts - fi / fps)))
+        cam = cams[idx] - c
+        frames.append((fi, des, [float((cam @ e1 - lo1) * fpu), float((cam @ e2 - lo2) * fpu)]))
+    cap.release()
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+    resp = s3.list_objects_v2(Bucket=R2_BUCKET, Prefix=f"stills/{slug}/")
+    keys = sorted(o["Key"] for o in resp.get("Contents", []) if o["Key"].lower().endswith(".jpg"))
+    out = {}
+    for key in keys:
+        name = os.path.splitext(os.path.basename(key))[0]
+        dl = f"/tmp/s_{name}.jpg"; s3.download_file(R2_BUCKET, key, dl)
+        im = cv2.imread(dl)
+        if im is None:
+            continue
+        g = cv2.cvtColor(cv2.resize(im, (1024, 512)), cv2.COLOR_BGR2GRAY)
+        _, sdes = orb.detectAndCompute(g, None)
+        best_feet, best_fi, best_cnt = None, -1, -1
+        for fi, fdes, feet in frames:
+            matches = bf.knnMatch(sdes, fdes, k=2)
+            good = sum(1 for mm in matches if len(mm) == 2 and mm[0].distance < 0.75 * mm[1].distance)
+            if good > best_cnt:
+                best_cnt, best_feet, best_fi = good, feet, fi
+        out[name] = {"frame": int(best_fi), "feet": [round(best_feet[0], 2), round(best_feet[1], 2)], "matches": int(best_cnt)}
+        print(f"[localize] {name}: frame {best_fi} ({best_cnt} matches) -> ({out[name]['feet'][0]}, {out[name]['feet'][1]}) ft")
+
+    out["_meta"] = {"ftw": round(ftw, 2), "fth": round(fth, 2), "frames": len(frames)}
+    s3.put_object(Bucket=R2_BUCKET, Key=f"layout/{slug}/localize.json", Body=json.dumps(out).encode(), ContentType="application/json")
+    n = len([k for k in out if k != "_meta"])
+    print(f"[localize] {slug}: {n} stills localized -> R2 layout/{slug}/localize.json")
+    return {"localized": int(n), "frames": int(len(frames))}
+
+
 @app.local_entrypoint()
 def main(r2_key: str, slug: str, scale: float = 1.0):
     """CLI smoke test:  modal run modal_app.py --r2-key uploads/1112.mp4 --slug apartment-1112"""
