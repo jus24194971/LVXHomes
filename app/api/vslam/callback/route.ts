@@ -25,6 +25,25 @@ function bearer(req: Request): string | null {
   return m ? m[1] : null;
 }
 
+// TEMP diagnostic — reports which token the route sees (fingerprint only, irreversible)
+// and whether the Authorization header survives Cloudflare. Remove once the wire is confirmed.
+export async function GET(req: NextRequest) {
+  const env = await appEnv();
+  const expected = env.VSLAM_CALLBACK_TOKEN || "";
+  const fp = async (s: string) => {
+    if (!s) return "";
+    const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+    return Array.from(new Uint8Array(h)).map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 12);
+  };
+  return NextResponse.json({
+    token_set: !!expected,
+    token_len: expected.length,
+    token_fp: await fp(expected),
+    saw_auth: !!req.headers.get("authorization"),
+    recv_fp: await fp(bearer(req) || ""),
+  });
+}
+
 export async function POST(req: NextRequest) {
   const env = await appEnv();
   const expected = env.VSLAM_CALLBACK_TOKEN;
