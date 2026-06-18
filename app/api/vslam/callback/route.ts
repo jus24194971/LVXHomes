@@ -40,14 +40,16 @@ export async function GET(req: NextRequest) {
     token_len: expected.length,
     token_fp: await fp(expected),
     saw_auth: !!req.headers.get("authorization"),
-    recv_fp: await fp(bearer(req) || ""),
+    saw_xhdr: !!req.headers.get("x-lvx-token"),
+    recv_fp: await fp(req.headers.get("x-lvx-token") || bearer(req) || ""),
   });
 }
 
 export async function POST(req: NextRequest) {
   const env = await appEnv();
   const expected = env.VSLAM_CALLBACK_TOKEN;
-  if (!expected || bearer(req) !== expected) {
+  const provided = req.headers.get("x-lvx-token") || bearer(req); // CF rewrites Authorization; use a custom header
+  if (!expected || provided !== expected) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
