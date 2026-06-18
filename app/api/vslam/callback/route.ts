@@ -29,7 +29,7 @@ function bearer(req: Request): string | null {
 // and whether the Authorization header survives Cloudflare. Remove once the wire is confirmed.
 export async function GET(req: NextRequest) {
   const env = await appEnv();
-  const expected = env.VSLAM_CALLBACK_TOKEN || "";
+  const expected = (env.VSLAM_CALLBACK_TOKEN || "").trim();
   const fp = async (s: string) => {
     if (!s) return "";
     const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
@@ -41,14 +41,14 @@ export async function GET(req: NextRequest) {
     token_fp: await fp(expected),
     saw_auth: !!req.headers.get("authorization"),
     saw_xhdr: !!req.headers.get("x-lvx-token"),
-    recv_fp: await fp(req.headers.get("x-lvx-token") || bearer(req) || ""),
+    recv_fp: await fp((req.headers.get("x-lvx-token") || bearer(req) || "").trim()),
   });
 }
 
 export async function POST(req: NextRequest) {
   const env = await appEnv();
-  const expected = env.VSLAM_CALLBACK_TOKEN;
-  const provided = req.headers.get("x-lvx-token") || bearer(req); // CF rewrites Authorization; use a custom header
+  const expected = (env.VSLAM_CALLBACK_TOKEN || "").trim();
+  const provided = (req.headers.get("x-lvx-token") || bearer(req) || "").trim(); // CF rewrites Authorization; custom header + trim stray whitespace
   if (!expected || provided !== expected) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
