@@ -155,6 +155,11 @@ function PlanSheetSVG({
                 height={L.height ?? sheet.height}
                 opacity={L.opacity ?? 1}
                 preserveAspectRatio="none"
+                transform={
+                  L.rotation
+                    ? `rotate(${L.rotation} ${(L.x ?? 0) + (L.width ?? sheet.width) / 2} ${(L.y ?? 0) + (L.height ?? sheet.height) / 2})`
+                    : undefined
+                }
               />
             ),
           )

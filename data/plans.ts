@@ -62,6 +62,8 @@ export type PlanLayer = {
   opacity?: number;
   /** default true. */
   visible?: boolean;
+  /** degrees, clockwise about the layer centre; default 0. */
+  rotation?: number;
 };
 
 export type PlanSheet = {

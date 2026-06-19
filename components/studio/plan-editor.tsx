@@ -35,6 +35,7 @@ type TraceImg = { url: string; opacity: number; scale: number; x: number; y: num
 type Drag =
   | { type: "vertex"; zi: number; vi: number }
   | { type: "zone"; zi: number; start: [number, number]; orig: [number, number][] }
+  | { type: "layer"; li: number; start: [number, number]; origX: number; origY: number }
   | { type: "trace"; start: [number, number]; origX: number; origY: number }
   | null;
 
@@ -59,6 +60,7 @@ export function PlanEditor() {
   const [draft, setDraft] = useState<[number, number][]>([]);
   const [selZone, setSelZone] = useState<number | null>(null);
   const [selVertex, setSelVertex] = useState<number | null>(null);
+  const [selLayer, setSelLayer] = useState<number | null>(null);
   const [traces, setTraces] = useState<Record<string, TraceImg>>({});
   const [importText, setImportText] = useState("");
   const [liveSlugs, setLiveSlugs] = useState<string[]>([]);
@@ -273,6 +275,15 @@ export function PlanEditor() {
             zi === drag.zi
               ? { ...z, points: drag.orig.map(([x, y]) => [snap(x + dx), snap(y + dy)] as [number, number]) }
               : z,
+          ),
+        }));
+      } else if (drag.type === "layer") {
+        const dx = pt[0] - drag.start[0];
+        const dy = pt[1] - drag.start[1];
+        mutateSheet((s) => ({
+          ...s,
+          layers: s.layers?.map((L, li) =>
+            li === drag.li ? { ...L, x: drag.origX + dx, y: drag.origY + dy } : L,
           ),
         }));
       } else if (drag.type === "trace" && sheet) {
@@ -711,7 +722,7 @@ export function PlanEditor() {
               falls back to the legacy single satUrl. Wider layers (satellite of the lot) carry
               their own x/y/width/height and extend beyond the sheet for the zoomed-out hybrid. */}
           {sheet.layers?.length ? (
-            sheet.layers.map((L) =>
+            sheet.layers.map((L, li) =>
               L.visible === false ? null : (
                 <image
                   key={L.id}
@@ -722,6 +733,17 @@ export function PlanEditor() {
                   height={L.height ?? sheet.height}
                   opacity={L.opacity ?? 1}
                   preserveAspectRatio="none"
+                  transform={
+                    L.rotation
+                      ? `rotate(${L.rotation} ${(L.x ?? 0) + (L.width ?? sheet.width) / 2} ${(L.y ?? 0) + (L.height ?? sheet.height) / 2})`
+                      : undefined
+                  }
+                  style={{ cursor: tool === "select" && selLayer === li ? "move" : undefined }}
+                  onPointerDown={(e) => {
+                    if (tool !== "select" || selLayer !== li) return;
+                    e.stopPropagation();
+                    dragRef.current = { type: "layer", li, start: toPlan(e), origX: L.x ?? 0, origY: L.y ?? 0 };
+                  }}
                 />
               ),
             )
@@ -903,25 +925,67 @@ export function PlanEditor() {
         {(sheet.layers?.length ?? 0) > 0 && (
           <div className="rounded border border-paper/15 p-4">
             <p className="font-display text-[0.6875rem] uppercase tracking-[0.2em] text-champagne">Layers</p>
+            <p className="mt-1 text-[0.65rem] text-paper/45">Select a layer to move it on the canvas, rotate &amp; resize.</p>
             <div className="mt-3 flex flex-col gap-2 text-xs">
               {sheet.layers!.map((L, li) => (
-                <div key={L.id} className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={L.visible !== false}
-                    onChange={(e) => mutateSheet((s) => ({ ...s, layers: s.layers!.map((x, i) => (i === li ? { ...x, visible: e.target.checked } : x)) }))}
-                    className="accent-champagne"
-                  />
-                  <span className="flex-1 truncate text-paper/80">{L.label}</span>
-                  <input
-                    type="range"
-                    min={0}
-                    max={100}
-                    value={Math.round((L.opacity ?? 1) * 100)}
-                    onChange={(e) => mutateSheet((s) => ({ ...s, layers: s.layers!.map((x, i) => (i === li ? { ...x, opacity: Number(e.target.value) / 100 } : x)) }))}
-                    className="w-20 accent-champagne"
-                    title="opacity"
-                  />
+                <div key={L.id} className="flex flex-col gap-1">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={L.visible !== false}
+                      onChange={(e) => mutateSheet((s) => ({ ...s, layers: s.layers!.map((x, i) => (i === li ? { ...x, visible: e.target.checked } : x)) }))}
+                      className="accent-champagne"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setSelLayer(selLayer === li ? null : li)}
+                      className={`flex-1 truncate text-left ${selLayer === li ? "text-champagne" : "text-paper/80"}`}
+                    >
+                      {L.label}
+                    </button>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      value={Math.round((L.opacity ?? 1) * 100)}
+                      onChange={(e) => mutateSheet((s) => ({ ...s, layers: s.layers!.map((x, i) => (i === li ? { ...x, opacity: Number(e.target.value) / 100 } : x)) }))}
+                      className="w-16 accent-champagne"
+                      title="opacity"
+                    />
+                  </div>
+                  {selLayer === li && (
+                    <div className="flex items-center gap-1.5 pl-6 text-[0.65rem] text-paper/70">
+                      <span title="rotate" className="text-paper/50">↻</span>
+                      <input
+                        type="range"
+                        min={-180}
+                        max={180}
+                        value={Math.round(L.rotation ?? 0)}
+                        onChange={(e) => mutateSheet((s) => ({ ...s, layers: s.layers!.map((x, i) => (i === li ? { ...x, rotation: Number(e.target.value) } : x)) }))}
+                        className="w-16 accent-champagne"
+                        title="rotation"
+                      />
+                      <span className="w-8 tabular-nums text-paper/45">{Math.round(L.rotation ?? 0)}°</span>
+                      <label className="ml-1">W
+                        <input
+                          type="number"
+                          value={Math.round((L.width ?? sheet.width) * 10) / 10}
+                          step={1}
+                          onChange={(e) => mutateSheet((s) => ({ ...s, layers: s.layers!.map((x, i) => (i === li ? { ...x, width: Number(e.target.value) } : x)) }))}
+                          className="ml-0.5 w-12 rounded border border-paper/15 bg-transparent px-1 py-0.5"
+                        />
+                      </label>
+                      <label>H
+                        <input
+                          type="number"
+                          value={Math.round((L.height ?? sheet.height) * 10) / 10}
+                          step={1}
+                          onChange={(e) => mutateSheet((s) => ({ ...s, layers: s.layers!.map((x, i) => (i === li ? { ...x, height: Number(e.target.value) } : x)) }))}
+                          className="ml-0.5 w-12 rounded border border-paper/15 bg-transparent px-1 py-0.5"
+                        />
+                      </label>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
