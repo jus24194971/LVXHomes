@@ -141,8 +141,24 @@ function PlanSheetSVG({
             : undefined
         }
       >
-        {/* Base — the real satellite/aerial for georeferenced grounds, else the cream card */}
-        {sheet.satUrl ? (
+        {/* Base — stacked layers (aerial / ortho / satellite) if present, else the
+            legacy single satUrl, else the cream card */}
+        {sheet.layers?.length ? (
+          sheet.layers.map((L) =>
+            L.visible === false ? null : (
+              <image
+                key={L.id}
+                href={L.url}
+                x={L.x ?? 0}
+                y={L.y ?? 0}
+                width={L.width ?? sheet.width}
+                height={L.height ?? sheet.height}
+                opacity={L.opacity ?? 1}
+                preserveAspectRatio="none"
+              />
+            ),
+          )
+        ) : sheet.satUrl ? (
           <image
             href={sheet.satUrl}
             x={0}

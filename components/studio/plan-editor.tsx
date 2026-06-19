@@ -61,6 +61,7 @@ export function PlanEditor() {
   const [selVertex, setSelVertex] = useState<number | null>(null);
   const [traces, setTraces] = useState<Record<string, TraceImg>>({});
   const [importText, setImportText] = useState("");
+  const [liveSlugs, setLiveSlugs] = useState<string[]>([]);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveMsg, setSaveMsg] = useState("");
   const [satLoading, setSatLoading] = useState(false);
@@ -78,6 +79,7 @@ export function PlanEditor() {
 
   const sheet = sheets[sheetIdx];
   const trace = sheet ? traces[sheet.id] : undefined;
+  const allSlugs = Array.from(new Set([...PLANS.map((p) => p.tourSlug), ...liveSlugs]));
 
   const snapshot = useCallback(() => {
     undoStack.current.push(JSON.stringify(sheets));
@@ -407,6 +409,13 @@ export function PlanEditor() {
     const saved = typeof window !== "undefined" ? localStorage.getItem("lvx-plan-tourslug") : null;
     void loadForSlug(url || saved || "the-george");
   }, []);
+  // pull live (cloud-delivered) plan slugs so they show up in the picker, not just baked ones
+  useEffect(() => {
+    fetch("/studio/api/plans")
+      .then((r) => (r.ok ? r.json() : { slugs: [] }))
+      .then((d: { slugs?: string[] }) => setLiveSlugs(d.slugs ?? []))
+      .catch(() => {});
+  }, []);
   // remember the tour for next session
   useEffect(() => {
     if (typeof window !== "undefined") localStorage.setItem("lvx-plan-tourslug", tourSlug);
@@ -698,8 +707,25 @@ export function PlanEditor() {
             }
           >
 
-          {/* base image (satellite / orthomosaic / SLAM top-down) */}
-          {sheet.satUrl && (
+          {/* base layers (aerial overview / interior ortho / satellite), stacked bottom→top;
+              falls back to the legacy single satUrl. Wider layers (satellite of the lot) carry
+              their own x/y/width/height and extend beyond the sheet for the zoomed-out hybrid. */}
+          {sheet.layers?.length ? (
+            sheet.layers.map((L) =>
+              L.visible === false ? null : (
+                <image
+                  key={L.id}
+                  href={L.url}
+                  x={L.x ?? 0}
+                  y={L.y ?? 0}
+                  width={L.width ?? sheet.width}
+                  height={L.height ?? sheet.height}
+                  opacity={L.opacity ?? 1}
+                  preserveAspectRatio="none"
+                />
+              ),
+            )
+          ) : sheet.satUrl ? (
             <image
               href={sheet.satUrl}
               x={0}
@@ -713,7 +739,7 @@ export function PlanEditor() {
                   : undefined
               }
             />
-          )}
+          ) : null}
 
           {/* trace underlay */}
           {trace && (
@@ -873,6 +899,35 @@ export function PlanEditor() {
           </div>
         </div>
 
+        {/* base layers — toggle aerial / interior ortho / satellite, set opacity */}
+        {(sheet.layers?.length ?? 0) > 0 && (
+          <div className="rounded border border-paper/15 p-4">
+            <p className="font-display text-[0.6875rem] uppercase tracking-[0.2em] text-champagne">Layers</p>
+            <div className="mt-3 flex flex-col gap-2 text-xs">
+              {sheet.layers!.map((L, li) => (
+                <div key={L.id} className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={L.visible !== false}
+                    onChange={(e) => mutateSheet((s) => ({ ...s, layers: s.layers!.map((x, i) => (i === li ? { ...x, visible: e.target.checked } : x)) }))}
+                    className="accent-champagne"
+                  />
+                  <span className="flex-1 truncate text-paper/80">{L.label}</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={Math.round((L.opacity ?? 1) * 100)}
+                    onChange={(e) => mutateSheet((s) => ({ ...s, layers: s.layers!.map((x, i) => (i === li ? { ...x, opacity: Number(e.target.value) / 100 } : x)) }))}
+                    className="w-20 accent-champagne"
+                    title="opacity"
+                  />
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* selected zone */}
         <div className="rounded border border-paper/15 p-4">
           <p className="font-display text-[0.6875rem] uppercase tracking-[0.2em] text-champagne">
@@ -967,12 +1022,12 @@ export function PlanEditor() {
               }}
               className="flex-1 rounded border border-paper/20 bg-ink px-2 py-1.5 text-sm text-paper outline-none focus:border-champagne"
             >
-              {!PLANS.some((p) => p.tourSlug === tourSlug) && (
+              {!allSlugs.includes(tourSlug) && (
                 <option value={tourSlug}>{tourSlug}</option>
               )}
-              {PLANS.map((p) => (
-                <option key={p.tourSlug} value={p.tourSlug}>
-                  {p.tourSlug}
+              {allSlugs.map((s) => (
+                <option key={s} value={s}>
+                  {s}
                 </option>
               ))}
             </select>

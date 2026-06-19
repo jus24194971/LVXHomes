@@ -42,6 +42,28 @@ export type PlanZone = {
  */
 export type PlanPathKey = { t: number; x: number; y: number; h?: number; z?: number };
 
+/**
+ * A toggleable base/underlay image. A sheet can stack several — a drone aerial
+ * overview, the interior ortho ("Floor"), a satellite of the whole lot — rendered
+ * bottom→top with per-layer opacity + visibility. Placement defaults to the full
+ * sheet; a wider layer (satellite of the lot) sets x/y/width/height in plan units to
+ * extend beyond the sheet, georeferenced so the building still lines up when zoomed out.
+ */
+export type PlanLayer = {
+  id: string;
+  label: string;
+  /** data-URL or R2 URL of the image. */
+  url: string;
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  /** 0..1, default 1. */
+  opacity?: number;
+  /** default true. */
+  visible?: boolean;
+};
+
 export type PlanSheet = {
   id: string;
   label: string;
@@ -61,6 +83,10 @@ export type PlanSheet = {
    *  the Studio stitches it from the bbox, and both the Studio and the player
    *  minimap render the flight path + amenity dots over it. */
   satUrl?: string;
+  /** Stacked, toggleable base layers (aerial overview, interior ortho, satellite of
+   *  the lot). Rendered bottom→top; each may extend beyond the sheet. Falls back to
+   *  `satUrl` when absent. */
+  layers?: PlanLayer[];
   /** Degrees to rotate the base image + drawn content for display — straightens
    *  a diagonally-captured floorplan. Drawing accounts for it; the viewer applies
    *  the same rotation so zones stay locked to the image. */

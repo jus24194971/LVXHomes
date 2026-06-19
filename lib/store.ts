@@ -55,6 +55,17 @@ export async function getPinSetLive(uid: string): Promise<VideoPinSet | undefine
   return (await readRow<VideoPinSet>("pinset", uid)) ?? bakedPinSet(uid);
 }
 
+/** All live plan slugs (D1 "plan" rows) — so the editor can list cloud-delivered plans,
+ *  not just the baked ones. Most-recently-updated first. */
+export async function listPlanSlugs(): Promise<string[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const res = await db
+    .prepare("SELECT id FROM doc WHERE kind = 'plan' ORDER BY updated_at DESC")
+    .all<{ id: string }>();
+  return (res.results ?? []).map((r) => r.id);
+}
+
 /** Generic load used by the author API — live row or baked fallback, or null. */
 export async function getDocLive(kind: Kind, id: string): Promise<unknown> {
   if (kind === "tour") return (await getTourLive(id)) ?? null;
