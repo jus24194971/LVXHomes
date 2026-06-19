@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Plan, PlanSheet, PlanZone, PlanZoneKind } from "@/data/plans";
-import { PLANS } from "@/data/plans";
+import { PLANS, layerTransform } from "@/data/plans";
 import { ZONE_FILL } from "@/components/tour/plan";
 import { smoothPathD, zoneFontSize } from "@/lib/plan-geometry";
 import { loadDoc, saveDoc } from "@/lib/author-client";
@@ -733,11 +733,7 @@ export function PlanEditor() {
                   height={L.height ?? sheet.height}
                   opacity={L.opacity ?? 1}
                   preserveAspectRatio="none"
-                  transform={
-                    L.rotation
-                      ? `rotate(${L.rotation} ${(L.x ?? 0) + (L.width ?? sheet.width) / 2} ${(L.y ?? 0) + (L.height ?? sheet.height) / 2})`
-                      : undefined
-                  }
+                  transform={layerTransform(L, sheet.width, sheet.height)}
                   style={{ cursor: tool === "select" && selLayer === li ? "move" : undefined }}
                   onPointerDown={(e) => {
                     if (tool !== "select" || selLayer !== li) return;
@@ -954,7 +950,7 @@ export function PlanEditor() {
                     />
                   </div>
                   {selLayer === li && (
-                    <div className="flex items-center gap-1.5 pl-6 text-[0.65rem] text-paper/70">
+                    <div className="flex flex-wrap items-center gap-1.5 pl-6 text-[0.65rem] text-paper/70">
                       <span title="rotate" className="text-paper/50">↻</span>
                       <input
                         type="range"
@@ -966,24 +962,44 @@ export function PlanEditor() {
                         title="rotation"
                       />
                       <span className="w-8 tabular-nums text-paper/45">{Math.round(L.rotation ?? 0)}°</span>
-                      <label className="ml-1">W
-                        <input
-                          type="number"
-                          value={Math.round((L.width ?? sheet.width) * 10) / 10}
-                          step={1}
-                          onChange={(e) => mutateSheet((s) => ({ ...s, layers: s.layers!.map((x, i) => (i === li ? { ...x, width: Number(e.target.value) } : x)) }))}
-                          className="ml-0.5 w-12 rounded border border-paper/15 bg-transparent px-1 py-0.5"
-                        />
-                      </label>
-                      <label>H
-                        <input
-                          type="number"
-                          value={Math.round((L.height ?? sheet.height) * 10) / 10}
-                          step={1}
-                          onChange={(e) => mutateSheet((s) => ({ ...s, layers: s.layers!.map((x, i) => (i === li ? { ...x, height: Number(e.target.value) } : x)) }))}
-                          className="ml-0.5 w-12 rounded border border-paper/15 bg-transparent px-1 py-0.5"
-                        />
-                      </label>
+                      <span title="size" className="ml-1 text-paper/50">⤢</span>
+                      <input
+                        type="range"
+                        min={10}
+                        max={300}
+                        step={0.5}
+                        value={Math.round(L.width ?? sheet.width)}
+                        onChange={(e) => {
+                          const nw = Number(e.target.value);
+                          mutateSheet((s) => ({
+                            ...s,
+                            layers: s.layers!.map((x, i) => {
+                              if (i !== li) return x;
+                              const cw = x.width ?? s.width;
+                              const ch = x.height ?? s.height;
+                              return { ...x, width: nw, height: cw ? (ch * nw) / cw : nw };
+                            }),
+                          }));
+                        }}
+                        className="w-16 accent-champagne"
+                        title="size"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => mutateSheet((s) => ({ ...s, layers: s.layers!.map((x, i) => (i === li ? { ...x, flipH: !x.flipH } : x)) }))}
+                        className={`rounded border px-1 ${L.flipH ? "border-champagne text-champagne" : "border-paper/25 text-paper/55"}`}
+                        title="flip horizontal"
+                      >
+                        ⇆
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => mutateSheet((s) => ({ ...s, layers: s.layers!.map((x, i) => (i === li ? { ...x, flipV: !x.flipV } : x)) }))}
+                        className={`rounded border px-1 ${L.flipV ? "border-champagne text-champagne" : "border-paper/25 text-paper/55"}`}
+                        title="flip vertical"
+                      >
+                        ⇅
+                      </button>
                     </div>
                   )}
                 </div>

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Plan, PlanSheet, PlanZone } from "@/data/plans";
+import { layerTransform } from "@/data/plans";
 import { cn } from "@/lib/utils";
 import { centroidOf, zoneFontSize } from "@/lib/plan-geometry";
 
@@ -155,11 +156,7 @@ function PlanSheetSVG({
                 height={L.height ?? sheet.height}
                 opacity={L.opacity ?? 1}
                 preserveAspectRatio="none"
-                transform={
-                  L.rotation
-                    ? `rotate(${L.rotation} ${(L.x ?? 0) + (L.width ?? sheet.width) / 2} ${(L.y ?? 0) + (L.height ?? sheet.height) / 2})`
-                    : undefined
-                }
+                transform={layerTransform(L, sheet.width, sheet.height)}
               />
             ),
           )

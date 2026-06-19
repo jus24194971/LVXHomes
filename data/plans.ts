@@ -64,7 +64,24 @@ export type PlanLayer = {
   visible?: boolean;
   /** degrees, clockwise about the layer centre; default 0. */
   rotation?: number;
+  /** mirror about the layer centre. */
+  flipH?: boolean;
+  flipV?: boolean;
 };
+
+/** SVG transform for a base layer image — rotate + flip about its centre. */
+export function layerTransform(L: PlanLayer, sheetW: number, sheetH: number): string | undefined {
+  const w = L.width ?? sheetW;
+  const h = L.height ?? sheetH;
+  const cx = (L.x ?? 0) + w / 2;
+  const cy = (L.y ?? 0) + h / 2;
+  const sx = L.flipH ? -1 : 1;
+  const sy = L.flipV ? -1 : 1;
+  const parts: string[] = [];
+  if (L.rotation) parts.push(`rotate(${L.rotation} ${cx} ${cy})`);
+  if (sx < 0 || sy < 0) parts.push(`translate(${sx < 0 ? 2 * cx : 0} ${sy < 0 ? 2 * cy : 0}) scale(${sx} ${sy})`);
+  return parts.length ? parts.join(" ") : undefined;
+}
 
 export type PlanSheet = {
   id: string;
