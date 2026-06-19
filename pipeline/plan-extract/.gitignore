@@ -1,0 +1,17 @@
+# build / deps
+node_modules/
+__pycache__/
+
+# generated artifacts — renders, bases, ortho images, clouds, clips, telemetry, plan outputs
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.ply
+*.db
+*.srt
+*.sql
+*.plan.json
+_*.json
+
+# keep source: *.mjs, *.py, *.md, *.yaml, package*.json

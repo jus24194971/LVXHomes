@@ -1,0 +1,13 @@
+import { readDjiMeta } from "./exif-gps.mjs";
+import fs from "node:fs";
+import path from "node:path";
+const dir = "C:/Users/jus24/Videos/Maria Real Estate/Scottsdale House";
+const jpgs = fs.readdirSync(dir).filter((f) => /\.jpe?g$/i.test(f));
+const ms = jpgs.map((f) => readDjiMeta(path.join(dir, f))).filter((m) => m.lat != null);
+const lats = ms.map((m) => m.lat), lons = ms.map((m) => m.lon);
+let a = Math.min(...lats), b = Math.max(...lats), c = Math.min(...lons), d = Math.max(...lons);
+const pl = (b - a) * 0.6, po = (d - c) * 0.6; a -= pl; b += pl; c -= po; d += po;
+const lat0 = (a + b) / 2, mLat = (b - a) * 111320, mLon = (d - c) * 111320 * Math.cos((lat0 * Math.PI) / 180);
+const W = 1000, H = Math.round((W * mLat) / mLon);
+fs.writeFileSync("C:/Users/jus24/dev/scottsdale-base-test.plan.json", JSON.stringify({ sheets: [{ width: W, height: H, geo: { minLat: a, maxLat: b, minLon: c, maxLon: d } }] }, null, 2));
+console.log("footprint ~" + mLon.toFixed(0) + " x " + mLat.toFixed(0) + " m  ->  sheet " + W + "x" + H);
