@@ -69,6 +69,8 @@ export function PlanEditor() {
   const [satLoading, setSatLoading] = useState(false);
   const [view, setView] = useState({ x: -2, y: -2, w: 104, h: 74 }); // zoom/pan viewBox
   const [panMode, setPanMode] = useState(false); // hold Space to pan
+  const [zoneVis, setZoneVis] = useState(true); // show/hide the traced room zones
+  const [zoneDim, setZoneDim] = useState(100); // zone opacity % (dim to see layers beneath)
   const [showPath, setShowPath] = useState(true); // toggle the flight-path layer
   const [clip, setClip] = useState(false); // trim the base image to drawn walls/zones
 
@@ -792,7 +794,9 @@ export function PlanEditor() {
               ) : null,
             )}
 
-          {/* zones */}
+          {/* zones — toggleable + dimmable so the photo/plan layers stay visible under them */}
+          {zoneVis && (
+          <g opacity={zoneDim / 100}>
           {sheet.zones.map((z, zi) => {
             const selected = zi === selZone;
             return (
@@ -832,6 +836,8 @@ export function PlanEditor() {
               </g>
             );
           })}
+          </g>
+          )}
 
           {/* committed strokes — walls. Light halo + dark core so they read over a photo base. */}
           {sheet.strokes?.map((line, i) => {
@@ -889,6 +895,8 @@ export function PlanEditor() {
 
           {/* zone labels — drawn OUTSIDE the rotate/flip group, at each room's screen
               position, so they stay upright and readable no matter the sheet rotation */}
+          {zoneVis && (
+          <g opacity={zoneDim / 100}>
           {sheet.zones.map((z) => {
             const [cx, cy] = centroid(z.points);
             const fs = zoneFontSize(z.points, z.label, labelSize, labelSize * 0.34);
@@ -911,6 +919,8 @@ export function PlanEditor() {
               </text>
             );
           })}
+          </g>
+          )}
         </svg>
       </div>
 
@@ -939,6 +949,29 @@ export function PlanEditor() {
                 </button>
               )}
             </div>
+          </div>
+        </div>
+
+        {/* traced rooms — show/hide + dim, so the photo/plan layers underneath stay visible */}
+        <div className="rounded border border-paper/15 p-4">
+          <div className="flex items-center gap-2 text-xs">
+            <input
+              type="checkbox"
+              checked={zoneVis}
+              onChange={(e) => setZoneVis(e.target.checked)}
+              className="accent-champagne"
+            />
+            <span className="flex-1 font-display text-[0.6875rem] uppercase tracking-[0.2em] text-champagne">Rooms</span>
+            <input
+              type="range"
+              min={10}
+              max={100}
+              value={zoneDim}
+              onChange={(e) => setZoneDim(Number(e.target.value))}
+              className="w-24 accent-champagne"
+              title="room overlay opacity"
+            />
+            <span className="w-9 text-right tabular-nums text-paper/45">{zoneDim}%</span>
           </div>
         </div>
 
