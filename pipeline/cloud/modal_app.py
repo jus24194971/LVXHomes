@@ -151,6 +151,35 @@ ortho_image = modal.Image.debian_slim(python_version="3.11").pip_install(
     "opencv-python-headless", "numpy", "boto3"
 )
 
+# Image for the LaMa AI inpaint stage — resolution-robust large-mask fill of the nadir gaps (#71).
+lama_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("libgl1", "libglib2.0-0")
+    .pip_install("torch", "torchvision", "numpy", "pillow",
+                 "opencv-python-headless", "boto3", "simple-lama-inpainting")
+    # bake the big-lama weights into the image (downloads on CPU at build; runs on GPU at call)
+    .run_commands("python -c 'from simple_lama_inpainting import SimpleLama; SimpleLama()' || echo 'lama preload skipped (will download at runtime)'")
+)
+
+# Image for the 3D Gaussian Splatting stage — learned geometry for the photoreal dollhouse.
+# torch + gsplat (nerfstudio-project) on CUDA; prebuilt wheel matched to torch2.4/cu124 when
+# available, else a source build (the -devel base has nvcc; arch list covers A10G/A100/L4).
+gsplat_image = (
+    modal.Image.from_registry("pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel")
+    .env({"DEBIAN_FRONTEND": "noninteractive", "TZ": "Etc/UTC",
+          "TORCH_CUDA_ARCH_LIST": "8.0;8.6;8.9"})   # set BEFORE any gsplat JIT compile
+    .apt_install("git", "libgl1", "libglib2.0-0", "build-essential", "ninja-build")
+    .pip_install("numpy<2", "scipy", "opencv-python-headless", "boto3", "pillow",
+                 "jaxtyping", "rich", "typing_extensions", "ninja")
+    .run_commands(
+        "pip install gsplat==1.4.0 --index-url https://docs.gsplat.studio/whl/pt24cu124 --no-deps"
+        " || pip install gsplat==1.4.0 --no-build-isolation",
+        # AOT-compile the CUDA backend at BUILD time (nvcc only, no GPU needed; arch list
+        # above) — otherwise every fresh container pays a ~8 min JIT on first import.
+        "python -c \"from gsplat.cuda._backend import _C; print('gsplat CUDA backend compiled:', _C is not None)\"",
+    )
+)
+
 
 # --- helpers ----------------------------------------------------------------
 def _r2():
@@ -1266,7 +1295,9 @@ def make_render(slug: str, video_key: str, ceiling_ft: float = 9.0, pxm: float =
     T = np.loadtxt(traj)
     if T.ndim == 1:
         T = T[None, :]
-    vid = f"{sd}/slam.mp4"
+    vid = f"{sd}/hires.mp4"      # 4K texture proxy first (slam.mp4 = 1920x960 was a softness leak)
+    if not os.path.exists(vid):
+        vid = f"{sd}/slam.mp4"
     if not os.path.exists(vid):
         vid = "/tmp/v.mp4"; s3.download_file(R2_BUCKET, video_key, vid)
 
@@ -1398,7 +1429,8 @@ def make_render(slug: str, video_key: str, ceiling_ft: float = 9.0, pxm: float =
 
 @app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=3600)
 def make_fused(slug: str, video_key: str, ceiling_ft: float = 9.0, pxm: float = 48.0,
-               ceil_cut: float = 0.9, yflip: int = 1, lonsign: int = 1, cone_deg: float = 60.0) -> dict:
+               ceil_cut: float = 0.9, yflip: int = 1, lonsign: int = 1, cone_deg: float = 60.0,
+               depth: int = 1, fill: int = 1) -> dict:
     """FUSE nadir + depth from all the data. Per frame, sample each cell two ways:
        (a) NADIR — project the cell's floor-plane point, weight by how straight-down the
            view is (clean on the dominant flat floor);
@@ -1423,7 +1455,9 @@ def make_fused(slug: str, video_key: str, ceiling_ft: float = 9.0, pxm: float = 
     T = np.loadtxt(traj)
     if T.ndim == 1:
         T = T[None, :]
-    vid = f"{sd}/slam.mp4"   # SLAM clip (working). 4K hi-res = re-encode to H.264 first (next session, #67).
+    vid = f"{sd}/hires.mp4"      # full-res seek-friendly TEXTURE proxy (make_proxy) — #67
+    if not os.path.exists(vid):
+        vid = f"{sd}/slam.mp4"   # fallback: the 1920x960 tracking clip (soft texture)
     if not os.path.exists(vid):
         vid = "/tmp/v.mp4"; s3.download_file(R2_BUCKET, video_key, vid)
 
@@ -1439,7 +1473,7 @@ def make_fused(slug: str, video_key: str, ceiling_ft: float = 9.0, pxm: float = 
     floor = float(np.percentile(hgt, 1.5)); ceil = float(np.percentile(hgt, 99)); room = ceil - floor
     cut = floor + ceil_cut * room
     fpu = ceiling_ft / room if room > 0 else 1.0
-    W = min(1800, int((hi1 - lo1) * pxm) + 1); H = min(1800, int((hi2 - lo2) * pxm) + 1)
+    W = min(4096, int((hi1 - lo1) * pxm) + 1); H = min(4096, int((hi2 - lo2) * pxm) + 1)
 
     # densified surface (dense top height per cell) + footprint
     keep = (hgt < cut) & (pxa >= lo1) & (pxa <= hi1) & (pya >= lo2) & (pya <= hi2)
@@ -1487,9 +1521,15 @@ def make_fused(slug: str, video_key: str, ceiling_ft: float = 9.0, pxm: float = 
         rcn = rc / (np.linalg.norm(rc, axis=1, keepdims=True) + 1e-9)
         lon = lonsign * np.arctan2(rcn[:, 0], rcn[:, 2])
         lat = np.arcsin(np.clip(yflip * (-rcn[:, 1]), -1, 1))
-        u = (((lon / (2 * np.pi)) + 0.5) * Wv).astype(np.int32) % Wv
-        v = np.clip((0.5 - lat / np.pi) * Hv, 0, Hv - 1).astype(np.int32)
-        return fr[v, u], ray
+        # bilinear (int-cast nearest-neighbor was a verified softness leak); u wraps, v clamps
+        uf = (((lon / (2 * np.pi)) + 0.5) * Wv) % Wv
+        vf = np.clip((0.5 - lat / np.pi) * Hv, 0, Hv - 1.001)
+        x0 = np.floor(uf).astype(np.int32); x1 = (x0 + 1) % Wv
+        y0 = np.floor(vf).astype(np.int32); y1 = np.minimum(y0 + 1, Hv - 1)
+        fx = (uf - x0).astype(np.float32)[:, None]; fy = (vf - y0).astype(np.float32)[:, None]
+        col = (fr[y0, x0] * (1 - fx) * (1 - fy) + fr[y0, x1] * fx * (1 - fy)
+               + fr[y1, x0] * (1 - fx) * fy + fr[y1, x1] * fx * fy)
+        return np.clip(col, 0, 255).astype(np.uint8), ray
 
     for i in range(0, len(T), step):
         C = T[i, 1:4] - c; R = _quat2rot(T[i, 4:8])
@@ -1512,33 +1552,41 @@ def make_fused(slug: str, video_key: str, ceiling_ft: float = 9.0, pxm: float = 
         bn = wn > nW; nC[bn] = coln[bn]; nW[bn] = wn[bn]
     cap.release()
 
-    # composite: nadir base where it has a confident sample, depth fills the gaps
+    # composite: nadir base; depth fills gaps UNLESS disabled (nadir-only clean mode for the AI fill)
     out = np.zeros((len(idx), 3), np.uint8)
-    hasn = nW > 0.05; hasd = dW > 0.05
-    out[hasd] = dC[hasd]; out[hasn] = nC[hasn]            # nadir overwrites depth (base)
+    hasn = nW > 0.05; hasd = (dW > 0.05) if depth else np.zeros(len(idx), bool)
+    if depth:
+        out[hasd] = dC[hasd]                             # depth-fill (smears 3D content -> the "tears")
+    out[hasn] = nC[hasn]                                 # nadir overwrites depth (clean straight-down base)
     img = np.zeros((H * W, 3), np.uint8); img[idx] = out
     hit = np.zeros(H * W, bool); hit[idx[hasn | hasd]] = True
     img = cv2.cvtColor(img.reshape(H, W, 3), cv2.COLOR_RGB2BGR)
     fm2 = cv2.morphologyEx(hit.reshape(H, W).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-    # building OUTLINE: solid-fill the captured region, inpaint EVERY interior gap → complete photo
     cm = cv2.morphologyEx(fm2 * 255, cv2.MORPH_CLOSE, np.ones((31, 31), np.uint8))
     cnts, _ = cv2.findContours(cm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     outline = np.zeros((H, W), np.uint8)
     if cnts:
         cv2.drawContours(outline, [max(cnts, key=cv2.contourArea)], -1, 255, -1)
     outm = outline > 0
+    if not fill:
+        # NADIR-ONLY CLEAN: no depth smear, no cv2 gap-inpaint. Leave gaps BLACK and emit a gap mask
+        # (black cells inside the footprint) so LaMa can fill them with plausible floor. #71.
+        img[~outm] = 0
+        gap = (outm & (img.sum(2) == 0)).astype(np.uint8) * 255
+        gap = cv2.morphologyEx(gap, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))   # drop pinpricks
+        gap = cv2.dilate(gap, np.ones((5, 5), np.uint8))                          # let LaMa breathe past edges
+        ck = f"ortho/{slug}_nadir_clean.png"; cv2.imwrite("/tmp/c.png", img); s3.upload_file("/tmp/c.png", R2_BUCKET, ck)  # lossless into LaMa (was a double-JPEG)
+        gk = f"ortho/{slug}_gap.png"; cv2.imwrite("/tmp/g.png", gap); s3.upload_file("/tmp/g.png", R2_BUCKET, gk)
+        npct = int(hasn.mean() * 100); gpct = int((gap > 0).mean() * 100)
+        print(f"[fused nadir-clean] {slug}: {W}x{H}, nadir {npct}%, gaps {gpct}% -> {ck} + {gk}")
+        return {"clean": ck, "gap": gk, "px": [int(W), int(H)], "nadir_pct": npct, "gap_pct": gpct}
     holes = (outm & (fm2 == 0)).astype(np.uint8)
     img = cv2.inpaint(img, holes, 6, cv2.INPAINT_NS)
     img[~outm] = 0
-    img = cv2.medianBlur(img, 3)                     # light denoise (high-res source needs less)
-    img = cv2.addWeighted(img, 1.35, cv2.GaussianBlur(img, (0, 0), 1.2), -0.35, 0)  # gentle sharpen
+    # (medianBlur removed — it erased grout/wood-grain; bilinear sampling denoises enough)
+    img = cv2.addWeighted(img, 1.25, cv2.GaussianBlur(img, (0, 0), 1.2), -0.25, 0)  # gentle sharpen
     img[~outm] = 0
-    # WALL LINES from geometry (Justin's crop-to-walls): near-ceiling cloud points — walls reach
-    # the ceiling, furniture doesn't — project to the room perimeter + interior walls; draw them
-    # over the texture, which covers the messy wall-base speckle for a clean floorplan look.
-    # (geometry wall-lines are off by default now — the cloud is too noisy for crisp walls; the
-    # clean source is the HorizonNet room polygons laid over the texture. See #67. Texture only here.)
-    o = "/tmp/fused.jpg"; cv2.imwrite(o, img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    o = "/tmp/fused.jpg"; cv2.imwrite(o, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
     key = f"ortho/{slug}.jpg"; s3.upload_file(o, R2_BUCKET, key)
 
     ftw = round(float((hi1 - lo1) * fpu), 1); fth = round(float((hi2 - lo2) * fpu), 1)
@@ -1989,7 +2037,7 @@ def make_walls_ai(slug: str, video_key: str, ceiling_ft: float = 9.0, spacing_ft
 
 @app.function(image=horizon_image, gpu="T4", secrets=[r2_secret], volumes={"/scratch": vol}, timeout=3600)
 def localize_stills(slug: str, video_key: str, ceiling_ft: float = 9.0, n_frames: int = 160,
-                    stills_prefix: str = "", srt_key: str = "") -> dict:
+                    stills_prefix: str = "", srt_key: str = "", pin_radius_ft: float = 9.0) -> dict:
     """Localize each dedicated 360 STILL into the VSLAM frame: ORB-match it to the video
     frame it overlaps (the 'common frames'), inherit that frame's pose -> the still's true
     feet position in the make_fused plan frame. -> layout/{slug}/localize.json."""
@@ -2066,6 +2114,38 @@ def localize_stills(slug: str, video_key: str, ceiling_ft: float = 9.0, n_frames
         if keys:
             print(f"[localize] {len(keys)} stills under {prefix}")
             break
+
+    # SINGLE-POINT capture pins (Justin's field-tagging workflow): one tap per still on
+    # the CubiCasa plan at capture time -> projects/{project}/still_pins.json
+    # {"space": "plan_norm", "pins": {uuid: [nx, ny]}} (normalized to the plan image).
+    # With the plan alignment (layout/{slug}/plan_align.json, from _fitalign.py or hand
+    # calibration) each pin becomes a floor-frame position prior, and the match search
+    # shrinks from the WHOLE flight to frames within pin_radius_ft — no global visual
+    # ambiguity. Yaw and all presentation (tour pin fade in/out) are derived downstream;
+    # the tap is the only user input. No pins / no alignment -> global match as before.
+    pin_ft = {}
+    try:
+        pkey = prefix.rsplit("still/", 1)[0] + "still_pins.json"
+        pj = json.loads(s3.get_object(Bucket=R2_BUCKET, Key=pkey)["Body"].read())
+        al = json.loads(s3.get_object(Bucket=R2_BUCKET,
+                                      Key=f"layout/{slug}/plan_align.json")["Body"].read())
+        FXa, FYa, FWa, FHa = al["FX"], al["FY"], al["FW"], al["FH"]
+        ROTa, FLIPa = al["ROT"], al.get("FLIPH", True)
+        CXa, CYa, CWa, CHa = al.get("CX", 0.0), al.get("CY", 0.0), al["CW"], al["CH"]
+        cxa = FXa + FWa / 2.0; cya = FYa + FHa / 2.0
+        tha = np.radians(ROTa); ca, sa = np.cos(-tha), np.sin(-tha)
+        for nm, xy in (pj.get("pins") or {}).items():
+            sx = float(xy[0]) * CWa + CXa                     # plan_norm -> plan canvas ft
+            sy = float(xy[1]) * CHa + CYa
+            dx = sx - cxa; dy = sy - cya                      # same forward map as the plansheet
+            p1x = cxa + ca * dx - sa * dy
+            p1y = cya + sa * dx + ca * dy
+            if FLIPa:
+                p1x = 2 * cxa - p1x
+            pin_ft[nm] = [(p1x - FXa) / FWa * ftw, (p1y - FYa) / FHa * fth]
+        print(f"[localize] {len(pin_ft)} capture pins loaded (radius {pin_radius_ft} ft)")
+    except Exception as e:
+        print(f"[localize] no capture pins in play ({type(e).__name__}) — global matching")
     out = {}
     for key in keys:
         name = os.path.splitext(os.path.basename(key))[0]
@@ -2075,8 +2155,15 @@ def localize_stills(slug: str, video_key: str, ceiling_ft: float = 9.0, n_frames
             continue
         g = cv2.cvtColor(cv2.resize(im, (1024, 512)), cv2.COLOR_BGR2GRAY)
         _, sdes = orb.detectAndCompute(g, None)
+        pf = pin_ft.get(name)
+        cand = frames
+        if pf is not None:                                    # pin -> local search only
+            near = [f for f in frames
+                    if (f[2][0] - pf[0]) ** 2 + (f[2][1] - pf[1]) ** 2 < pin_radius_ft ** 2]
+            if len(near) >= 3:
+                cand = near
         best_feet, best_fi, best_cnt, best_head = None, -1, -1, None
-        for fi, fdes, feet, fhead in frames:
+        for fi, fdes, feet, fhead in cand:
             matches = bf.knnMatch(sdes, fdes, k=2)
             good = sum(1 for mm in matches if len(mm) == 2 and mm[0].distance < 0.75 * mm[1].distance)
             if good > best_cnt:
@@ -2084,7 +2171,12 @@ def localize_stills(slug: str, video_key: str, ceiling_ft: float = 9.0, n_frames
         out[name] = {"frame": int(best_fi), "feet": [round(best_feet[0], 2), round(best_feet[1], 2)], "matches": int(best_cnt)}
         if best_head is not None:
             out[name]["head"] = round(best_head, 1)
-        print(f"[localize] {name}: frame {best_fi} ({best_cnt} matches) -> ({out[name]['feet'][0]}, {out[name]['feet'][1]}) ft")
+        if pf is not None:
+            out[name]["pin_ft"] = [round(pf[0], 2), round(pf[1], 2)]
+            out[name]["pinned"] = bool(cand is not frames)
+        print(f"[localize] {name}: frame {best_fi} ({best_cnt} matches"
+              f"{', pinned ' + str(len(cand)) + ' cand' if pf is not None and cand is not frames else ''})"
+              f" -> ({out[name]['feet'][0]}, {out[name]['feet'][1]}) ft")
 
     # ---- cross-stream heading calibration (Justin's GPS/compass idea): the flythrough's
     # own VSLAM head vs its SRT compass (gb_yaw) over the sampled frames -> one constant
@@ -2210,6 +2302,688 @@ def vslam(key: str, slug: str):
     print(run_vslam.remote(key, slug))
 
 
+@app.function(image=vslam_image, gpu="T4", volumes={"/scratch": vol}, secrets=[r2_secret], timeout=3600)
+def make_proxy(slug: str, video_key: str = "", maxw: int = 4096, gop: int = 15, crf: int = 20,
+               src_name: str = "raw.mp4", out_name: str = "hires.mp4", use_gpu: bool = True) -> dict:
+    """Render a full-res, seek-friendly proxy of a capture on the volume (#67).
+    slam.mp4 is downscaled to 1920x960 for tracking — too soft for a crisp floor texture.
+    The raw 4K/5.7K HEVC is sharp but seeks glacially in OpenCV (decode-from-keyframe on a
+    long GOP) -> the texture pass times out the Modal worker. Fix: re-encode the source ONCE to
+    H.264 at native-or-4K with a TIGHT, uniform GOP (cheap MSEC seeks), cache on the volume.
+    Default raw.mp4 -> hires.mp4 (equirect texture). Also used for the 4K nadir reframe
+    (src_name=nadir4k.mp4 -> out_name=nadir_hires.mp4), which OpenCV would otherwise seek too slowly."""
+    import os
+    import json as _json
+    import subprocess
+
+    vol.reload()
+    sd = f"/scratch/{slug}"; os.makedirs(sd, exist_ok=True)
+    src = f"{sd}/{src_name}"
+    if not os.path.exists(src):
+        if not video_key:
+            raise RuntimeError(f"no {src_name} on volume for {slug}; pass --video-key to pull from R2")
+        src = "/tmp/src.mp4"; _r2().download_file(R2_BUCKET, video_key, src)
+
+    out = f"{sd}/{out_name}"
+    # cap width at maxw, NEVER upscale, PRESERVE aspect (-2 = auto even height) — works for both the
+    # 2:1 equirect and the 16:9 nadir reframe; uniform tight GOP for cheap MSEC seeks.
+    sc = f"scale='min({maxw},iw)':-2"
+    cpu_cmd = ["ffmpeg", "-y", "-i", src, "-vf", sc,
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+               "-x264-params", f"keyint={gop}:min-keyint={gop}:scenecut=0",
+               "-pix_fmt", "yuv420p", "-an", out]
+    # GPU path: NVDEC decode + NVENC encode — the heavy cost is decoding 10-bit 4K/6K HEVC, which
+    # -hwaccel cuda offloads to the GPU; h264_nvenc encodes on-chip (10-20x the CPU x264 throughput).
+    # Uniform tight GOP, no B-frames -> cheap cv2 MSEC seeks. Falls back to CPU x264 if NVENC is absent.
+    gpu_cmd = ["ffmpeg", "-y", "-hwaccel", "cuda", "-i", src,
+               "-vf", f"{sc},format=yuv420p",
+               "-c:v", "h264_nvenc", "-preset", "p4", "-cq", str(crf),
+               "-g", str(gop), "-bf", "0", "-an", out]
+    mode = "cpu(x264)"
+    if use_gpu:
+        enc = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+        if "h264_nvenc" in enc:
+            try:
+                subprocess.run(gpu_cmd, check=True, capture_output=True, text=True)
+                mode = "gpu(nvenc)"
+            except subprocess.CalledProcessError as e:
+                print(f"[proxy] nvenc failed -> CPU fallback: {(e.stderr or '')[-400:]}")
+                subprocess.run(cpu_cmd, check=True)
+        else:
+            print("[proxy] h264_nvenc not in this ffmpeg build -> CPU x264")
+            subprocess.run(cpu_cmd, check=True)
+    else:
+        subprocess.run(cpu_cmd, check=True)
+    vol.commit()
+
+    dims = {}
+    try:
+        pr = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "json", out],
+            capture_output=True, text=True,
+        )
+        st = _json.loads(pr.stdout)["streams"][0]; dims = {"w": st.get("width"), "h": st.get("height")}
+    except Exception:
+        pass
+    mb = round(os.path.getsize(out) / 1e6, 1)
+    print(f"[proxy] {slug}: {dims} {mb} MB seek-friendly H.264 via {mode} -> {out}")
+    return {"hires": out, "mb": mb, "mode": mode, **dims}
+
+
+@app.local_entrypoint()
+def proxy(slug: str, video_key: str = "", src_name: str = "raw.mp4", out_name: str = "hires.mp4",
+          use_gpu: bool = True):
+    """Render a seek-friendly proxy once, cached on the volume (NVENC on GPU, CPU x264 fallback):
+        modal run modal_app.py::proxy --slug scottsdale-fly                                  # raw.mp4 -> hires.mp4
+        modal run modal_app.py::proxy --slug scottsdale-fly --src-name nadir4k.mp4 --out-name nadir_hires.mp4"""
+    print(make_proxy.remote(slug, video_key, src_name=src_name, out_name=out_name, use_gpu=use_gpu))
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=3600,
+              memory=10240)
+def make_nadir_mosaic(slug: str, nadir_name: str = "nadir_hires.mp4", ceiling_ft: float = 9.0,
+                      pxm: float = 80.0, fov_deg: float = 79.5, fov_axis: str = "h", yaw_off: float = 0.0,
+                      t_off: float = 0.0, sx: int = 1, sy: int = 1, swap: int = 0,
+                      frame_step: int = 2, feather: float = 4.0, gain: int = 1, sharp_gate: int = 1,
+                      mode: str = "select") -> dict:
+    """Drape a true-NADIR 4K reframe onto the VSLAM poses we already solved for THIS flight (#67).
+    v2 (orthomosaic-grade): SEQUENTIALLY decodes ALL frames (no seek subsampling), gates out
+    motion-blurred frames (rolling-median Laplacian variance), FEATHER-BLENDS every observation
+    (w^feather center-weighted accumulation — kills the winner-take-all seams/serration), applies
+    incremental GAIN COMPENSATION per frame against the mosaic built so far (kills auto-exposure
+    patchwork), samples bilinearly, and writes a LOSSLESS PNG + gap mask for LaMa.
+    Projection stays the validated yaw-only model: the DJI reframe is synthetically locked to true
+    nadir, so residual tilt is already removed in the video itself. SAME feet frame as make_fused."""
+    import os
+    import time
+    import numpy as np
+    import cv2
+
+    s3 = _r2(); sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = f"{sd}/keyframe_trajectory.txt"
+    T = np.loadtxt(traj)
+    if T.ndim == 1:
+        T = T[None, :]
+    vid = f"{sd}/{nadir_name}"
+    if not os.path.exists(vid):
+        raise RuntimeError(f"nadir proxy not staged: {vid} (run proxy --src-name nadir4k.mp4 --out-name {nadir_name})")
+
+    # floor frame — IDENTICAL derivation to make_fused so the mosaic registers with everything
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False); up = Vt[2].astype("f4")
+    cams = T[:, 1:4]
+    if np.dot(cams.mean(0) - c, up) < 0:
+        up = -up
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    pxa = X @ e1; pya = X @ e2; hgt = X @ up
+    lo1, hi1 = np.percentile(pxa, [1, 99]); lo2, hi2 = np.percentile(pya, [1, 99])
+    floor = float(np.percentile(hgt, 1.5)); ceil = float(np.percentile(hgt, 99)); room = ceil - floor
+    fpu = ceiling_ft / room if room > 0 else 1.0
+    W = min(6000, int((hi1 - lo1) * pxm) + 1); H = min(6000, int((hi2 - lo2) * pxm) + 1)
+    span1 = hi1 - lo1; span2 = hi2 - lo2
+
+    cap = cv2.VideoCapture(vid)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    nfr = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    Hv = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)); Wv = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    if not Wv or not Hv:
+        raise RuntimeError(f"could not open nadir video: {vid}")
+    half = np.radians(fov_deg) / 2.0                      # f_px is what matters; pixels are square (SAR 1:1)
+    if fov_axis == "v":
+        f_px = (Hv / 2.0) / np.tan(half)
+    elif fov_axis == "d":
+        f_px = (np.hypot(Wv, Hv) / 2.0) / np.tan(half)
+    else:                                                 # "h" — horizontal FOV (typical reframe spec)
+        f_px = (Wv / 2.0) / np.tan(half)
+    ts = T[:, 0].copy()
+    if nfr and ts.max() > (nfr / fps) * 2:
+        ts = ts / fps
+
+    # precompute poses once — v2 decodes the whole video sequentially and looks up the
+    # nearest pose per FRAME (the tight-GOP proxy makes sequential decode cheap; seeks were
+    # what forced the old ~700-frame subsample)
+    Rm = np.array([_quat2rot(q) for q in T[:, 4:8]])
+    Cm = T[:, 1:4] - c
+    pose_ok = np.isfinite(Cm).all(1) & np.isfinite(Rm.reshape(len(T), -1)).all(1)
+    # Track smoothing OFF by default (ksm=0): tested on the serpentine Scottsdale flight, a boxcar
+    # lags the true track into the inside of every turn and WORSENS tile registration. Keep the
+    # hook for straight-line survey flights only.
+    ksm = 0
+    if ksm and len(Cm) > 2 * ksm:
+        Cs = Cm.copy()
+        good = pose_ok.astype(np.float64)
+        for ax in range(3):
+            v = np.where(pose_ok, Cm[:, ax], 0.0)
+            num = np.convolve(v, np.ones(ksm), mode="same")
+            den = np.convolve(good, np.ones(ksm), mode="same")
+            Cs[:, ax] = np.where(den > 0, num / np.maximum(den, 1e-9), Cm[:, ax])
+        Cm = np.where(pose_ok[:, None], Cs, Cm)
+
+    # INSTANTANEOUS heading: the reframe is drone-yaw-locked (verified on this capture — total
+    # yaw excursion ~3 deg), so the raw per-pose heading is the correct rotation. Smoothing it was
+    # tested and REGRESSES: it adds ~1-2 deg of tile-to-tile rotational mismatch (radial fans).
+    fwd_all = Rm @ np.array([0.0, 0.0, 1.0])
+    fh = fwd_all - np.outer(fwd_all @ up, up)
+    psi_raw = np.arctan2(fh @ e2, fh @ e1)
+    psi_s = np.unwrap(np.where(np.isfinite(psi_raw), psi_raw, 0.0))
+
+    p = float(feather)
+    select = (mode == "select")
+    # select: per-cell ARGMAX (v1's proven-sharp semantics — blending exposes residual pose error
+    # as smear, selection hides it) with v2's gates/gain on top. blend: w^p feathered accumulation.
+    acc = np.zeros((H * W, 3), np.float32)   # blend: weighted color sum | select: winning color
+    accw = np.zeros(H * W, np.float32)       # blend: weight sum         | select: best weight
+    used = 0; skip_blur = 0; reg_hits = 0
+    drift1 = 0.0; drift2 = 0.0               # running frame->mosaic registration correction (plan units)
+    sharps = []
+    fi = -1; last_pi = -1
+    while True:
+        ok, fr = cap.read()
+        if not ok:
+            break
+        fi += 1
+        if fi % max(1, frame_step):
+            continue
+        t = fi / fps + t_off
+        pi = int(np.searchsorted(ts, t))
+        if pi >= len(ts):
+            pi = len(ts) - 1
+        if pi > 0 and abs(float(ts[pi - 1]) - t) < abs(float(ts[pi]) - t):
+            pi -= 1
+        if abs(float(ts[pi]) - t) > 1.5 / fps or not pose_ok[pi]:
+            continue                                       # tracking lost around this frame
+        if pi == last_pi:
+            continue                                       # same pose as previous frame — painting it
+        last_pi = pi                                       # twice just adds misregistered content
+        C = Cm[pi]; R = Rm[pi]
+        h = float(C @ up - floor)
+        # takeoff/landing gate must be SCALE-RELATIVE: monocular VSLAM units are arbitrary
+        # (review-confirmed: absolute 0.3 could silently blank a small-scale reconstruction)
+        if not np.isfinite(h) or h < (1.5 / ceiling_ft) * room:   # ~1.5 ft above floor
+            continue
+        psi = float(psi_s[pi]) + np.radians(yaw_off)       # SMOOTHED heading (matches the reframe)
+        cps, sps = np.cos(psi), np.sin(psi)
+        Ce1 = float(C @ e1) + drift1; Ce2 = float(C @ e2) + drift2   # registration-corrected placement
+        if sharp_gate:
+            # rolling-median Laplacian variance: motion-blurred frames poison a blend, skip them
+            g = cv2.cvtColor(cv2.resize(fr, (480, 270)), cv2.COLOR_BGR2GRAY)
+            s = float(cv2.Laplacian(g, cv2.CV_64F).var())
+            sharps.append(s)
+            if len(sharps) > 30 and s < 0.55 * float(np.median(sharps[-121:])):
+                skip_blur += 1
+                continue
+
+        def project(ce1, ce2):
+            """Project this frame onto the canvas at camera-centre (ce1, ce2); bilinear gather."""
+            fwid = h * (np.hypot(Wv, Hv) / 2.0) / f_px * 1.2
+            a0 = int(np.clip((ce1 - fwid - lo1) / span1 * (W - 1), 0, W - 1))
+            a1 = int(np.clip((ce1 + fwid - lo1) / span1 * (W - 1) + 1, 0, W))
+            b0 = int(np.clip((ce2 - fwid - lo2) / span2 * (H - 1), 0, H - 1))
+            b1 = int(np.clip((ce2 + fwid - lo2) / span2 * (H - 1) + 1, 0, H))
+            if a1 <= a0 or b1 <= b0:
+                return None
+            sj, si = np.mgrid[b0:b1, a0:a1]
+            gidx = (sj * W + si).ravel()
+            sP1 = lo1 + si.ravel() / (W - 1) * span1
+            sP2 = lo2 + sj.ravel() / (H - 1) * span2
+            dxx = sP1 - ce1; dyy = sP2 - ce2
+            u_cam = dxx * cps + dyy * sps
+            v_cam = -dxx * sps + dyy * cps
+            if swap:
+                u_cam, v_cam = v_cam, u_cam
+            u_img = Wv / 2.0 + sx * (f_px / h) * u_cam
+            v_img = Hv / 2.0 + sy * (f_px / h) * v_cam
+            inb = (u_img >= 0) & (u_img < Wv - 1) & (v_img >= 0) & (v_img < Hv - 1)
+            if not inb.any():
+                return None
+            rr = np.sqrt((u_img - Wv / 2.0) ** 2 + (v_img - Hv / 2.0) ** 2) / (Hv / 2.0)
+            w = np.clip(1.0 - 0.85 * rr, 0.0, 1.0).astype(np.float32) ** p
+            w[~inb] = 0.0
+            sel = w > 1e-6
+            if not sel.any():
+                return None
+            uf = u_img[sel]; vf = v_img[sel]
+            x0 = np.floor(uf).astype(np.int32); y0 = np.floor(vf).astype(np.int32)
+            fx = (uf - x0).astype(np.float32)[:, None]; fy = (vf - y0).astype(np.float32)[:, None]
+            c00 = fr[y0, x0].astype(np.float32); c10 = fr[y0, x0 + 1].astype(np.float32)
+            c01 = fr[y0 + 1, x0].astype(np.float32); c11 = fr[y0 + 1, x0 + 1].astype(np.float32)
+            col = c00 * (1 - fx) * (1 - fy) + c10 * fx * (1 - fy) + c01 * (1 - fx) * fy + c11 * fx * fy
+            return gidx, sel, w, col, (b1 - b0, a1 - a0)
+
+        res = project(Ce1, Ce2)
+        if res is None:
+            continue
+        gidx, sel, w, col, (bh, bw) = res
+        # REGISTER frame -> mosaic (blend mode only): residual pose drift leaves each tile a few
+        # px off; phase-correlate this frame's projection against the mosaic already built in its
+        # bbox and correct placement BEFORE accumulating (this is what lets blending stay sharp).
+        seenb = accw[gidx] > 0.5
+        if (not select) and int(seenb.sum()) > 3000:
+            fp = np.zeros(bh * bw, np.float32)
+            fp[sel] = col.mean(1)
+            mp = np.zeros(bh * bw, np.float32)
+            mp[seenb] = acc[gidx[seenb]].sum(1) / (3.0 * accw[gidx[seenb]])
+            both = (fp > 0) & (mp > 0)
+            if int(both.sum()) > 3000:
+                fp[~both] = 0.0; mp[~both] = 0.0
+                win = cv2.createHanningWindow((bw, bh), cv2.CV_32F)
+                (shx, shy), resp = cv2.phaseCorrelate(mp.reshape(bh, bw), fp.reshape(bh, bw), win)
+                if resp > 0.04 and abs(shx) < 18 and abs(shy) < 18 and (abs(shx) > 0.5 or abs(shy) > 0.5):
+                    d1 = shx * span1 / (W - 1); d2 = shy * span2 / (H - 1)
+                    drift1 -= 0.45 * d1; drift2 -= 0.45 * d2      # EMA drift carried to next frames
+                    res2 = project(Ce1 - d1, Ce2 - d2)            # re-place THIS frame corrected
+                    if res2 is not None:
+                        gidx, sel, w, col, (bh, bw) = res2
+                        reg_hits += 1
+        used += 1
+        gi = gidx[sel]; ws = w[sel]
+        if gain:
+            # incremental gain compensation: match this frame to the mosaic already built where
+            # they overlap — auto-exposure flicker is the patchwork's root cause
+            seen = accw[gi] > (0.15 if select else 0.5)
+            if int(seen.sum()) > 400:
+                if select:
+                    mos = acc[gi[seen]].mean(1)
+                else:
+                    mos = acc[gi[seen]].sum(1) / (3.0 * accw[gi[seen]])
+                cur = col[seen].mean(1) + 1e-3
+                gval = float(np.clip(np.median(mos / cur), 0.75, 1.35))
+                col *= gval
+        if select:
+            cand = ws > accw[gi]                    # v1's proven argmax: best view wins the cell
+            if cand.any():
+                gc = gi[cand]
+                acc[gc] = col[cand]
+                accw[gc] = ws[cand]
+        else:
+            acc[gi] += col * ws[:, None]
+            accw[gi] += ws
+    cap.release()
+
+    covm = accw > 1e-6
+    img = np.zeros((H * W, 3), np.float32)
+    if select:
+        img[covm] = acc[covm]
+    else:
+        img[covm] = acc[covm] / accw[covm, None]
+    img = np.clip(img, 0, 255).astype(np.uint8).reshape(H, W, 3)   # frames stayed BGR throughout
+    hit = covm.reshape(H, W).astype(np.uint8)
+    fm = cv2.morphologyEx(hit, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    gapm = ((fm > 0) & (hit == 0)).astype(np.uint8) * 255          # for LaMa — no NS smear here
+    img[fm == 0] = 0
+    o = "/tmp/nadir.png"; cv2.imwrite(o, img)                      # LOSSLESS master
+    key = f"ortho/{slug}_nadir.png"; s3.upload_file(o, R2_BUCKET, key)
+    oj = "/tmp/nadir.jpg"; cv2.imwrite(oj, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    s3.upload_file(oj, R2_BUCKET, f"ortho/{slug}_nadir.jpg")       # quick-view copy
+    gk = f"ortho/{slug}_nadir_gap.png"; cv2.imwrite("/tmp/ng.png", gapm); s3.upload_file("/tmp/ng.png", R2_BUCKET, gk)
+
+    cov = int(covm.mean() * 100)
+    ftw = round(float(span1 * fpu), 1); fth = round(float(span2 * fpu), 1)
+    print(f"[nadir v2] {slug}: {W}x{H}, {used} frames blended ({skip_blur} blur-skipped, "
+          f"{reg_hits} registration-corrected), {cov}% covered, feather^{p} gain{gain} step{frame_step}, "
+          f"{ftw}x{fth}ft -> {key}")
+    return {"ortho": key, "gap": gk, "px": [int(W), int(H)], "frames": int(used),
+            "blur_skipped": int(skip_blur), "cov_pct": cov, "ft": [ftw, fth], "fov": fov_deg}
+
+
+@app.local_entrypoint()
+def nadir(slug: str, ceiling_ft: float = 9.0, pxm: float = 80.0, fov_deg: float = 79.5,
+          fov_axis: str = "h", yaw_off: float = 0.0, t_off: float = 0.0, sx: int = 1, sy: int = 1,
+          swap: int = 0, nadir_name: str = "nadir_hires.mp4", frame_step: int = 2,
+          feather: float = 4.0, gain: int = 1, sharp_gate: int = 1, mode: str = "select"):
+    """v2 orthomosaic of the true-nadir 4K reframe (all frames, blur-gated, argmax-SELECT by
+    default — sharp by construction — with gain compensation; --mode blend for feathered):
+        modal run modal_app.py::nadir --slug scottsdale-nadir --ceiling-ft 8.5 --pxm 100"""
+    print(make_nadir_mosaic.remote(slug, nadir_name=nadir_name, ceiling_ft=ceiling_ft, pxm=pxm,
+                                   fov_deg=fov_deg, fov_axis=fov_axis, yaw_off=yaw_off, t_off=t_off,
+                                   sx=sx, sy=sy, swap=swap, frame_step=frame_step, feather=feather,
+                                   gain=gain, sharp_gate=sharp_gate, mode=mode))
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=3600,
+              memory=10240)
+def make_furnish(slug: str, nadir_name: str = "nadir_hires.mp4", base_key: str = "",
+                 ceiling_ft: float = 9.0, pxm: float = 100.0, fov_deg: float = 79.5,
+                 yaw_off: float = 0.0, max_blobs: int = 60, ribbons: int = 0) -> dict:
+    """FURNITURE-COHERENT composite (Justin's 'sample image' idea, #70):
+    stack = complete LaMa floor (base) -> sharp nadir ribbons -> per-furniture SINGLE-VIEW patches.
+    Furniture squishes in any mosaic because everything projects through the FLOOR plane; a couch
+    seat 0.5 m up stretches differently in every tile. Here each furniture blob (from the dense
+    cloud's height map) is re-projected from ONE most-overhead sharp frame at ITS OWN height plane
+    (scale f/(h-z), not f/h) — one coherent, correctly-scaled photo per piece."""
+    import os
+    import numpy as np
+    import cv2
+
+    s3 = _r2(); sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = f"{sd}/keyframe_trajectory.txt"
+    T = np.loadtxt(traj)
+    vid = f"{sd}/{nadir_name}"
+    if not os.path.exists(vid):
+        raise RuntimeError(f"nadir proxy not staged: {vid}")
+
+    # identical floor frame to make_fused / make_nadir_mosaic (deterministic from the ply)
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False); up = Vt[2].astype("f4")
+    cams = T[:, 1:4]
+    if np.dot(cams.mean(0) - c, up) < 0:
+        up = -up
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    pxa = X @ e1; pya = X @ e2; hgt = X @ up
+    lo1, hi1 = np.percentile(pxa, [1, 99]); lo2, hi2 = np.percentile(pya, [1, 99])
+    floor = float(np.percentile(hgt, 1.5)); ceil = float(np.percentile(hgt, 99)); room = ceil - floor
+    fpu = ceiling_ft / room if room > 0 else 1.0
+    W = min(6000, int((hi1 - lo1) * pxm) + 1); H = min(6000, int((hi2 - lo2) * pxm) + 1)
+    span1 = hi1 - lo1; span2 = hi2 - lo2
+
+    # DSM: top height per cell below a near-ceiling cut (walls kept, ceiling dropped)
+    cut = floor + 0.9 * room
+    keep = (hgt < cut) & (pxa >= lo1) & (pxa <= hi1) & (pya >= lo2) & (pya <= hi2)
+    ix = np.clip(((pxa[keep] - lo1) / span1 * (W - 1)), 0, W - 1).astype(np.int64)
+    iy = np.clip(((pya[keep] - lo2) / span2 * (H - 1)), 0, H - 1).astype(np.int64)
+    hk = hgt[keep]; cell = iy * W + ix
+    order = np.lexsort((hk, cell)); cs = cell[order]; hs = hk[order]
+    last = np.ones(len(cs), bool)
+    if len(cs) > 1:
+        last[:-1] = cs[1:] != cs[:-1]
+    dsm = np.full(H * W, np.nan, np.float32); dsm[cs[last]] = hs[last]
+    occ = np.zeros(H * W, bool); occ[cell] = True
+    fp = cv2.morphologyEx(occ.reshape(H, W).astype(np.uint8) * 255, cv2.MORPH_CLOSE,
+                          np.ones((15, 15), np.uint8)) > 0
+    d8 = np.where(np.isnan(dsm), 0, np.clip((dsm - floor) / max(room, 1e-6), 0, 1) * 255).astype(np.uint8)
+    d8 = d8.reshape(H, W)
+    d8 = cv2.inpaint(d8, (np.isnan(dsm).reshape(H, W) & fp).astype(np.uint8), 5, cv2.INPAINT_TELEA)
+    d8 = cv2.medianBlur(d8, 5)
+    hrel = d8.astype(np.float32) / 255.0                      # 0..1 of room height, per cell
+
+    # furniture band: above trip-hazard, below counter-top+ (walls ~1.0 excluded)
+    fmask = ((hrel > 0.05) & (hrel < 0.68) & fp).astype(np.uint8) * 255
+    fmask = cv2.morphologyEx(fmask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    fmask = cv2.morphologyEx(fmask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    px_per_ft = pxm / fpu
+    min_area = int((1.0 * px_per_ft) ** 2)                    # ignore blobs smaller than ~1x1 ft
+    nb, lab, st, cent = cv2.connectedComponentsWithStats(fmask)
+
+    # base stack: LaMa-complete floor, upscaled to this grid; sharp ribbons on top
+    bk = base_key or f"ortho/{slug}_lama2.jpg"
+    s3.download_file(R2_BUCKET, bk, "/tmp/base.jpg")
+    base = cv2.resize(cv2.imread("/tmp/base.jpg"), (W, H), interpolation=cv2.INTER_CUBIC)
+    if ribbons:  # OFF by default: the ribbon arcs cut up the smooth base more than they sharpen it
+        try:
+            s3.download_file(R2_BUCKET, f"ortho/{slug}_nadir.png", "/tmp/rib.png")
+            rib = cv2.imread("/tmp/rib.png")
+            if rib is not None and rib.shape[:2] != (H, W):
+                rib = cv2.resize(rib, (W, H), interpolation=cv2.INTER_NEAREST)
+            rm = (rib.sum(2) > 30).astype(np.uint8)
+            rm = cv2.erode(rm, np.ones((5, 5), np.uint8))      # avoid dark edge fringe
+            base[rm > 0] = rib[rm > 0]
+        except Exception as e:
+            print("[furnish] no ribbon layer:", e)
+
+    cap = cv2.VideoCapture(vid)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    Wv = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); Hv = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    f_px = (Wv / 2.0) / np.tan(np.radians(fov_deg) / 2.0)
+    ts = T[:, 0].copy(); nfr = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    if nfr and ts.max() > (nfr / fps) * 2:
+        ts = ts / fps
+    Rm = np.array([_quat2rot(q) for q in T[:, 4:8]])
+    Cm = T[:, 1:4] - c
+    ok = np.isfinite(Cm).all(1) & np.isfinite(Rm.reshape(len(T), -1)).all(1)
+    ch = (Cm @ up) - floor                                    # cam height above floor (units)
+    fwd_all = Rm @ np.array([0.0, 0.0, 1.0])
+    fh2 = fwd_all - np.outer(fwd_all @ up, up)
+    psi_all = np.arctan2(fh2 @ e2, fh2 @ e1)
+    cx1 = Cm @ e1; cx2 = Cm @ e2
+
+    blobs = sorted(range(1, nb), key=lambda i: -st[i, cv2.CC_STAT_AREA])
+    pasted = 0
+    for bi in blobs:
+        if st[bi, cv2.CC_STAT_AREA] < min_area:
+            break
+        if pasted >= max_blobs:
+            break
+        bm = (lab == bi).astype(np.uint8)
+        z = float(np.median(hrel[bm > 0])) * room             # blob height above floor (units)
+        bx0 = st[bi, cv2.CC_STAT_LEFT]; by0 = st[bi, cv2.CC_STAT_TOP]
+        bw = st[bi, cv2.CC_STAT_WIDTH]; bh = st[bi, cv2.CC_STAT_HEIGHT]
+        cxp, cyp = cent[bi]                                   # centroid in canvas px
+        c1 = lo1 + cxp / (W - 1) * span1; c2 = lo2 + cyp / (H - 1) * span2
+        # most-overhead usable pose: max verticality to the blob top-plane
+        dxy = np.hypot(cx1 - c1, cx2 - c2)
+        hz = ch - z
+        vert = np.where(ok & (hz > 0.15 * room), hz / np.hypot(dxy, hz), -1)
+        pi = int(np.argmax(vert))
+        if vert[pi] <= 0.55:                                  # nothing saw it near-overhead
+            continue
+        cap.set(cv2.CAP_PROP_POS_MSEC, float(ts[pi]) * 1000.0)
+        rd, fr = cap.read()
+        if not rd:
+            continue
+        # project the blob region (with margin) at the blob's OWN height plane
+        pad = int(0.5 * px_per_ft)
+        a0 = max(0, bx0 - pad); a1 = min(W, bx0 + bw + pad)
+        b0 = max(0, by0 - pad); b1 = min(H, by0 + bh + pad)
+        sj, si = np.mgrid[b0:b1, a0:a1]
+        pl1 = lo1 + si / (W - 1) * span1; pl2 = lo2 + sj / (H - 1) * span2
+        dx = pl1 - cx1[pi]; dy = pl2 - cx2[pi]
+        cps, sps = np.cos(psi_all[pi] + np.radians(yaw_off)), np.sin(psi_all[pi] + np.radians(yaw_off))
+        u_cam = dx * cps + dy * sps; v_cam = -dx * sps + dy * cps
+        # TRUE-ORTHO per cell: each cell projects at ITS OWN surface height from the DSM —
+        # a couch is not a plateau; one flat plane per blob is what smushed the sloping sides
+        zc = hrel[b0:b1, a0:a1] * room
+        he = np.maximum(ch[pi] - zc, 0.12 * room)
+        valid = (ch[pi] - zc) > 0.12 * room
+        u_img = Wv / 2.0 + (f_px / he) * u_cam; v_img = Hv / 2.0 + (f_px / he) * v_cam
+        inb = (u_img >= 0) & (u_img < Wv - 1) & (v_img >= 0) & (v_img < Hv - 1) & valid
+        if not inb.any():
+            continue
+        x0 = np.floor(np.where(inb, u_img, 0)).astype(np.int32)
+        y0 = np.floor(np.where(inb, v_img, 0)).astype(np.int32)
+        fx = (u_img - x0).astype(np.float32)[..., None]; fy = (v_img - y0).astype(np.float32)[..., None]
+        p00 = fr[y0, x0].astype(np.float32); p10 = fr[y0, x0 + 1].astype(np.float32)
+        p01 = fr[y0 + 1, x0].astype(np.float32); p11 = fr[y0 + 1, x0 + 1].astype(np.float32)
+        patch = p00 * (1 - fx) * (1 - fy) + p10 * fx * (1 - fy) + p01 * (1 - fx) * fy + p11 * fx * fy
+        patch[~inb] = 0
+        # gain-match the patch to the base around the blob (kills the visible patch-border seams)
+        roi0 = base[b0:b1, a0:a1].astype(np.float32)
+        ringm = (bm[b0:b1, a0:a1] == 0) & inb & (patch.sum(2) > 30) & (roi0.sum(2) > 30)
+        if int(ringm.sum()) > 300:
+            gv = float(np.clip(np.median(roi0[ringm].mean(1) / (patch[ringm].mean(1) + 1e-3)), 0.8, 1.25))
+            patch = np.clip(patch * gv, 0, 255)
+        # feathered alpha from the blob mask
+        sub = bm[b0:b1, a0:a1] * 255
+        alpha = cv2.distanceTransform(cv2.dilate(sub, np.ones((5, 5), np.uint8)), cv2.DIST_L2, 3)
+        alpha = np.clip(alpha / max(3.0, 0.25 * px_per_ft), 0, 1).astype(np.float32)
+        alpha = alpha * inb.astype(np.float32)
+        roi = base[b0:b1, a0:a1].astype(np.float32)
+        base[b0:b1, a0:a1] = (roi * (1 - alpha[..., None]) + patch * alpha[..., None]).astype(np.uint8)
+        pasted += 1
+    cap.release()
+
+    o = "/tmp/furnish.png"; cv2.imwrite(o, base)
+    key = f"ortho/{slug}_composed.png"; s3.upload_file(o, R2_BUCKET, key)
+    oj = "/tmp/furnish.jpg"; cv2.imwrite(oj, base, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    s3.upload_file(oj, R2_BUCKET, f"ortho/{slug}_composed.jpg")
+    print(f"[furnish] {slug}: {pasted} furniture pieces re-pasted from single overhead views -> {key}")
+    return {"composed": key, "px": [int(W), int(H)], "furniture": int(pasted)}
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=3600,
+              memory=10240)
+def make_trueortho(slug: str, ceiling_ft: float = 9.0, pxm: float = 100.0,
+                   max_off_deg: float = 32.0, n_frames: int = 900, fov_pow: float = 12.0) -> dict:
+    """TRUE-ORTHO base from the 360's BOTTOM HEMISPHERE (Justin's dewarp insight, done per-ray):
+    every cell samples only NEAR-VERTICAL rays (<=max_off_deg off straight-down) from the 4K
+    equirect, projected at the cell's OWN surface height from the dense cloud's DSM — no flat-floor
+    layover (phantom cabinets), no oblique bathroom jumble. Gaps (never seen near-vertically) stay
+    black + gap mask for LaMa."""
+    import os
+    import numpy as np
+    import cv2
+
+    s3 = _r2(); sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = f"{sd}/keyframe_trajectory.txt"
+    T = np.loadtxt(traj)
+    vid = f"{sd}/hires.mp4"
+    if not os.path.exists(vid):
+        raise RuntimeError("4K equirect proxy (hires.mp4) not staged")
+
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False); up = Vt[2].astype("f4")
+    cams = T[:, 1:4]
+    if np.dot(cams.mean(0) - c, up) < 0:
+        up = -up
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    pxa = X @ e1; pya = X @ e2; hgt = X @ up
+    lo1, hi1 = np.percentile(pxa, [1, 99]); lo2, hi2 = np.percentile(pya, [1, 99])
+    floor = float(np.percentile(hgt, 1.5)); ceil = float(np.percentile(hgt, 99)); room = ceil - floor
+    fpu = ceiling_ft / room if room > 0 else 1.0
+    W = min(6000, int((hi1 - lo1) * pxm) + 1); H = min(6000, int((hi2 - lo2) * pxm) + 1)
+    span1 = hi1 - lo1; span2 = hi2 - lo2
+
+    # float-ish DSM (top surface below a near-ceiling cut)
+    cut = floor + 0.9 * room
+    keep = (hgt < cut) & (pxa >= lo1) & (pxa <= hi1) & (pya >= lo2) & (pya <= hi2)
+    ix = np.clip(((pxa[keep] - lo1) / span1 * (W - 1)), 0, W - 1).astype(np.int64)
+    iy = np.clip(((pya[keep] - lo2) / span2 * (H - 1)), 0, H - 1).astype(np.int64)
+    hk = hgt[keep]; cell = iy * W + ix
+    order = np.lexsort((hk, cell)); cs = cell[order]; hs = hk[order]
+    last = np.ones(len(cs), bool)
+    if len(cs) > 1:
+        last[:-1] = cs[1:] != cs[:-1]
+    dsm = np.full(H * W, np.nan, np.float32); dsm[cs[last]] = hs[last]
+    occ = np.zeros(H * W, bool); occ[cell] = True
+    fpm = cv2.morphologyEx(occ.reshape(H, W).astype(np.uint8) * 255, cv2.MORPH_CLOSE,
+                           np.ones((15, 15), np.uint8)) > 0
+    d8 = np.where(np.isnan(dsm), 0, np.clip((dsm - floor) / max(room, 1e-6), 0, 1) * 255).astype(np.uint8).reshape(H, W)
+    d8 = cv2.inpaint(d8, (np.isnan(dsm).reshape(H, W) & fpm).astype(np.uint8), 5, cv2.INPAINT_TELEA)
+    d8 = cv2.medianBlur(d8, 5)
+    zsurf = (d8.astype(np.float32) / 255.0 * room).reshape(H * W)   # height above floor per cell
+
+    cap = cv2.VideoCapture(vid)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    Wv = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); Hv = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    nfr = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    ts = T[:, 0].copy()
+    if nfr and ts.max() > (nfr / fps) * 2:
+        ts = ts / fps
+    Rm = np.array([_quat2rot(q) for q in T[:, 4:8]])
+    Cm = T[:, 1:4] - c
+    okp = np.isfinite(Cm).all(1) & np.isfinite(Rm.reshape(len(T), -1)).all(1)
+    cosmax = np.cos(np.radians(max_off_deg))
+    yflip = 1; lonsign = 1
+
+    best = np.zeros(H * W, np.float32)
+    out = np.zeros((H * W, 3), np.float32)
+    step = max(1, len(T) // n_frames)
+    used = 0
+    for i in range(0, len(T), step):
+        if not okp[i]:
+            continue
+        C = Cm[i]; R = Rm[i]
+        hcam = float(C @ up - floor)
+        if hcam < (1.5 / ceiling_ft) * room:
+            continue
+        Ce1 = float(C @ e1); Ce2 = float(C @ e2)
+        fw = hcam * np.tan(np.radians(max_off_deg)) * 1.15
+        a0 = int(np.clip((Ce1 - fw - lo1) / span1 * (W - 1), 0, W - 1))
+        a1 = int(np.clip((Ce1 + fw - lo1) / span1 * (W - 1) + 1, 0, W))
+        b0 = int(np.clip((Ce2 - fw - lo2) / span2 * (H - 1), 0, H - 1))
+        b1 = int(np.clip((Ce2 + fw - lo2) / span2 * (H - 1) + 1, 0, H))
+        if a1 <= a0 or b1 <= b0:
+            continue
+        sj, si = np.mgrid[b0:b1, a0:a1]
+        gidx = (sj * W + si).ravel()
+        pl1 = lo1 + si.ravel() / (W - 1) * span1
+        pl2 = lo2 + sj.ravel() / (H - 1) * span2
+        zc = zsurf[gidx]
+        # world ray camera -> cell's SURFACE point
+        rays = (pl1 - Ce1)[:, None] * e1 + (pl2 - Ce2)[:, None] * e2 + (zc - hcam)[:, None] * up
+        dist = np.linalg.norm(rays, axis=1) + 1e-9
+        vert = -(rays @ up) / dist                          # 1 = straight down
+        sel = (vert > cosmax) & ((hcam - zc) > 0.1 * room)
+        if not sel.any():
+            continue
+        w = (vert ** fov_pow).astype(np.float32)
+        cand = sel & (w > best[gidx])
+        if not cand.any():
+            continue
+        cap.set(cv2.CAP_PROP_POS_MSEC, float(ts[i]) * 1000.0)
+        ok2, fr = cap.read()
+        if not ok2:
+            continue
+        used += 1
+        rc = rays[cand] @ R
+        rcn = rc / (np.linalg.norm(rc, axis=1, keepdims=True) + 1e-9)
+        lon = lonsign * np.arctan2(rcn[:, 0], rcn[:, 2])
+        lat = np.arcsin(np.clip(yflip * (-rcn[:, 1]), -1, 1))
+        uf = (((lon / (2 * np.pi)) + 0.5) * Wv) % Wv
+        vf = np.clip((0.5 - lat / np.pi) * Hv, 0, Hv - 1.001)
+        x0 = np.floor(uf).astype(np.int32); x1 = (x0 + 1) % Wv
+        y0 = np.floor(vf).astype(np.int32); y1 = np.minimum(y0 + 1, Hv - 1)
+        fx = (uf - x0).astype(np.float32)[:, None]; fy = (vf - y0).astype(np.float32)[:, None]
+        col = (fr[y0, x0] * (1 - fx) * (1 - fy) + fr[y0, x1] * fx * (1 - fy)
+               + fr[y1, x0] * (1 - fx) * fy + fr[y1, x1] * fx * fy).astype(np.float32)
+        gi = gidx[cand]
+        seen = best[gi] > 0.2
+        if int(seen.sum()) > 400:                            # per-frame gain match to the mosaic
+            gv = float(np.clip(np.median(out[gi[seen]].mean(1) / (col[seen].mean(1) + 1e-3)), 0.8, 1.25))
+            col *= gv
+        out[gi] = col
+        best[gi] = w[cand]
+    cap.release()
+
+    covm = best > 0
+    img = np.clip(out, 0, 255).astype(np.uint8).reshape(H, W, 3)
+    hit = covm.reshape(H, W).astype(np.uint8)
+    fm = (cv2.morphologyEx((fpm.astype(np.uint8)) * 255, cv2.MORPH_CLOSE, np.ones((31, 31), np.uint8)) > 0)
+    gap = ((fm) & (hit == 0)).astype(np.uint8) * 255
+    img[~fm] = 0
+    cv2.imwrite("/tmp/to.png", img)
+    key = f"ortho/{slug}_trueortho.png"; s3.upload_file("/tmp/to.png", R2_BUCKET, key)
+    gk = f"ortho/{slug}_trueortho_gap.png"; cv2.imwrite("/tmp/tog.png", gap); s3.upload_file("/tmp/tog.png", R2_BUCKET, gk)
+    cov = int(covm.mean() * 100)
+    print(f"[trueortho] {slug}: {W}x{H}, {used} frames, {cov}% covered within {max_off_deg} deg -> {key}")
+    return {"ortho": key, "gap": gk, "px": [int(W), int(H)], "frames": int(used), "cov_pct": cov}
+
+
+@app.local_entrypoint()
+def trueortho(slug: str, ceiling_ft: float = 8.5, pxm: float = 100.0, max_off_deg: float = 32.0):
+    """True-ortho base from the 360 bottom hemisphere (per-ray dewarp at DSM height):
+        modal run modal_app.py::trueortho --slug scottsdale-nadir --ceiling-ft 8.5"""
+    print(make_trueortho.remote(slug, ceiling_ft=ceiling_ft, pxm=pxm, max_off_deg=max_off_deg))
+
+
+@app.local_entrypoint()
+def furnish(slug: str, ceiling_ft: float = 8.5, pxm: float = 100.0, base_key: str = ""):
+    """Furniture-coherent composite (base floor + ribbons + single-view furniture):
+        modal run modal_app.py::furnish --slug scottsdale-nadir --ceiling-ft 8.5"""
+    print(make_furnish.remote(slug, ceiling_ft=ceiling_ft, pxm=pxm, base_key=base_key))
+
+
 @app.function(image=test_image, secrets=[r2_secret])
 def read_r2(key: str) -> bytes:
     """Return an R2 object's bytes — for pulling cloud artifacts (walls.jpg etc.) down to view."""
@@ -2225,12 +2999,15 @@ def getr2(key: str, out: str):
 
 
 @app.local_entrypoint()
-def walls(slug: str, video_key: str, ceiling_ft: float = 9.0, spacing_ft: float = 4.0):
+def walls(slug: str, video_key: str, ceiling_ft: float = 9.0, spacing_ft: float = 4.0,
+          pxm: float = 18.0, maxd: float = 16.0, maxroom: float = 32.0):
     """Horizon-line wall reconstruction: sample the flythrough along its VSLAM trajectory,
-    HorizonNet each frame, back-project the floor horizon, vote consensus walls.
-        modal run modal_app.py::walls --slug scottsdale-fly --video-key projects/.../standard.mp4 --ceiling-ft 8.5
+    HorizonNet each frame, back-project the floor horizon, vote consensus walls. pxm is px/FOOT
+    (set ~27 to match a make_fused texture for a 1:1 overlay); ceiling_ft MUST match the texture run.
+        modal run modal_app.py::walls --slug scottsdale-fly --video-key projects/.../standard.mp4 --ceiling-ft 8.5 --pxm 27
     """
-    print(make_walls_ai.remote(slug, video_key, ceiling_ft=ceiling_ft, spacing_ft=spacing_ft))
+    print(make_walls_ai.remote(slug, video_key, ceiling_ft=ceiling_ft, spacing_ft=spacing_ft,
+                               pxm=pxm, maxd=maxd, maxroom=maxroom))
 
 
 @app.local_entrypoint()
@@ -2250,6 +3027,23 @@ def put_r2(key: str, data_b64: str, content_type: str = "image/jpeg") -> dict:
     import base64
     _r2().put_object(Bucket=R2_BUCKET, Key=key, Body=base64.b64decode(data_b64), ContentType=content_type)
     return {"key": key}
+
+
+@app.function(image=test_image, secrets=[r2_secret])
+def presign_r2(keys_csv: str, expires: int = 604800) -> dict:
+    """Presigned GET links (default 7 days) so renders can be viewed from any browser
+    without Studio wiring — for remote review."""
+    s3 = _r2()
+    return {k.strip(): s3.generate_presigned_url(
+        "get_object", Params={"Bucket": R2_BUCKET, "Key": k.strip()}, ExpiresIn=expires)
+        for k in keys_csv.split(",") if k.strip()}
+
+
+@app.local_entrypoint()
+def presign(keys: str, expires: int = 604800):
+    """modal run modal_app.py::presign --keys ortho/x.png,ortho/y.jpg"""
+    for k, u in presign_r2.remote(keys, expires).items():
+        print(f"{k}\n  {u}\n")
 
 
 @app.local_entrypoint()
@@ -2460,11 +3254,1542 @@ def render(slug: str, video_key: str, ceiling_ft: float = 9.0):
 
 
 @app.local_entrypoint()
-def fused(slug: str, video_key: str, ceiling_ft: float = 9.0, pxm: float = 64.0):
+def fused(slug: str, video_key: str, ceiling_ft: float = 9.0, pxm: float = 64.0, depth: int = 1, fill: int = 1):
     """Nadir-weighted FLAT-floor fusion — pulls each cell's colour from the most straight-down
-    clean frame that saw it (clean floor, minimal wall-smear; Justin's visual-ref approach):
-        modal run modal_app.py::fused --slug scottsdale-fly --video-key projects/old-town-scottsdale-home/video/standard.mp4 --ceiling-ft 8.5"""
-    print(make_fused.remote(slug, video_key, ceiling_ft=ceiling_ft, pxm=pxm))
+    clean frame that saw it. --depth 0 --fill 0 = NADIR-ONLY CLEAN (no tears, black gaps + gap mask for LaMa):
+        modal run modal_app.py::fused --slug scottsdale-nadir --video-key x --ceiling-ft 8.5 --pxm 90 --depth 0 --fill 0"""
+    print(make_fused.remote(slug, video_key, ceiling_ft=ceiling_ft, pxm=pxm, depth=depth, fill=fill))
+
+
+@app.function(image=lama_image, gpu="T4", secrets=[r2_secret], timeout=1800)
+def lama_fill(clean_key: str, gap_key: str, out_key: str) -> dict:
+    """Fill the nadir-only gaps with LaMa (resolution-robust large-mask inpainting): plausible clean
+    floor where furniture occluded the straight-down view — no tears, no cv2 smear. #71."""
+    import io
+    from PIL import Image
+    from simple_lama_inpainting import SimpleLama
+    s3 = _r2()
+    img = Image.open(io.BytesIO(s3.get_object(Bucket=R2_BUCKET, Key=clean_key)["Body"].read())).convert("RGB")
+    mask = Image.open(io.BytesIO(s3.get_object(Bucket=R2_BUCKET, Key=gap_key)["Body"].read())).convert("L")
+    if mask.size != img.size:
+        mask = mask.resize(img.size, Image.NEAREST)
+    assert out_key != clean_key, "lama_fill: out_key == clean_key would overwrite the master"
+    # big-lama at full 4-6K blows past a T4's VRAM (review-confirmed OOM). LaMa is resolution-
+    # robust by design: inpaint at a bounded size, then paste ONLY the masked fill back into the
+    # full-res master so every captured pixel stays native.
+    import numpy as _np
+    MAXS = 2048
+    w0, h0 = img.size
+    if max(w0, h0) > MAXS:
+        sc = MAXS / max(w0, h0)
+        sw = max(8, int(round(w0 * sc)) // 8 * 8); sh = max(8, int(round(h0 * sc)) // 8 * 8)
+        small = img.resize((sw, sh), Image.LANCZOS)
+        smask = mask.resize((sw, sh), Image.NEAREST)
+        res_s = SimpleLama()(small, smask).resize((w0, h0), Image.LANCZOS)
+        m = _np.array(mask) > 0
+        outa = _np.array(img); outa[m] = _np.array(res_s)[m]
+        res = Image.fromarray(outa)
+    else:
+        res = SimpleLama()(img, mask)
+    buf = io.BytesIO()
+    if out_key.lower().endswith(".png"):
+        res.save(buf, format="PNG"); ctype = "image/png"           # lossless when asked
+    else:
+        res.save(buf, format="JPEG", quality=95); ctype = "image/jpeg"
+    s3.put_object(Bucket=R2_BUCKET, Key=out_key, Body=buf.getvalue(), ContentType=ctype)
+    print(f"[lama] {clean_key} + {gap_key} -> {out_key} ({res.size})")
+    return {"out": out_key, "size": list(res.size)}
+
+
+@app.local_entrypoint()
+def lama(clean_key: str, gap_key: str, out_key: str = ""):
+    """Fill nadir-clean gaps with LaMa:
+        modal run modal_app.py::lama --clean-key ortho/scottsdale-nadir_nadir_clean.png --gap-key ortho/scottsdale-nadir_gap.png"""
+    out_key = out_key or clean_key.replace("_nadir_clean", "_lama")
+    if out_key == clean_key:                       # replace didn't match — NEVER overwrite the master
+        dot = clean_key.rfind(".")
+        out_key = clean_key[:dot] + "_lama" + clean_key[dot:]
+    print(lama_fill.remote(clean_key, gap_key, out_key))
+
+
+# ---------------------------------------------------------------------------
+# 3D Gaussian Splatting — learned geometry for the photoreal dollhouse
+# Every projection engine above is capped by the dense cloud's accuracy on
+# furniture (distorted couch / dining table / fixtures). A splat TRAINED on the
+# posed video learns the geometry instead, then renders a clean true-ortho
+# top-down + tilted dollhouse views. 3 stages: data -> train -> render.
+# ---------------------------------------------------------------------------
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=3600,
+              memory=10240)
+def make_splat_data(slug: str, n_frames: int = 400, face_px: int = 800, fov_deg: float = 95.0,
+                    ceiling_ft: float = 8.5, stills: int = 1,
+                    stills_prefix: str = "projects/old-town-scottsdale-home/still/") -> dict:
+    """Stage 1: posed PINHOLE views for splat training. Picks ~n_frames SHARP frames from the
+    4K equirect proxy (rolling-median Laplacian gate, as make_nadir_mosaic), cuts 5 pinhole
+    faces per frame (4 sides + straight DOWN; the zenith face is stitch smear — skipped) via
+    the standard equirect ray remap, and writes images + cameras.json to /scratch/{slug}/splat/.
+    The floor frame (IDENTICAL derivation to make_fused) is computed ONCE here and stored in
+    cameras.json so train/render can never drift from the other engines' frame."""
+    import os
+    import json
+    import shutil
+    import numpy as np
+    import cv2
+
+    s3 = _r2(); sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = f"{sd}/keyframe_trajectory.txt"
+    T = np.loadtxt(traj)
+    if T.ndim == 1:
+        T = T[None, :]
+    vid = f"{sd}/hires.mp4"
+    if not os.path.exists(vid):
+        raise RuntimeError("4K equirect proxy (hires.mp4) not staged")
+
+    # floor frame — IDENTICAL derivation to make_fused / make_trueortho (do not "improve")
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False); up = Vt[2].astype("f4")
+    cams = T[:, 1:4]
+    if np.dot(cams.mean(0) - c, up) < 0:
+        up = -up
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    pxa = X @ e1; pya = X @ e2; hgt = X @ up
+    lo1, hi1 = np.percentile(pxa, [1, 99]); lo2, hi2 = np.percentile(pya, [1, 99])
+    floor = float(np.percentile(hgt, 1.5)); ceilh = float(np.percentile(hgt, 99)); room = ceilh - floor
+    fpu = ceiling_ft / room if room > 0 else 1.0
+
+    out_dir = f"{sd}/splat"
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.makedirs(f"{out_dir}/images", exist_ok=True)
+
+    cap = cv2.VideoCapture(vid)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    nfr = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    Wv = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); Hv = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    ts = T[:, 0].copy()
+    if nfr and ts.max() > (nfr / fps) * 2:
+        ts = ts / fps
+    Rm = np.array([_quat2rot(q) for q in T[:, 4:8]])
+    Cm = T[:, 1:4] - c
+    okp = np.isfinite(Cm).all(1) & np.isfinite(Rm.reshape(len(T), -1)).all(1) & np.isfinite(ts)
+
+    # 5 virtual faces in the CAMERA frame (x right, y down, z nose — OpenCV convention,
+    # exactly the frame the equirect lives in: lon = atan2(x, z), lat = asin(-y)).
+    def _ry(t):
+        ct, st = np.cos(t), np.sin(t)
+        return np.array([[ct, 0.0, st], [0.0, 1.0, 0.0], [-st, 0.0, ct]])
+    faces = [("f", np.eye(3)), ("r", _ry(np.pi / 2)), ("b", _ry(np.pi)), ("l", _ry(-np.pi / 2)),
+             ("d", np.array([[1.0, 0, 0], [0, 0, 1.0], [0, -1.0, 0]]))]   # nose -> straight down
+
+    # equirect->pinhole remap is pose-independent (the pano IS the camera frame): precompute
+    # one map per face; u spans [0, Wv] against a 1-col wrap-padded frame (no seam at lon 180).
+    f_px = (face_px / 2.0) / np.tan(np.radians(fov_deg) / 2.0)
+    cxy = (face_px - 1) / 2.0
+    jj, ii = np.mgrid[0:face_px, 0:face_px].astype(np.float32)
+    d_f = np.stack([(ii - cxy) / f_px, (jj - cxy) / f_px, np.ones_like(ii)], -1)
+    d_f /= np.linalg.norm(d_f, axis=-1, keepdims=True)
+    maps = {}
+    for nm, Rf in faces:
+        d_c = d_f @ Rf.T
+        lon = np.arctan2(d_c[..., 0], d_c[..., 2])
+        lat = np.arcsin(np.clip(-d_c[..., 1], -1, 1))
+        maps[nm] = ((((lon / (2 * np.pi)) + 0.5) * Wv).astype(np.float32),
+                    np.clip((0.5 - lat / np.pi) * Hv, 0, Hv - 1.001).astype(np.float32))
+
+    okidx = np.where(okp)[0]
+    # sample the WHOLE flight: no early stop — capping at n_frames while stepping in time
+    # order starved the flight's tail (the casita visit) down to 3 training frames.
+    step = max(1, len(okidx) // max(1, n_frames))
+    frames_meta = []
+    nkept = 0; skip_blur = 0; sharps = []
+    for i in okidx[::step]:
+        cap.set(cv2.CAP_PROP_POS_MSEC, float(ts[i]) * 1000.0)
+        ok2, fr = cap.read()
+        if not ok2:
+            continue
+        g = cv2.cvtColor(cv2.resize(fr, (480, 240)), cv2.COLOR_BGR2GRAY)
+        s = float(cv2.Laplacian(g, cv2.CV_64F).var())
+        sharps.append(s)
+        if len(sharps) > 30 and s < 0.55 * float(np.median(sharps[-121:])):
+            skip_blur += 1
+            continue
+        frp = np.concatenate([fr, fr[:, :1]], axis=1)              # wrap pad for lon-180 seam
+        for nm, Rf in faces:
+            im = cv2.remap(frp, maps[nm][0], maps[nm][1], cv2.INTER_LINEAR)
+            fn = f"images/p{i:05d}_{nm}.jpg"
+            cv2.imwrite(f"{out_dir}/{fn}", im, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            c2w = np.eye(4)
+            c2w[:3, :3] = Rm[i] @ Rf                               # world<-face (OpenCV convention)
+            c2w[:3, 3] = Cm[i]                                     # centered world (xyz - c)
+            frames_meta.append({"img": fn, "c2w": c2w.tolist()})
+        nkept += 1
+    cap.release()
+
+    # DEDICATED 360 STILLS as extra training views — shot standing IN the rooms, they
+    # observe exactly the near-wall zones the flythrough missed. Pose init: position
+    # inherited from the localize.json matched frame; the still's OWN yaw re-derived
+    # from the ORB equirect x-shift vs that frame (lon = psi - azimuth, so the shift
+    # IS the yaw delta); level attitude. train_splat refines each still's pose (SE3).
+    nstill = 0
+    if stills:
+        try:
+            loc = json.loads(s3.get_object(Bucket=R2_BUCKET,
+                                           Key=f"layout/{slug}/localize.json")["Body"].read())
+        except Exception as e:
+            loc = None
+            print(f"[splatdata] no localize.json for {slug} ({e}) — skipping stills")
+        svid = f"{sd}/slam.mp4"
+        if loc and os.path.exists(svid):
+            scap = cv2.VideoCapture(svid)
+            sfps = scap.get(cv2.CAP_PROP_FPS) or 30.0
+            orb = cv2.ORB_create(1500)
+            bfm = cv2.BFMatcher(cv2.NORM_HAMMING)
+            resp = s3.list_objects_v2(Bucket=R2_BUCKET, Prefix=stills_prefix)
+            skeys = {os.path.splitext(os.path.basename(o["Key"]))[0]: o["Key"]
+                     for o in resp.get("Contents", []) if o["Key"].lower().endswith((".jpg", ".jpeg"))}
+            for name, info in loc.items():
+                if name == "_meta" or not isinstance(info, dict):
+                    continue
+                if info.get("matches", 0) < 30 or name not in skeys:
+                    continue
+                pi = int(np.argmin(np.abs(ts - info["frame"] / sfps)))
+                if not okp[pi]:
+                    continue
+                scap.set(cv2.CAP_PROP_POS_FRAMES, int(info["frame"]))
+                okf, fr = scap.read()
+                if not okf:
+                    continue
+                s3.download_file(R2_BUCKET, skeys[name], "/tmp/still.jpg")
+                sim = cv2.imread("/tmp/still.jpg")
+                if sim is None:
+                    continue
+                gf = cv2.cvtColor(cv2.resize(fr, (1024, 512)), cv2.COLOR_BGR2GRAY)
+                gs2 = cv2.cvtColor(cv2.resize(sim, (1024, 512)), cv2.COLOR_BGR2GRAY)
+                kps, dss = orb.detectAndCompute(gs2, None)
+                kpf, dsf = orb.detectAndCompute(gf, None)
+                if dss is None or dsf is None:
+                    continue
+                good = [p[0] for p in bfm.knnMatch(dss, dsf, k=2)
+                        if len(p) == 2 and p[0].distance < 0.75 * p[1].distance]
+                if len(good) < 25:
+                    continue
+                dxs = np.array([(kps[m.queryIdx].pt[0] - kpf[m.trainIdx].pt[0] + 512.0) % 1024.0 - 512.0
+                                for m in good])
+                dyaw = float(np.median(dxs)) / 1024.0 * 360.0
+                q = T[pi, 4:8]     # matched frame's floor-frame heading (as localize_stills)
+                fwdf = np.array([2 * (q[0] * q[2] + q[3] * q[1]),
+                                 2 * (q[1] * q[2] - q[3] * q[0]),
+                                 1 - 2 * (q[0] ** 2 + q[1] ** 2)])
+                fhead = np.degrees(np.arctan2(float(fwdf @ e2), float(fwdf @ e1)))
+                psi = np.radians(fhead + dyaw)
+                fwd = np.cos(psi) * e1 + np.sin(psi) * e2
+                Rst = np.stack([np.cross(fwd, up), -up, fwd], 1)  # cols: x, y(down), z(fwd) — level
+                simp = cv2.resize(sim, (Wv, Hv), interpolation=cv2.INTER_AREA)
+                simp = np.concatenate([simp, simp[:, :1]], axis=1)
+                for nm, Rf in faces:
+                    imf = cv2.remap(simp, maps[nm][0], maps[nm][1], cv2.INTER_LINEAR)
+                    fn = f"images/s_{name[:8]}_{nm}.jpg"
+                    cv2.imwrite(f"{out_dir}/{fn}", imf, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    c2w = np.eye(4)
+                    c2w[:3, :3] = Rst @ Rf
+                    c2w[:3, 3] = Cm[pi]
+                    frames_meta.append({"img": fn, "c2w": c2w.tolist(), "group": name})
+                nstill += 1
+                print(f"[splatdata] still {name[:8]}: frame {info['frame']}, yaw {fhead + dyaw:+.1f}deg, "
+                      f"{len(good)} matches")
+            scap.release()
+            print(f"[splatdata] stills: {nstill} localized into the training set")
+
+    meta = {"slug": slug, "face_px": face_px, "fov_deg": fov_deg, "f_px": float(f_px),
+            "cx": cxy, "cy": cxy,
+            "world": "vslam minus cloud centroid c; cams OpenCV x-right y-down z-forward",
+            "c": [float(v) for v in c], "up": [float(v) for v in up],
+            "e1": [float(v) for v in e1], "e2": [float(v) for v in e2],
+            "floor": floor, "room": room, "fpu": float(fpu), "ceiling_ft": ceiling_ft,
+            "lo1": float(lo1), "hi1": float(hi1), "lo2": float(lo2), "hi2": float(hi2),
+            "frames": frames_meta}
+    with open(f"{out_dir}/cameras.json", "w") as f:
+        json.dump(meta, f)
+    vol.commit()
+    ftw = round(float((hi1 - lo1) * fpu), 1); fth = round(float((hi2 - lo2) * fpu), 1)
+    print(f"[splatdata] {slug}: {nkept} frames x {len(faces)} faces = {len(frames_meta)} views "
+          f"({skip_blur} blur-skipped), {face_px}px @ {fov_deg}deg, {ftw}x{fth}ft -> {out_dir}")
+    return {"views": len(frames_meta), "frames": nkept, "stills": nstill,
+            "blur_skipped": skip_blur, "ft": [ftw, fth]}
+
+
+@app.function(image=gsplat_image, gpu="A10G", secrets=[r2_secret], volumes={"/scratch": vol},
+              timeout=10800, memory=32768)
+def train_splat(slug: str, iters: int = 20000, init_pts: int = 500000, sh_degree: int = 2,
+                max_gauss: int = 3000000, pose_opt: int = 1, still_start: int = 0) -> dict:
+    """Stage 2: gsplat training (simple_trainer pattern). Gaussians init from the dense
+    COLORED cloud (subsampled), DefaultStrategy densification, 0.8*L1 + 0.2*(1-SSIM).
+    Checkpoint -> /scratch/{slug}/splat/ckpt.pt; a couple of train-view vs GT strips -> R2."""
+    import os
+    import json
+    import numpy as np
+    import cv2
+    import torch
+    import torch.nn.functional as F
+    from gsplat import rasterization
+    from gsplat.strategy import DefaultStrategy
+
+    sd = f"/scratch/{slug}"; spd = f"{sd}/splat"
+    meta = json.load(open(f"{spd}/cameras.json"))
+    frames = meta["frames"]
+    if not frames:
+        raise RuntimeError("no training views — run make_splat_data first")
+    Wf = Hf = int(meta["face_px"])
+
+    # all views into RAM as uint8 (≈5 GB at 400x5x800²) — one .cuda() per iter
+    imgs = np.empty((len(frames), Hf, Wf, 3), np.uint8)
+    c2ws = np.empty((len(frames), 4, 4), np.float64)
+    for k, frm in enumerate(frames):
+        imgs[k] = cv2.cvtColor(cv2.imread(f"{spd}/{frm['img']}"), cv2.COLOR_BGR2RGB)
+        c2ws[k] = np.array(frm["c2w"])
+    w2cs = np.linalg.inv(c2ws)
+    viewmats = torch.tensor(w2cs, dtype=torch.float32, device="cuda")
+    K = torch.tensor([[meta["f_px"], 0, meta["cx"]], [0, meta["f_px"], meta["cy"]], [0, 0, 1]],
+                     dtype=torch.float32, device="cuda")
+    # dedicated-still views: coarse localize poses, refined per-STILL during training
+    # (all faces of one still share the still's body SE3)
+    gnames = sorted({f["group"] for f in frames if "group" in f})
+    gidx = np.array([gnames.index(f["group"]) if "group" in f else -1 for f in frames])
+    c2wt = torch.tensor(c2ws, dtype=torch.float32, device="cuda")
+
+    # init from the dense colored cloud, clipped to the scene box (+ margin) and subsampled
+    xyz, rgb = _read_ply_xyzrgb(f"{sd}/{slug}.ply")
+    if rgb is None:
+        raise RuntimeError("PLY has no RGB — splat init needs the colored dense cloud")
+    c = np.array(meta["c"], np.float64)
+    up = np.array(meta["up"]); e1 = np.array(meta["e1"]); e2 = np.array(meta["e2"])
+    floor, room = meta["floor"], meta["room"]
+    lo1, hi1, lo2, hi2 = meta["lo1"], meta["hi1"], meta["lo2"], meta["hi2"]
+    X = xyz - c
+    p1 = X @ e1; p2 = X @ e2; h = X @ up
+    m1 = 0.25 * (hi1 - lo1); m2 = 0.25 * (hi2 - lo2)
+    keep = ((p1 > lo1 - m1) & (p1 < hi1 + m1) & (p2 > lo2 - m2) & (p2 < hi2 + m2)
+            & (h > floor - 0.3 * room) & (h < floor + 1.3 * room))
+    X = X[keep]; col = rgb[keep].astype(np.float32) / 255.0
+    if len(X) > init_pts:
+        sel = np.random.default_rng(0).choice(len(X), init_pts, replace=False)
+        X = X[sel]; col = col[sel]
+    from scipy.spatial import cKDTree
+    d3, _ = cKDTree(X).query(X, k=4)
+    scale0 = np.log(np.clip(d3[:, 1:].mean(1), 1e-5, None))
+    N = len(X)
+    KSH = (sh_degree + 1) ** 2
+    params = torch.nn.ParameterDict({
+        "means": torch.nn.Parameter(torch.tensor(X, dtype=torch.float32)),
+        "scales": torch.nn.Parameter(torch.tensor(np.repeat(scale0[:, None], 3, 1), dtype=torch.float32)),
+        "quats": torch.nn.Parameter(torch.rand(N, 4) * 2 - 1),
+        "opacities": torch.nn.Parameter(torch.logit(torch.full((N,), 0.1))),
+        "sh0": torch.nn.Parameter(torch.tensor((col - 0.5) / 0.28209479177387814,
+                                               dtype=torch.float32)[:, None, :]),
+        "shN": torch.nn.Parameter(torch.zeros(N, KSH - 1, 3)),
+    }).cuda()
+    cpos = c2ws[:, :3, 3]
+    scene_scale = 1.1 * float(np.linalg.norm(cpos - cpos.mean(0), axis=1).max())
+    lrs = {"means": 1.6e-4 * scene_scale, "scales": 5e-3, "quats": 1e-3,
+           "opacities": 5e-2, "sh0": 2.5e-3, "shN": 2.5e-3 / 20}
+    opts = {k: torch.optim.Adam([params[k]], lr=lrs[k], eps=1e-15) for k in lrs}
+    sched = torch.optim.lr_scheduler.ExponentialLR(opts["means"], gamma=0.01 ** (1.0 / iters))
+    if still_start <= 0:
+        still_start = iters // 2 + 1000                       # after densification stops
+    strategy = DefaultStrategy(refine_start_iter=500, refine_stop_iter=iters // 2,
+                               reset_every=3000, refine_every=100)
+    strategy.check_sanity(params, opts)
+    sstate = strategy.initialize_state(scene_scale=scene_scale)
+
+    use_pose = bool(pose_opt and len(gnames))
+    if use_pose:
+        rvec = torch.nn.Parameter(torch.zeros(len(gnames), 3, device="cuda"))
+        tvec = torch.nn.Parameter(torch.zeros(len(gnames), 3, device="cuda"))
+        evec = torch.nn.Parameter(torch.zeros(len(gnames), 3, device="cuda"))   # per-still exposure
+        pose_optim = torch.optim.Adam([{"params": [rvec], "lr": 1e-3},
+                                       {"params": [tvec], "lr": 1.6e-3 * scene_scale},
+                                       {"params": [evec], "lr": 5e-3}])
+
+    def _viewmat(k):
+        g = int(gidx[k])
+        if g < 0 or not use_pose:
+            return viewmats[k][None]
+        rv = rvec[g]
+        th = rv.norm() + 1e-8                                 # Rodrigues (safe near zero)
+        ax = rv / th
+        Kx = torch.zeros(3, 3, device="cuda")
+        Kx[0, 1] = -ax[2]; Kx[0, 2] = ax[1]; Kx[1, 0] = ax[2]
+        Kx[1, 2] = -ax[0]; Kx[2, 0] = -ax[1]; Kx[2, 1] = ax[0]
+        Rd = torch.eye(3, device="cuda") + torch.sin(th) * Kx + (1 - torch.cos(th)) * (Kx @ Kx)
+        Rn = Rd @ c2wt[k, :3, :3]
+        tn = c2wt[k, :3, 3] + tvec[g]
+        w2c = torch.eye(4, device="cuda")
+        w2c[:3, :3] = Rn.T
+        w2c[:3, 3] = -Rn.T @ tn
+        return w2c[None]
+
+    gk = torch.exp(-((torch.arange(11, device="cuda") - 5.0) ** 2) / (2 * 1.5 ** 2))
+    gk = gk / gk.sum()
+    sswin = (gk[:, None] @ gk[None, :]).expand(3, 1, 11, 11)
+
+    def _ssim(x, y):
+        C1, C2 = 0.01 ** 2, 0.03 ** 2
+        mu1 = F.conv2d(x, sswin, padding=5, groups=3); mu2 = F.conv2d(y, sswin, padding=5, groups=3)
+        s1 = F.conv2d(x * x, sswin, padding=5, groups=3) - mu1 ** 2
+        s2 = F.conv2d(y * y, sswin, padding=5, groups=3) - mu2 ** 2
+        s12 = F.conv2d(x * y, sswin, padding=5, groups=3) - mu1 * mu2
+        return (((2 * mu1 * mu2 + C1) * (2 * s12 + C2))
+                / ((mu1 ** 2 + mu2 ** 2 + C1) * (s1 + s2 + C2))).mean()
+
+    def _render(k, shd):
+        return rasterization(
+            means=params["means"], quats=params["quats"], scales=torch.exp(params["scales"]),
+            opacities=torch.sigmoid(params["opacities"]),
+            colors=torch.cat([params["sh0"], params["shN"]], 1),
+            viewmats=_viewmat(k), Ks=K[None], width=Wf, height=Hf,
+            sh_degree=shd, packed=False)
+
+    rng = np.random.default_rng(1)
+    vididx = np.where(gidx < 0)[0]
+    stillidx = np.where(gidx >= 0)[0]
+    print(f"[train] {slug}: {len(vididx)} video + {len(stillidx)} still views "
+          f"({len(gnames)} stills, pose_opt={use_pose} from iter {still_start}), "
+          f"{N} init gaussians, scene_scale {scene_scale:.2f}, {iters} iters on "
+          f"{torch.cuda.get_device_name(0)}")
+    psnr = 0.0
+    for it in range(iters):
+        # stills join once the map is solid; oversample them (they're few but gold)
+        if len(stillidx) and it >= still_start and rng.random() < 0.15:
+            k = int(rng.choice(stillidx))
+        else:
+            k = int(rng.choice(vididx))
+        shd = min(it // 1000, sh_degree)
+        g = int(gidx[k])
+        renders, _, info = _render(k, shd)
+        gt = torch.from_numpy(imgs[k]).cuda().float().div_(255.0)
+        pred = renders[0]
+        if use_pose and g >= 0:
+            pred = pred * (2.0 * torch.sigmoid(evec[g]))[None, None, :]   # still exposure gain
+        l1 = (pred - gt).abs().mean()
+        pc = pred.permute(2, 0, 1)[None].clamp(0, 1); gc = gt.permute(2, 0, 1)[None]
+        loss = 0.8 * l1 + 0.2 * (1.0 - _ssim(pc, gc))
+        if g < 0:
+            # video view: normal training step (densification only ever sees these —
+            # a misaligned still must never SPAWN gaussians, it sprays needles)
+            strategy.step_pre_backward(params, opts, sstate, it, info)
+            loss.backward()
+            strategy.step_post_backward(params, opts, sstate, it, info, packed=False)
+            for o in opts.values():
+                o.step(); o.zero_grad(set_to_none=True)
+        else:
+            # still view: pose+exposure always learn; the map only after the warmup
+            loss.backward()
+            if it >= still_start + 2000:
+                for o in opts.values():
+                    o.step(); o.zero_grad(set_to_none=True)
+            else:
+                for o in opts.values():
+                    o.zero_grad(set_to_none=True)
+            pose_optim.step(); pose_optim.zero_grad(set_to_none=True)
+        sched.step()
+        if len(params["means"]) > max_gauss:                       # pragmatic VRAM guard
+            strategy.grow_grad2d *= 1.5
+        if it % 1000 == 0 or it == iters - 1:
+            with torch.no_grad():
+                mse = ((pred.clamp(0, 1) - gt) ** 2).mean()
+                psnr = float(10 * torch.log10(1.0 / (mse + 1e-12)))
+            print(f"[train] it {it}: loss {float(loss):.4f} psnr {psnr:.2f} "
+                  f"gaussians {len(params['means'])}")
+
+    extra = {"sh_degree": sh_degree}
+    if use_pose:
+        extra["still_pose"] = {"names": gnames, "rvec": rvec.detach().cpu(),
+                               "tvec": tvec.detach().cpu(), "evec": evec.detach().cpu()}
+        dr = np.degrees(rvec.detach().cpu().norm(dim=1).numpy())
+        dt = (tvec.detach().cpu().norm(dim=1).numpy() * meta["fpu"])
+        print(f"[train] still pose refinement: rot median {np.median(dr):.2f}deg max {dr.max():.2f}deg, "
+              f"trans median {np.median(dt):.2f}ft max {dt.max():.2f}ft")
+    torch.save({k: v.detach().cpu() for k, v in params.items()} | extra, f"{spd}/ckpt.pt")
+    vol.commit()
+
+    s3 = _r2(); dbg = []
+    with torch.no_grad():
+        for j, k in enumerate(rng.choice(len(frames), 3, replace=False)):
+            renders, _, _ = _render(int(k), sh_degree)
+            pr = (renders[0].clamp(0, 1) * 255).byte().cpu().numpy()
+            strip = np.concatenate([cv2.cvtColor(pr, cv2.COLOR_RGB2BGR),
+                                    cv2.cvtColor(imgs[int(k)], cv2.COLOR_RGB2BGR)], axis=1)
+            cv2.imwrite("/tmp/dbg.jpg", strip, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            dk = f"ortho/{slug}_splat_train{j}.jpg"
+            s3.upload_file("/tmp/dbg.jpg", R2_BUCKET, dk); dbg.append(dk)
+    ng = int(len(params["means"]))
+    print(f"[train] {slug}: done — {ng} gaussians, last psnr {psnr:.2f} -> {spd}/ckpt.pt, dbg {dbg}")
+    return {"gaussians": ng, "psnr": round(psnr, 2), "ckpt": f"{spd}/ckpt.pt", "debug": dbg}
+
+
+@app.function(image=gsplat_image, gpu="A10G", secrets=[r2_secret], volumes={"/scratch": vol},
+              timeout=1800, memory=16384)
+def render_splat(slug: str, out_w: int = 2266, ceil_cut: float = 0.8, floor_cut: float = -0.5,
+                 dollhouse: int = 3, doll_elev_deg: float = 40.0,
+                 opa_min: float = 0.35, big_cut: float = 0.2, xy_margin: float = 0.12,
+                 walls_mode: int = 0, strip_walls: int = 1, wall_lo: float = 0.55,
+                 wall_hi: float = 0.75, tex_cut: float = 0.8) -> dict:
+    """Stage 3: TRUE ORTHOGRAPHIC top-down from the trained splat (gaussians above
+    floor + ceil_cut*room dropped = ceiling removed), pixel-registered to the same
+    lo/hi-percentile frame as every other engine -> ortho/{slug}_splat.png. Bonus:
+    tilted dollhouse renders (horizontally flipped for delivery — the reconstruction
+    is mirrored vs reality; the ortho PNG stays RAW frame like _composed_v2, the
+    editor layer applies flipH)."""
+    import json
+    import numpy as np
+    import cv2
+    import torch
+    from gsplat import rasterization, spherical_harmonics
+
+    sd = f"/scratch/{slug}"; spd = f"{sd}/splat"
+    meta = json.load(open(f"{spd}/cameras.json"))
+    ck = torch.load(f"{spd}/ckpt.pt", map_location="cuda", weights_only=False)
+    up = np.array(meta["up"]); e1 = np.array(meta["e1"]); e2 = np.array(meta["e2"])
+    floor, room = meta["floor"], meta["room"]
+    lo1, hi1, lo2, hi2 = meta["lo1"], meta["hi1"], meta["lo2"], meta["hi2"]
+    span1 = hi1 - lo1; span2 = hi2 - lo2
+    mid1 = 0.5 * (lo1 + hi1); mid2 = 0.5 * (lo2 + hi2)
+    shdeg = int(ck["sh_degree"])
+
+    upT = torch.tensor(up, dtype=torch.float32, device="cuda")
+    e1T = torch.tensor(e1, dtype=torch.float32, device="cuda")
+    e2T = torch.tensor(e2, dtype=torch.float32, device="cuda")
+    mall = ck["means"].cuda()
+    h = mall @ upT
+    sall = torch.exp(ck["scales"].cuda())
+    qall = ck["quats"].cuda()
+    opaall = torch.sigmoid(ck["opacities"].cuda())
+    shall = torch.cat([ck["sh0"].cuda(), ck["shN"].cuda()], 1)
+    p1g = mall @ e1T; p2g = mall @ e2T
+    mx = xy_margin * max(span1, span2)
+    # de-fuzz + scene box: semi-transparent floaters, oversized soft blobs, and
+    # through-window sky/street gaussians all read as gray haze from above
+    boxm = (p1g > lo1 - mx) & (p1g < hi1 + mx) & (p2g > lo2 - mx) & (p2g < hi2 + mx)
+    # needles (ONE long axis — misaligned-view artifacts) render as streak spikes;
+    # pancakes (walls/surfaces, TWO long axes) pass because max ~ median there
+    needle = ((sall.max(1).values > 4.0 * sall.median(1).values)
+              & (sall.max(1).values > 0.05 * room))
+    solid = (opaall > opa_min) & (sall.max(1).values < big_cut * room) & boxm & ~needle
+    band = solid & (h < floor + ceil_cut * room) & (h > floor + floor_cut * room)
+    print(f"[render] {slug}: {int(band.sum())}/{len(band)} gaussians in view band "
+          f"(ceil_cut {ceil_cut}, opa>{opa_min}, scale<{big_cut}*room, box+{xy_margin})")
+
+    def _shade(idx, campos=None):
+        # bake SH -> per-gaussian RGB for THIS view (dirs = -up for ortho top-down),
+        # so the ortho camera model never has to reason about SH view directions
+        m = mall[idx]
+        if campos is None:
+            dirs = (-upT)[None, :].expand(len(m), 3)
+        else:
+            dirs = m - torch.tensor(campos, dtype=torch.float32, device="cuda")
+            dirs = dirs / dirs.norm(dim=1, keepdim=True).clamp(min=1e-9)
+        return torch.clamp(spherical_harmonics(shdeg, dirs, shall[idx]) + 0.5, 0.0, 1.0)
+
+    def _raster(idx, viewmat, Km, w, hh, campos=None, model="pinhole"):
+        renders, alphas, _ = rasterization(
+            means=mall[idx], quats=qall[idx], scales=sall[idx], opacities=opaall[idx],
+            colors=_shade(idx, campos),
+            viewmats=torch.tensor(viewmat, dtype=torch.float32, device="cuda")[None],
+            Ks=torch.tensor(Km, dtype=torch.float32, device="cuda")[None],
+            width=w, height=hh, packed=False, camera_model=model)
+        return ((renders[0].clamp(0, 1) * 255).byte().cpu().numpy(),
+                alphas[0, :, :, 0].cpu().numpy())
+
+    # -- true ortho top-down: rows [e1, -e2, -up] (right-handed), flipud after -> raw frame
+    Ht = int(round((out_w - 1) * span2 / span1)) + 1
+    Rw2c = np.stack([e1, -e2, -up])
+    campos = mid1 * e1 + mid2 * e2 + (floor + 4.0 * room) * up
+    vm = np.eye(4); vm[:3, :3] = Rw2c; vm[:3, 3] = -Rw2c @ campos
+    fx = (out_w - 1) / span1; fy = (Ht - 1) / span2
+    Ko = [[fx, 0, (out_w - 1) / 2.0], [0, fy, (Ht - 1) / 2.0], [0, 0, 1]]
+
+    keep_tex = band
+    nwall = 0
+    if walls_mode or strip_walls:
+        # WALLS AS SOLID PAINT-COLORED STROKES (Justin's spec): the door-header band
+        # (wall_lo..wall_hi of room height, ~4.7-6.4 ft) is solid over walls, OPEN over
+        # doorways (openings stop at ~6'8"), and above nearly all furniture — so its
+        # ortho occupancy IS the wall map with door breaks built in, and its rendered
+        # color IS the paint.
+        # walls only: a wall gaussian is a PANCAKE standing upright (smallest axis =
+        # surface normal = horizontal). Furniture tops / floaters in the band are
+        # horizontal pancakes or blobs — drop them before rasterizing the mask.
+        qn = qall / qall.norm(dim=1, keepdim=True).clamp(min=1e-9)
+        w_, x_, y_, z_ = qn[:, 0], qn[:, 1], qn[:, 2], qn[:, 3]
+        Rg = torch.stack([
+            torch.stack([1 - 2 * (y_ * y_ + z_ * z_), 2 * (x_ * y_ - w_ * z_), 2 * (x_ * z_ + w_ * y_)], -1),
+            torch.stack([2 * (x_ * y_ + w_ * z_), 1 - 2 * (x_ * x_ + z_ * z_), 2 * (y_ * z_ - w_ * x_)], -1),
+            torch.stack([2 * (x_ * z_ - w_ * y_), 2 * (y_ * z_ + w_ * x_), 1 - 2 * (x_ * x_ + y_ * y_)], -1),
+        ], 1)
+        jmin = sall.argmin(1)
+        nrm = Rg[torch.arange(len(jmin), device="cuda"), :, jmin]
+        vertical = (nrm @ upT).abs() < 0.6
+        flatg = sall.min(1).values < 0.7 * sall.median(1).values
+        wb = (boxm & (opaall > min(0.25, opa_min)) & (sall.max(1).values < big_cut * room)
+              & vertical & flatg
+              & (h > floor + wall_lo * room) & (h < floor + wall_hi * room))
+        nwall = int(wb.sum())
+        wrgb, wocc = _raster(wb, vm, Ko, out_w, Ht, model="ortho")
+        ev = cv2.morphologyEx((wocc > 0.35).astype(np.uint8), cv2.MORPH_CLOSE,
+                              np.ones((5, 5), np.uint8))
+        px_ft = (out_w - 1) / (span1 * meta["fpu"])           # px per foot
+        nc, lab, st, _ = cv2.connectedComponentsWithStats(ev)
+        for i in range(1, nc):
+            if st[i, cv2.CC_STAT_AREA] < 200:                 # specks aren't walls
+                ev[lab == i] = 0
+                continue
+            dt = cv2.distanceTransform((lab == i).astype(np.uint8), cv2.DIST_L2, 3)
+            if float(dt.max()) > 0.75 * px_ft:                # fatter than ~1.5 ft -> not a wall
+                ev[lab == i] = 0
+        ug = (fx * (p1g - mid1) + (out_w - 1) / 2.0).round().long().clamp(0, out_w - 1)
+        vg = ((Ht - 1) / 2.0 - fy * (p2g - mid2)).round().long().clamp(0, Ht - 1)
+        stroke = np.zeros((Ht, out_w), np.uint8)
+    if walls_mode:
+        # VECTORIZE by 1-D density: in the rotated Manhattan frame a wall is a sustained
+        # line of band-gaussian mass at one offset; doorways are the gaps in its span.
+        # (Robust to spotty evidence — no skeleton/Hough cascade to break.)
+        wall_px = max(3, int(round(0.37 * px_ft)))
+        segs = cv2.HoughLinesP(ev * 255, 1, np.pi / 180, threshold=int(1.5 * px_ft),
+                               minLineLength=int(2.0 * px_ft), maxLineGap=int(0.5 * px_ft))
+        theta = 0.0
+        if segs is not None and len(segs):
+            s0_ = segs[:, 0, :].astype(np.float64)
+            ang = np.degrees(np.arctan2(s0_[:, 3] - s0_[:, 1], s0_[:, 2] - s0_[:, 0])) % 90.0
+            ln = np.hypot(s0_[:, 2] - s0_[:, 0], s0_[:, 3] - s0_[:, 1])
+            hist = np.zeros(90)
+            np.add.at(hist, ang.astype(int) % 90, ln)
+            hist = np.convolve(np.concatenate([hist[-2:], hist, hist[:2]]), np.ones(5), "valid")
+            theta = float(np.argmax(hist))                    # dominant wall orientation
+        cxi = (out_w - 1) / 2.0; cyi = (Ht - 1) / 2.0
+        th = np.radians(theta); ct, sn = np.cos(th), np.sin(th)
+        ir = lambda v: int(round(v))
+        uw = ug[wb].cpu().numpy().astype(np.float64); vw = vg[wb].cpu().numpy().astype(np.float64)
+        wts = opaall[wb].cpu().numpy()
+        WX = cxi + ct * (uw - cxi) + sn * (vw - cyi)          # rotate by -theta
+        WY = cyi - sn * (uw - cxi) + ct * (vw - cyi)
+        OB, AB = 4.0, 16.0                                    # offset / along bin sizes (px)
+        gaptol = int(round(2.0 * px_ft / AB)); minrun = 3.0 * px_ft / AB
+        for axis in (0, 1):
+            off = (WY if axis == 0 else WX) / OB
+            alo = (WX if axis == 0 else WY) / AB
+            o0 = int(np.floor(off.min())); a0 = int(np.floor(alo.min()))
+            grid = np.zeros((int(off.max()) - o0 + 2, int(alo.max()) - a0 + 2), np.float32)
+            np.add.at(grid, (off.astype(int) - o0, alo.astype(int) - a0), wts)
+            rs = np.convolve(grid.sum(1), np.ones(3), "same")
+            order = np.argsort(-rs)
+            taken = np.zeros(len(rs), bool)
+            rs_min = max(6.0, 0.18 * float(rs.max()))         # furniture rows don't qualify
+            for r in order:
+                if rs[r] < rs_min or taken[max(0, r - 8):r + 9].any():   # one stroke per wall
+                    continue
+                taken[r] = True
+                prof = np.convolve(grid[max(0, r - 2):r + 3].sum(0), np.ones(3), "same")
+                on = prof > 1.4
+                runs = []
+                for k in np.where(on)[0]:                     # merge sub-door gaps only
+                    if runs and k - runs[-1][1] <= gaptol:
+                        runs[-1][1] = k
+                    else:
+                        runs.append([k, k])
+                for k0, k1 in runs:
+                    if k1 - k0 < minrun:                      # stray dashes aren't walls
+                        continue
+                    aa0 = (k0 + a0) * AB; aa1 = (k1 + a0 + 1) * AB
+                    oo = (r + o0 + 0.5) * OB
+                    if axis == 0:
+                        P0 = (aa0, oo); P1 = (aa1, oo)
+                    else:
+                        P0 = (oo, aa0); P1 = (oo, aa1)
+                    q0 = (cxi + ct * (P0[0] - cxi) - sn * (P0[1] - cyi),
+                          cyi + sn * (P0[0] - cxi) + ct * (P0[1] - cyi))
+                    q1 = (cxi + ct * (P1[0] - cxi) - sn * (P1[1] - cyi),
+                          cyi + sn * (P1[0] - cxi) + ct * (P1[1] - cyi))
+                    cv2.line(stroke, (ir(q0[0]), ir(q0[1])), (ir(q1[0]), ir(q1[1])),
+                             255, wall_px)
+    if walls_mode or strip_walls:
+        wmask = stroke > 0
+        # strip ALL wall evidence (not just drawn strokes) from the texture pass — the
+        # wall fuzz goes away, and with walls gone the ceiling cut can rise to tex_cut
+        # so tall furniture keeps its top
+        grow = cv2.dilate(((ev > 0) | wmask).astype(np.uint8), np.ones((13, 13), np.uint8)) > 0
+        inwall = torch.from_numpy(grow).cuda()[vg, ug]
+        # mid-air isotropic blobs (floaters the opacity gate misses) read as gray haze
+        roundish = sall.min(1).values > 0.45 * sall.max(1).values
+        airjunk = roundish & (h > floor + 0.45 * room) & (h < floor + tex_cut * room)
+        keep_tex = (solid & (h < floor + tex_cut * room) & (h > floor + floor_cut * room)
+                    & ~(inwall & (h > floor + 0.18 * room)) & ~airjunk)
+
+    img, _ = _raster(keep_tex, vm, Ko, out_w, Ht, model="ortho")
+    if walls_mode:
+        # flat paint field: de-alpha the band render, spread + smooth at quarter res,
+        # then fill the wall strokes solid with it
+        pf = (wrgb.astype(np.float32) / np.maximum(wocc[..., None], 0.25)).clip(0, 255).astype(np.uint8)
+        q = cv2.resize(pf, (max(2, out_w // 4), max(2, Ht // 4)), interpolation=cv2.INTER_AREA)
+        qm = (cv2.resize((wocc > 0.3).astype(np.uint8) * 255, (q.shape[1], q.shape[0]),
+                         interpolation=cv2.INTER_NEAREST) == 0).astype(np.uint8)
+        q = cv2.inpaint(q, qm, 5, cv2.INPAINT_TELEA)
+        q = cv2.GaussianBlur(q, (31, 31), 0)
+        paint = cv2.resize(q, (out_w, Ht), interpolation=cv2.INTER_LINEAR)
+        img[wmask] = paint[wmask]
+
+    img = np.flipud(img)
+    obgr = cv2.cvtColor(np.ascontiguousarray(img), cv2.COLOR_RGB2BGR)
+    s3 = _r2()
+    cv2.imwrite("/tmp/so.png", obgr)
+    key = f"ortho/{slug}_splat.png"; s3.upload_file("/tmp/so.png", R2_BUCKET, key)
+    cv2.imwrite("/tmp/so.jpg", obgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    s3.upload_file("/tmp/so.jpg", R2_BUCKET, f"ortho/{slug}_splat.jpg")
+
+    # compositor inputs: per-pixel surface HEIGHT (expected-depth ortho -> feet above
+    # floor; PNG16, value = (ft + 5) * 1000) + the raw wall-evidence mask (registration)
+    dep, dal, _ = rasterization(
+        means=mall[keep_tex], quats=qall[keep_tex], scales=sall[keep_tex],
+        opacities=opaall[keep_tex], colors=torch.ones((int(keep_tex.sum()), 3), device="cuda"),
+        viewmats=torch.tensor(vm, dtype=torch.float32, device="cuda")[None],
+        Ks=torch.tensor(Ko, dtype=torch.float32, device="cuda")[None],
+        width=out_w, height=Ht, packed=False, camera_model="ortho", render_mode="ED")
+    hft = (4.0 * room - dep[0, :, :, 0].cpu().numpy()) * meta["fpu"]
+    hft[dal[0, :, :, 0].cpu().numpy() < 0.5] = 30.0           # empty sky reads as "not floor"
+    cv2.imwrite("/tmp/shh.png", np.flipud(np.clip((hft + 5.0) * 1000.0, 0, 65535).astype(np.uint16)))
+    hkey = f"ortho/{slug}_splat_height.png"; s3.upload_file("/tmp/shh.png", R2_BUCKET, hkey)
+    if walls_mode or strip_walls:
+        cv2.imwrite("/tmp/sev.png", np.flipud(ev * 255))
+        s3.upload_file("/tmp/sev.png", R2_BUCKET, f"ortho/{slug}_splat_wallev.png")
+
+    # -- bonus dollhouse views: pinhole, 35-45 deg elevation, flipH for delivery
+    dkeys = []
+    el = np.radians(doll_elev_deg); fov = np.radians(55.0); dw, dh = 1600, 1200
+    ctr = mid1 * e1 + mid2 * e2 + (floor + 0.35 * room) * up
+    dist = 0.65 * float(np.hypot(span1, span2)) / np.tan(fov / 2)
+    for k in range(max(0, dollhouse)):
+        az = 2 * np.pi * k / max(1, dollhouse) + np.pi / 6
+        back = np.cos(az) * e1 + np.sin(az) * e2
+        cp = ctr + dist * (np.cos(el) * back + np.sin(el) * up)
+        fwd = ctr - cp; fwd = fwd / np.linalg.norm(fwd)
+        rgt = np.cross(fwd, up); rgt = rgt / np.linalg.norm(rgt)
+        dwn = np.cross(fwd, rgt)                             # OpenCV y-down; [rgt,dwn,fwd] right-handed
+        R = np.stack([rgt, dwn, fwd])
+        vmk = np.eye(4); vmk[:3, :3] = R; vmk[:3, 3] = -R @ cp
+        fpx = (dw / 2.0) / np.tan(fov / 2)
+        Kd = [[fpx, 0, dw / 2.0], [0, fpx, dh / 2.0], [0, 0, 1]]
+        dim, _ = _raster(band, vmk, Kd, dw, dh, campos=cp)
+        dim = cv2.cvtColor(np.ascontiguousarray(dim[:, ::-1]), cv2.COLOR_RGB2BGR)  # mirror fix
+        cv2.imwrite("/tmp/dh.jpg", dim, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        dk = f"ortho/{slug}_dollhouse{k}.jpg"
+        s3.upload_file("/tmp/dh.jpg", R2_BUCKET, dk); dkeys.append(dk)
+
+    fpu = meta["fpu"]
+    print(f"[render] {slug}: ortho {out_w}x{Ht} ({round(span1*fpu,1)}x{round(span2*fpu,1)}ft), "
+          f"walls_mode={walls_mode} ({nwall} band gaussians) -> {key}, dollhouse {dkeys}")
+    return {"ortho": key, "jpg": f"ortho/{slug}_splat.jpg", "px": [out_w, Ht],
+            "walls": bool(walls_mode), "dollhouse": dkeys}
+
+
+def _load_still_poses(s3, slug, meta, spd):
+    """Refined still BODY poses (c2w) for projection: prefer the COLMAP registration
+    (layout/{slug}/colmap_stills.json — mm-class), else the photometric refinement
+    saved in the training checkpoint."""
+    import json
+    import numpy as np
+    try:
+        cj = json.loads(s3.get_object(Bucket=R2_BUCKET,
+                                      Key=f"layout/{slug}/colmap_stills.json")["Body"].read())
+        poses = {k: np.array(v["c2w"]) for k, v in cj.items() if isinstance(v, dict)}
+        if poses:
+            print(f"[stillposes] COLMAP poses for {len(poses)} stills")
+            return poses
+    except Exception:
+        pass
+    import torch
+    ck = torch.load(f"{spd}/ckpt.pt", map_location="cpu", weights_only=False)
+    sp = ck.get("still_pose")
+    if not sp:
+        return {}
+    base = {}
+    for f in meta["frames"]:
+        if f.get("group") and f["img"].endswith("_f.jpg"):
+            base[f["group"]] = np.array(f["c2w"])
+    rv = sp["rvec"].numpy(); tv = sp["tvec"].numpy()
+    poses = {}
+    for gi, name in enumerate(sp["names"]):
+        if name not in base:
+            continue
+        c2w = base[name].copy()
+        th = np.linalg.norm(rv[gi])
+        if th > 1e-8:
+            ax = rv[gi] / th
+            Kx = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+            c2w[:3, :3] = (np.eye(3) + np.sin(th) * Kx + (1 - np.cos(th)) * (Kx @ Kx)) @ c2w[:3, :3]
+        c2w[:3, 3] += tv[gi]
+        poses[name] = c2w
+    print(f"[stillposes] ckpt-refined poses for {len(poses)} stills")
+    return poses
+
+
+@app.function(image=gsplat_image, secrets=[r2_secret], volumes={"/scratch": vol},
+              timeout=3600, memory=16384)
+def make_still_ortho(slug: str, out_w: int = 2266, max_off_deg: float = 60.0,
+                     max_off_flat: float = 76.0,
+                     stills_prefix: str = "projects/old-town-scottsdale-home/still/") -> dict:
+    """Project each 360 STILL's bottom hemisphere onto the splat's height surface
+    (make_trueortho's per-ray trick, but from 14 standpoints INSIDE the rooms at 8K,
+    through the REFINED poses from train_splat). Occlusion-checked against the height
+    map, exposure-corrected by each still's learned gain, winner-take-all by ray
+    verticality -> ortho/{slug}_still_tex.png + weight mask for the hybrid compositor."""
+    import io
+    import json
+    import numpy as np
+    import cv2
+    import torch
+
+    s3 = _r2(); sd = f"/scratch/{slug}"; spd = f"{sd}/splat"
+    meta = json.load(open(f"{spd}/cameras.json"))
+    ck = torch.load(f"{spd}/ckpt.pt", map_location="cpu", weights_only=False)
+    poses = _load_still_poses(s3, slug, meta, spd)
+    if not poses:
+        raise RuntimeError("no refined still poses — run colmapreg or retrain with pose_opt=1")
+    up = np.array(meta["up"]); e1 = np.array(meta["e1"]); e2 = np.array(meta["e2"])
+    floor, room, fpu = meta["floor"], meta["room"], meta["fpu"]
+    lo1, hi1, lo2, hi2 = meta["lo1"], meta["hi1"], meta["lo2"], meta["hi2"]
+    span1 = hi1 - lo1; span2 = hi2 - lo2
+    Ht = int(round((out_w - 1) * span2 / span1)) + 1
+
+    # surface height per RAW-frame cell (ft above floor), from the splat render stage
+    hbuf = s3.get_object(Bucket=R2_BUCKET, Key=f"ortho/{slug}_splat_height.png")["Body"].read()
+    h16 = cv2.imdecode(np.frombuffer(hbuf, np.uint8), cv2.IMREAD_UNCHANGED)
+    h16 = cv2.resize(h16, (out_w, Ht), interpolation=cv2.INTER_NEAREST)
+    hft = h16.astype(np.float32) / 1000.0 - 5.0
+    hft[hft > 12.0] = 0.0                                    # empty sky -> treat as floor
+    hu = floor + hft / fpu                                   # surface height in units
+
+    sp = ck.get("still_pose") or {}
+    evec = sp.get("evec")                                     # may be absent on old ckpts
+    egain = {}
+    if evec is not None:
+        for gi, nm in enumerate(sp["names"]):
+            egain[nm] = 2.0 / (1.0 + np.exp(-evec[gi].numpy()))
+    resp = s3.list_objects_v2(Bucket=R2_BUCKET, Prefix=stills_prefix)
+    skeys = {os.path.splitext(os.path.basename(o["Key"]))[0]: o["Key"]
+             for o in resp.get("Contents", []) if o["Key"].lower().endswith((".jpg", ".jpeg"))}
+
+    # splat ortho = the color/exposure anchor each still patch gets matched to
+    sbuf = s3.get_object(Bucket=R2_BUCKET, Key=f"ortho/{slug}_splat.png")["Body"].read()
+    sref = cv2.imdecode(np.frombuffer(sbuf, np.uint8), cv2.IMREAD_COLOR)
+    sref = cv2.resize(sref, (out_w, Ht), interpolation=cv2.INTER_AREA).astype(np.float32)
+
+    gx, gy = np.meshgrid(np.arange(out_w), np.arange(Ht))     # RAW frame cell coords
+    p1c = lo1 + gx / (out_w - 1.0) * span1
+    p2c = lo2 + gy / (Ht - 1.0) * span2
+    cosmax = np.cos(np.radians(max_off_deg))
+    # flat surfaces (counters, tables, floors) tolerate OBLIQUE rays — layover needs a
+    # height EDGE to show. Relax the cone there; stay strict near discontinuities.
+    gyf, gxf = np.gradient(hft)
+    flatm = np.hypot(gxf, gyf) < 0.12
+    flatm = cv2.erode(flatm.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+    coscell = np.where(flatm, np.cos(np.radians(max_off_flat)), cosmax).astype(np.float32)
+    out = np.zeros((Ht, out_w, 3), np.float32)
+    best = np.zeros((Ht, out_w), np.float32)
+    used = 0
+    for name, c2w in poses.items():
+        if name not in skeys:
+            continue
+        R = c2w[:3, :3]; C = c2w[:3, 3]
+        p1s = float(C @ e1); p2s = float(C @ e2); hs = float(C @ up)
+        s3.download_file(R2_BUCKET, skeys[name], "/tmp/sp.jpg")
+        pano = cv2.imread("/tmp/sp.jpg")
+        if pano is None:
+            continue
+        Hp, Wp = pano.shape[:2]
+        pano = np.concatenate([pano, pano[:, :1]], axis=1)    # lon-180 wrap
+        dx = p1c - p1s; dy = p2c - p2s
+        drop = hs - hu
+        dxy = np.hypot(dx, dy)
+        dist = np.hypot(dxy, drop)
+        vert = drop / np.maximum(dist, 1e-6)                  # 1 = straight down
+        cand = (vert > coscell) & (drop > 0.4 / fpu)
+        w = np.where(cand, vert ** 6, 0.0).astype(np.float32)
+        w[w <= best] = 0.0
+        if not (w > 0).any():
+            continue
+        # occlusion march: reject cells whose ray dips below the surface en route
+        vis = np.ones((Ht, out_w), bool)
+        for s in np.linspace(0.2, 0.9, 10):
+            sx = ((p1s + s * dx - lo1) / span1 * (out_w - 1)).astype(np.int32).clip(0, out_w - 1)
+            sy = ((p2s + s * dy - lo2) / span2 * (Ht - 1)).astype(np.int32).clip(0, Ht - 1)
+            vis &= hu[sy, sx] < (hs + s * (hu - hs)) + 0.35 / fpu
+        w[~vis] = 0.0
+        sel = w > 0
+        if not sel.any():
+            continue
+        vx = dx[sel]; vy = dy[sel]; vz = (hu - hs)[sel]
+        vw = (vx[:, None] * e1 + vy[:, None] * e2 + vz[:, None] * up)
+        vw /= np.linalg.norm(vw, axis=1, keepdims=True) + 1e-9
+        rc = vw @ R                                           # world -> camera (R^T v)
+        lon = np.arctan2(rc[:, 0], rc[:, 2])
+        lat = np.arcsin(np.clip(-rc[:, 1], -1, 1))
+        uf = ((lon / (2 * np.pi)) + 0.5) * Wp
+        vf = np.clip((0.5 - lat / np.pi) * Hp, 0, Hp - 1.001)
+        polar = vf > 0.86 * Hp                                # pano bottom pole = drone body
+        x0 = np.floor(uf).astype(np.int32); y0 = np.floor(vf).astype(np.int32)
+        fx = (uf - x0).astype(np.float32)[:, None]; fy = (vf - y0).astype(np.float32)[:, None]
+        col = (pano[y0, x0] * (1 - fx) * (1 - fy) + pano[y0, x0 + 1] * fx * (1 - fy)
+               + pano[y0 + 1, x0] * (1 - fx) * fy + pano[y0 + 1, x0 + 1] * fx * fy).astype(np.float32)
+        if name in egain:                                     # learned gain maps splat->still (RGB);
+            col /= np.maximum(egain[name][::-1], 0.3)         # divide -> splat exposure (BGR order)
+        col = col[~polar]
+        selyx = np.where(sel)
+        keep2 = ~polar
+        sel2 = np.zeros_like(sel); sel2[selyx[0][keep2], selyx[1][keep2]] = True
+        # per-still exposure anchor: match this patch's stats to the splat at the SAME cells
+        anch = sref[sel2]
+        okc = anch.sum(1) > 25
+        if int(okc.sum()) > 400:
+            for cch in range(3):
+                a = float(np.clip(anch[okc, cch].std() / max(col[okc, cch].std(), 1e-3), 0.6, 1.6))
+                b = float(anch[okc, cch].mean() - a * col[okc, cch].mean())
+                col[:, cch] = col[:, cch] * a + b
+        out[sel2] = np.clip(col, 0, 255)
+        best[sel2] = w[sel][keep2]
+        used += 1
+        print(f"[stilltex] {name[:8]}: {int(sel.sum())} px, standpoint ({(p1s-lo1)*fpu:.1f}, "
+              f"{(p2s-lo2)*fpu:.1f}) ft, h {(hs-floor)*fpu:.1f} ft")
+
+    img = np.clip(out, 0, 255).astype(np.uint8)
+    w8 = np.clip(best / max(best.max(), 1e-6) * 255, 0, 255).astype(np.uint8)
+    cv2.imwrite("/tmp/st.png", img)
+    key = f"ortho/{slug}_still_tex.png"; s3.upload_file("/tmp/st.png", R2_BUCKET, key)
+    cv2.imwrite("/tmp/stw.png", w8)
+    wkey = f"ortho/{slug}_still_texw.png"; s3.upload_file("/tmp/stw.png", R2_BUCKET, wkey)
+    cov = int((best > 0).mean() * 100)
+    print(f"[stilltex] {slug}: {used} stills projected, {cov}% of frame covered -> {key}")
+    return {"tex": key, "weight": wkey, "stills": used, "cov_pct": cov}
+
+
+@app.local_entrypoint()
+def stillortho(slug: str, max_off_deg: float = 60.0):
+    """Project the 8K stills through their refined poses onto the splat height surface:
+        modal run modal_app.py::stillortho --slug scottsdale-nadir"""
+    print(make_still_ortho.remote(slug, max_off_deg=max_off_deg))
+
+
+@app.function(image=gsplat_image, secrets=[r2_secret], volumes={"/scratch": vol},
+              timeout=7200, memory=32768)
+def make_floortex(slug: str, out_w: int = 2266, n_frames: int = 240, rmax_ft: float = 16.0,
+                  stills_prefix: str = "projects/old-town-scottsdale-home/still/") -> dict:
+    """Justin's horizon-bounded floor unwrap: every posed pano (stills first, then video
+    frames) projects its FLOOR pixels outward to the per-azimuth LINE-OF-SIGHT horizon —
+    an occlusion march on the splat height field stands in for the horizon line, so the
+    projection stops at wall bases and furniture instead of a fixed cone. Floor is flat,
+    so there is NO layover at any obliquity. Select-blend by ray verticality with rolling
+    gain match -> ortho/{slug}_floortex.png (+ mask) for the hybrid compositor."""
+    import json
+    import numpy as np
+    import cv2
+    import torch
+
+    s3 = _r2(); sd = f"/scratch/{slug}"; spd = f"{sd}/splat"
+    meta = json.load(open(f"{spd}/cameras.json"))
+    up = np.array(meta["up"]); e1 = np.array(meta["e1"]); e2 = np.array(meta["e2"])
+    floor, room, fpu = meta["floor"], meta["room"], meta["fpu"]
+    lo1, hi1, lo2, hi2 = meta["lo1"], meta["hi1"], meta["lo2"], meta["hi2"]
+    span1 = hi1 - lo1; span2 = hi2 - lo2
+    Ht = int(round((out_w - 1) * span2 / span1)) + 1
+    c = np.array(meta["c"], np.float64)
+
+    hbuf = s3.get_object(Bucket=R2_BUCKET, Key=f"ortho/{slug}_splat_height.png")["Body"].read()
+    h16 = cv2.imdecode(np.frombuffer(hbuf, np.uint8), cv2.IMREAD_UNCHANGED)
+    h16 = cv2.resize(h16, (out_w, Ht), interpolation=cv2.INTER_NEAREST)
+    hft = h16.astype(np.float32) / 1000.0 - 5.0
+    hft[hft > 12.0] = 0.0
+    hu = (floor + hft / fpu).astype(np.float32)               # surface height (units)
+    F = hft < 0.35                                            # floor + rugs = unwrap targets
+
+    gx, gy = np.meshgrid(np.arange(out_w), np.arange(Ht))
+    p1c = (lo1 + gx / (out_w - 1.0) * span1).astype(np.float32)
+    p2c = (lo2 + gy / (Ht - 1.0) * span2).astype(np.float32)
+    rmax_u = rmax_ft / fpu
+
+    out = np.zeros((Ht, out_w, 3), np.float32)
+    best = np.zeros((Ht, out_w), np.float32)
+
+    def unwrap(pano, R, C, tag, wboost=1.0):
+        nonlocal out, best
+        p1s = float(C @ e1); p2s = float(C @ e2); hs = float(C @ up)
+        if hs - floor < 0.25 * (1.0 / fpu):                   # too low to see floor (< ~3in? no: 0.25ft)
+            return 0
+        dx = p1c - p1s; dy = p2c - p2s
+        dxy = np.hypot(dx, dy)
+        drop = hs - hu
+        vert = drop / np.maximum(np.hypot(dxy, drop), 1e-6)
+        w = np.where(F & (dxy < rmax_u) & (drop > 0.15 / fpu), vert ** 4, 0.0).astype(np.float32) * wboost
+        cand = w > best
+        if not cand.any():
+            return 0
+        cy, cx2 = np.where(cand)
+        dxc = dx[cy, cx2]; dyc = dy[cy, cx2]
+        # LINE-OF-SIGHT march: the ray from the camera to the cell's floor point must
+        # clear the height field en route — this IS the per-azimuth horizon line
+        vis = np.ones(len(cy), bool)
+        huc = hu[cy, cx2]
+        for s in np.linspace(0.12, 0.93, 12):
+            sx = ((p1s + s * dxc - lo1) / span1 * (out_w - 1)).astype(np.int32).clip(0, out_w - 1)
+            sy = ((p2s + s * dyc - lo2) / span2 * (Ht - 1)).astype(np.int32).clip(0, Ht - 1)
+            vis &= hu[sy, sx] < (hs + s * (huc - hs)) + 0.3 / fpu
+        if not vis.any():
+            return 0
+        cy = cy[vis]; cx2 = cx2[vis]
+        vw = (dx[cy, cx2][:, None] * e1 + dy[cy, cx2][:, None] * e2
+              + (hu[cy, cx2] - hs)[:, None] * up)
+        vw /= np.linalg.norm(vw, axis=1, keepdims=True) + 1e-9
+        rc = vw @ R
+        Hp, Wp = pano.shape[0], pano.shape[1] - 1
+        lon = np.arctan2(rc[:, 0], rc[:, 2])
+        lat = np.arcsin(np.clip(-rc[:, 1], -1, 1))
+        uf = ((lon / (2 * np.pi)) + 0.5) * Wp
+        vf = np.clip((0.5 - lat / np.pi) * Hp, 0, Hp - 1.001)
+        keepp = vf < 0.88 * Hp                                # pano bottom pole = drone body
+        cy = cy[keepp]; cx2 = cx2[keepp]; uf = uf[keepp]; vf = vf[keepp]
+        if not len(cy):
+            return 0
+        x0 = np.floor(uf).astype(np.int32); y0 = np.floor(vf).astype(np.int32)
+        fx = (uf - x0).astype(np.float32)[:, None]; fy = (vf - y0).astype(np.float32)[:, None]
+        col = (pano[y0, x0] * (1 - fx) * (1 - fy) + pano[y0, x0 + 1] * fx * (1 - fy)
+               + pano[y0 + 1, x0] * (1 - fx) * fy + pano[y0 + 1, x0 + 1] * fx * fy).astype(np.float32)
+        seen = best[cy, cx2] > 0.05
+        if int(seen.sum()) > 400:                             # rolling gain match to the mosaic
+            gv = float(np.clip(np.median(out[cy[seen], cx2[seen]].mean(1)
+                                         / (col[seen].mean(1) + 1e-3)), 0.75, 1.35))
+            col *= gv
+        out[cy, cx2] = col
+        best[cy, cx2] = w[cy, cx2]
+        return int(len(cy))
+
+    # --- stills first (in-room standpoints set the exposure baseline) ---
+    poses = _load_still_poses(s3, slug, meta, spd)
+    nstill = 0
+    if poses:
+        resp = s3.list_objects_v2(Bucket=R2_BUCKET, Prefix=stills_prefix)
+        skeys = {os.path.splitext(os.path.basename(o["Key"]))[0]: o["Key"]
+                 for o in resp.get("Contents", []) if o["Key"].lower().endswith((".jpg", ".jpeg"))}
+        for name, c2w in poses.items():
+            if name not in skeys:
+                continue
+            s3.download_file(R2_BUCKET, skeys[name], "/tmp/fp.jpg")
+            pano = cv2.imread("/tmp/fp.jpg")
+            if pano is None:
+                continue
+            pano = np.concatenate([pano, pano[:, :1]], axis=1)
+            n = unwrap(pano, c2w[:3, :3], c2w[:3, 3], name[:8], wboost=1.6)   # stills win ties
+            nstill += 1 if n else 0
+    print(f"[floortex] {nstill} stills unwrapped")
+
+    # --- video frames: sequential decode of the 4K proxy, sharp-gated ---
+    traj = f"{sd}/frame_trajectory.txt"
+    T = np.loadtxt(traj)
+    vid = f"{sd}/hires.mp4"
+    cap = cv2.VideoCapture(vid)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    nfr = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    ts = T[:, 0].copy()
+    if nfr and ts.max() > (nfr / fps) * 2:
+        ts = ts / fps
+    Rm = np.array([_quat2rot(q) for q in T[:, 4:8]])
+    Cm = T[:, 1:4] - c
+    okp = np.isfinite(Cm).all(1) & np.isfinite(Rm.reshape(len(T), -1)).all(1) & np.isfinite(ts)
+    okidx = np.where(okp)[0]
+    step = max(1, len(okidx) // max(1, n_frames))
+    nvid = 0; sharps = []
+    for i in okidx[::step]:
+        cap.set(cv2.CAP_PROP_POS_MSEC, float(ts[i]) * 1000.0)
+        ok2, fr = cap.read()
+        if not ok2:
+            continue
+        g = cv2.cvtColor(cv2.resize(fr, (480, 240)), cv2.COLOR_BGR2GRAY)
+        s = float(cv2.Laplacian(g, cv2.CV_64F).var())
+        sharps.append(s)
+        if len(sharps) > 30 and s < 0.55 * float(np.median(sharps[-121:])):
+            continue
+        frp = np.concatenate([fr, fr[:, :1]], axis=1)
+        if unwrap(frp, Rm[i], Cm[i], f"f{i}"):
+            nvid += 1
+    cap.release()
+
+    img = np.clip(out, 0, 255).astype(np.uint8)
+    cov = best > 0
+    cv2.imwrite("/tmp/ft.png", img)
+    key = f"ortho/{slug}_floortex.png"; s3.upload_file("/tmp/ft.png", R2_BUCKET, key)
+    cv2.imwrite("/tmp/ftm.png", cov.astype(np.uint8) * 255)
+    mkey = f"ortho/{slug}_floortex_mask.png"; s3.upload_file("/tmp/ftm.png", R2_BUCKET, mkey)
+    covp = int(cov.mean() * 100)
+    floorp = int((cov & F).sum() / max(F.sum(), 1) * 100)
+    print(f"[floortex] {slug}: {nstill} stills + {nvid} video frames, floor {floorp}% textured "
+          f"({covp}% of frame) -> {key}")
+    return {"tex": key, "mask": mkey, "stills": nstill, "frames": nvid,
+            "floor_cov_pct": floorp}
+
+
+@app.local_entrypoint()
+def floortex(slug: str, n_frames: int = 240, rmax_ft: float = 16.0):
+    """Horizon-bounded floor unwrap from ALL posed panos:
+        modal run modal_app.py::floortex --slug scottsdale-nadir"""
+    print(make_floortex.remote(slug, n_frames=n_frames, rmax_ft=rmax_ft))
+
+
+# COLMAP CLI layered on top of the gsplat image (appended layer — the cached torch/gsplat
+# build is untouched). CPU SIFT; we drive the classic known-pose flow via subprocess.
+colmap_image = gsplat_image.apt_install("colmap")
+
+# Real-ESRGAN weights via spandrel (torch-only loader — no basicsr dependency tar pit).
+esrgan_image = (
+    gsplat_image
+    .pip_install("spandrel")
+    .run_commands(
+        "python -c \"import urllib.request; urllib.request.urlretrieve("
+        "'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth',"
+        "'/opt/realesrgan_x4plus.pth')\"")
+)
+
+
+@app.function(image=esrgan_image, gpu="A10G", secrets=[r2_secret], timeout=1800, memory=16384)
+def enhance_image(key_in: str, key_out: str, sharpen: float = 0.35, tile: int = 512) -> dict:
+    """AI de-blur for the composite (Justin-approved generative sharpening): Real-ESRGAN
+    x4 over the image in padded tiles, downsampled back to NATIVE size — soft edges come
+    back defined — plus a mild unsharp kiss. R2 key -> R2 key."""
+    import numpy as np
+    import cv2
+    import torch
+    from spandrel import ModelLoader
+
+    s3 = _r2()
+    buf = s3.get_object(Bucket=R2_BUCKET, Key=key_in)["Body"].read()
+    img = cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
+    H, W = img.shape[:2]
+    model = ModelLoader().load_from_file("/opt/realesrgan_x4plus.pth").cuda().eval()
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    up = np.zeros((H * 4, W * 4, 3), np.float32)
+    pad = 16
+    with torch.no_grad():
+        for y0 in range(0, H, tile):
+            for x0 in range(0, W, tile):
+                y1 = min(H, y0 + tile); x1 = min(W, x0 + tile)
+                ya = max(0, y0 - pad); xa = max(0, x0 - pad)
+                yb = min(H, y1 + pad); xb = min(W, x1 + pad)
+                t = torch.from_numpy(rgb[ya:yb, xa:xb]).permute(2, 0, 1)[None].cuda()
+                o = model(t)[0].permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+                up[y0 * 4:y1 * 4, x0 * 4:x1 * 4] = \
+                    o[(y0 - ya) * 4:(y0 - ya) * 4 + (y1 - y0) * 4,
+                      (x0 - xa) * 4:(x0 - xa) * 4 + (x1 - x0) * 4]
+    out = cv2.resize(up, (W, H), interpolation=cv2.INTER_AREA)
+    out = cv2.cvtColor((np.clip(out, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+    if sharpen > 0:
+        bl = cv2.GaussianBlur(out, (0, 0), 1.2)
+        out = cv2.addWeighted(out, 1 + sharpen, bl, -sharpen, 0)
+    png = key_out.lower().endswith(".png")
+    enc = cv2.imencode(".png" if png else ".jpg", out,
+                       [] if png else [cv2.IMWRITE_JPEG_QUALITY, 95])[1]
+    s3.put_object(Bucket=R2_BUCKET, Key=key_out, Body=enc.tobytes(),
+                  ContentType="image/png" if png else "image/jpeg")
+    print(f"[enhance] {key_in} -> {key_out} ({W}x{H}, x4->native, sharpen {sharpen})")
+    return {"out": key_out, "px": [W, H]}
+
+
+@app.local_entrypoint()
+def enhance(key_in: str, key_out: str, sharpen: float = 0.35):
+    """modal run modal_app.py::enhance --key-in ortho/x.png --key-out ortho/x_enh.png"""
+    print(enhance_image.remote(key_in, key_out, sharpen=sharpen))
+
+
+@app.function(image=colmap_image, secrets=[r2_secret], volumes={"/scratch": vol},
+              timeout=10800, cpu=16.0, memory=65536)
+def colmap_register(slug: str, t_win: int = 4, spatial_ft: float = 5.0,
+                    still_partners: int = 60) -> dict:
+    """COLMAP-grade still registration: video faces enter a known-pose model FIXED at
+    their VSLAM poses (frame + scale preserved by construction), the scene is
+    triangulated from them, and the still faces are registered into that fixed model
+    (PnP + BA with fix_existing_images). Per-still body pose = robust average over its
+    registered faces; the face-to-face spread is the accuracy diagnostic.
+    -> layout/{slug}/colmap_stills.json (consumed by make_still_ortho / make_floortex)."""
+    import json
+    import shutil
+    import subprocess
+    import numpy as np
+
+    s3 = _r2(); sd = f"/scratch/{slug}"; spd = f"{sd}/splat"
+    meta = json.load(open(f"{spd}/cameras.json"))
+    frames = meta["frames"]
+    face_px = int(meta["face_px"]); f_px = float(meta["f_px"])
+    cx = float(meta["cx"]); cy = float(meta["cy"])
+    fpu = float(meta["fpu"])
+    wd = f"{sd}/colmap"
+    shutil.rmtree(wd, ignore_errors=True)
+    os.makedirs(f"{wd}/known", exist_ok=True)
+
+    def _run(args):
+        r = subprocess.run(["colmap"] + args, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"colmap {args[0]} failed:\n{r.stdout[-800:]}\n{r.stderr[-800:]}")
+        return r
+
+    # --- image inventory from cameras.json (faces already on the volume at 1024px) ---
+    vids, stils = [], []
+    for f in frames:
+        (stils if "group" in f else vids).append(f)
+    C_all = {f["img"]: np.array(f["c2w"])[:3, 3] for f in frames}
+    D_all = {f["img"]: np.array(f["c2w"])[:3, :3][:, 2] for f in frames}   # view dir (z col)
+
+    # --- curated match list: temporal same-face, same-frame adjacent faces, spatial
+    #     same-face loop closures, stills vs nearby video faces (direction-gated) ---
+    pairs = set()
+    byface = {}
+    for f in vids:
+        nm = f["img"]                                        # images/p{idx:05d}_{s}.jpg
+        idx = int(nm.split("p")[1][:5]); sfx = nm[-5]
+        byface.setdefault(sfx, []).append((idx, nm))
+    for sfx, lst in byface.items():
+        lst.sort()
+        for a in range(len(lst)):
+            for b in range(a + 1, min(a + 1 + t_win, len(lst))):
+                pairs.add((lst[a][1], lst[b][1]))
+    adj = [("f", "r"), ("r", "b"), ("b", "l"), ("l", "f"),
+           ("f", "d"), ("r", "d"), ("b", "d"), ("l", "d")]
+    frameix = {}
+    for f in vids:
+        frameix.setdefault(int(f["img"].split("p")[1][:5]), {})[f["img"][-5]] = f["img"]
+    for fmap in frameix.values():
+        for a, b in adj:
+            if a in fmap and b in fmap:
+                pairs.add((fmap[a], fmap[b]))
+    # spatial loop closures: same-suffix faces of non-adjacent frames that are close
+    sp_u = spatial_ft / fpu
+    ids = sorted(frameix)
+    cents = np.array([C_all[frameix[i]["f"]] if "f" in frameix[i]
+                      else C_all[list(frameix[i].values())[0]] for i in ids])
+    for ai in range(0, len(ids), 2):
+        d = np.linalg.norm(cents - cents[ai], axis=1)
+        near = [bi for bi in np.argsort(d)[1:12]
+                if d[bi] < sp_u and abs(ids[bi] - ids[ai]) > t_win * 8]
+        for bi in near[:4]:
+            for sfx in ("d", "f", "r", "b", "l"):
+                if sfx in frameix[ids[ai]] and sfx in frameix[ids[bi]]:
+                    pairs.add(tuple(sorted((frameix[ids[ai]][sfx], frameix[ids[bi]][sfx]))))
+    # stills: every still face vs the closest video faces with compatible view direction
+    vnames = [f["img"] for f in vids]
+    vC = np.array([C_all[n] for n in vnames]); vD = np.array([D_all[n] for n in vnames])
+    for f in stils:
+        nm = f["img"]; Cs = C_all[nm]; Ds = D_all[nm]
+        d = np.linalg.norm(vC - Cs, axis=1)
+        cosang = vD @ Ds
+        order = np.argsort(d)
+        cnt = 0
+        for oi in order:
+            if d[oi] > 4.5 * sp_u:
+                break
+            if cosang[oi] > 0.34:                            # < ~70 deg apart
+                pairs.add((nm, vnames[oi])); cnt += 1
+            if cnt >= still_partners:
+                break
+        for f2 in stils:                                     # still <-> still
+            if f2["img"] > nm and np.linalg.norm(C_all[f2["img"]] - Cs) < 4.5 * sp_u \
+                    and float(D_all[f2["img"]] @ Ds) > 0.2:
+                pairs.add((nm, f2["img"]))
+    with open(f"{wd}/pairs.txt", "w") as fh:
+        fh.write("\n".join(f"{a} {b}" for a, b in sorted(pairs)))
+    print(f"[colmap] {len(vids)} video + {len(stils)} still faces, {len(pairs)} match pairs")
+
+    # --- features + matches ---
+    cam = f"{f_px},{f_px},{cx},{cy}"
+    _run(["feature_extractor", "--database_path", f"{wd}/db.db", "--image_path", spd,
+          "--ImageReader.camera_model", "PINHOLE", "--ImageReader.single_camera", "1",
+          "--ImageReader.camera_params", cam,
+          "--SiftExtraction.use_gpu", "0", "--SiftExtraction.max_num_features", "4096",
+          "--SiftExtraction.num_threads", "16"])
+    print("[colmap] features extracted")
+    _run(["matches_importer", "--database_path", f"{wd}/db.db",
+          "--match_list_path", f"{wd}/pairs.txt", "--match_type", "pairs",
+          "--SiftMatching.use_gpu", "0", "--SiftMatching.num_threads", "16"])
+    print("[colmap] matches verified")
+
+    # --- known-pose model (video faces FIXED at VSLAM poses; COLMAP wants w2c) ---
+    import sqlite3
+    con = sqlite3.connect(f"{wd}/db.db")
+    name2id = {n: i for i, n in con.execute("SELECT image_id, name FROM images")}
+    con.close()
+
+    def _q_from_R(R):
+        t = np.trace(R)
+        if t > 0:
+            s = np.sqrt(t + 1.0) * 2
+            return np.array([0.25 * s, (R[2, 1] - R[1, 2]) / s,
+                             (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s])
+        i = int(np.argmax(np.diag(R)))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        s = np.sqrt(R[i, i] - R[j, j] - R[k, k] + 1.0) * 2
+        q = np.zeros(4)
+        q[0] = (R[k, j] - R[j, k]) / s
+        q[1 + i] = 0.25 * s
+        q[1 + j] = (R[j, i] + R[i, j]) / s
+        q[1 + k] = (R[k, i] + R[i, k]) / s
+        return q
+
+    with open(f"{wd}/known/cameras.txt", "w") as fh:
+        fh.write(f"1 PINHOLE {face_px} {face_px} {cam.replace(',', ' ')}\n")
+    with open(f"{wd}/known/images.txt", "w") as fh:
+        for f in vids:
+            nm = f["img"]
+            if nm not in name2id:
+                continue
+            c2w = np.array(f["c2w"])
+            Rw2c = c2w[:3, :3].T
+            tw2c = -Rw2c @ c2w[:3, 3]
+            q = _q_from_R(Rw2c)
+            fh.write(f"{name2id[nm]} {q[0]} {q[1]} {q[2]} {q[3]} "
+                     f"{tw2c[0]} {tw2c[1]} {tw2c[2]} 1 {nm}\n\n")
+    open(f"{wd}/known/points3D.txt", "w").close()
+
+    os.makedirs(f"{wd}/tri", exist_ok=True)
+    _run(["point_triangulator", "--database_path", f"{wd}/db.db", "--image_path", spd,
+          "--input_path", f"{wd}/known", "--output_path", f"{wd}/tri",
+          "--Mapper.ba_refine_focal_length", "0", "--Mapper.ba_refine_extra_params", "0",
+          "--Mapper.ba_refine_principal_point", "0"])
+    print("[colmap] triangulated")
+    os.makedirs(f"{wd}/reg", exist_ok=True)
+    _run(["mapper", "--database_path", f"{wd}/db.db", "--image_path", spd,
+          "--input_path", f"{wd}/tri", "--output_path", f"{wd}/reg",
+          "--Mapper.fix_existing_images", "1",
+          "--Mapper.ba_refine_focal_length", "0", "--Mapper.ba_refine_extra_params", "0",
+          "--Mapper.ba_refine_principal_point", "0"])
+    print("[colmap] stills registered")
+    _run(["model_converter", "--input_path", f"{wd}/reg", "--output_path", f"{wd}/reg",
+          "--output_type", "TXT"])
+
+    # --- read back still-face poses -> per-still BODY pose + spread diagnostics ---
+    RF = {"f": np.eye(3),
+          "r": np.array([[0, 0, 1.], [0, 1, 0], [-1., 0, 0]]),
+          "b": np.array([[-1., 0, 0], [0, 1, 0], [0, 0, -1.]]),
+          "l": np.array([[0, 0, -1.], [0, 1, 0], [1., 0, 0]]),
+          "d": np.array([[1., 0, 0], [0, 0, 1.], [0, -1., 0]])}
+    got = {}
+    with open(f"{wd}/reg/images.txt") as fh:
+        lines = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+    for ln in lines[::2]:
+        p = ln.split()
+        nm = p[-1]
+        if not nm.startswith("images/s_"):
+            continue
+        qw, qx, qy, qz = map(float, p[1:5])
+        tx, ty, tz = map(float, p[5:8])
+        Rw2c = np.array([
+            [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+            [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+            [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)]])
+        C = -Rw2c.T @ np.array([tx, ty, tz])
+        sfx = nm[-5]
+        Rbody = Rw2c.T @ RF[sfx].T
+        short = nm.split("s_")[1].split("_")[0]
+        got.setdefault(short, []).append((Rbody, C))
+    outj = {}
+    name_by_short = {g[:8]: g for g in {f["group"] for f in stils}}
+    for short, obs in got.items():
+        Cs = np.array([o[1] for o in obs])
+        Cm_ = np.median(Cs, 0)
+        qs = np.array([_q_from_R(o[0].T) for o in obs])       # w2c-quat basis for averaging
+        qs[qs @ qs[0] < 0] *= -1
+        qm = qs.mean(0); qm /= np.linalg.norm(qm)
+        w, x, y, z = qm
+        Rw2c_m = np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+        Rb = Rw2c_m.T
+        c2w = np.eye(4); c2w[:3, :3] = Rb; c2w[:3, 3] = Cm_
+        spread_ft = float(np.linalg.norm(Cs - Cm_, axis=1).max() * fpu)
+        angs = [float(np.degrees(np.arccos(np.clip((np.trace(o[0].T @ Rb) - 1) / 2, -1, 1))))
+                for o in obs]
+        full = name_by_short.get(short, short)
+        outj[full] = {"c2w": c2w.tolist(), "faces": len(obs),
+                      "spread_ft": round(spread_ft, 3), "spread_deg": round(max(angs), 2)}
+        print(f"[colmap] {short}: {len(obs)}/5 faces, spread {spread_ft:.2f}ft / {max(angs):.1f}deg")
+    s3.put_object(Bucket=R2_BUCKET, Key=f"layout/{slug}/colmap_stills.json",
+                  Body=json.dumps(outj).encode(), ContentType="application/json")
+    nreg = len(outj)
+    print(f"[colmap] {slug}: {nreg}/{len(name_by_short)} stills registered -> "
+          f"layout/{slug}/colmap_stills.json")
+    return {"registered": nreg, "stills": len(name_by_short),
+            "spread_ft": {k[:8]: v["spread_ft"] for k, v in outj.items()}}
+
+
+@app.local_entrypoint()
+def colmapreg(slug: str):
+    """COLMAP-register the stills into the fixed VSLAM frame:
+        modal run modal_app.py::colmapreg --slug scottsdale-nadir"""
+    print(colmap_register.remote(slug))
+
+
+@app.function(image=gsplat_image, gpu="A10G", secrets=[r2_secret], volumes={"/scratch": vol},
+              timeout=900)
+def probe_still_pose(slug: str, still: str = "ce3508df", face: str = "f") -> dict:
+    """Referee a disputed still pose: render the splat (trusted video geometry) from the
+    COLMAP pose and from the ckpt-refined pose for one face, side-by-side with the
+    actual face image -> ortho/{slug}_posecheck.jpg. Whichever render matches the photo
+    has the right pose."""
+    import json
+    import numpy as np
+    import cv2
+    import torch
+    from gsplat import rasterization, spherical_harmonics
+
+    s3 = _r2(); sd = f"/scratch/{slug}"; spd = f"{sd}/splat"
+    meta = json.load(open(f"{spd}/cameras.json"))
+    ck = torch.load(f"{spd}/ckpt.pt", map_location="cuda", weights_only=False)
+    shdeg = int(ck["sh_degree"])
+    Wf = Hf = int(meta["face_px"])
+    K = np.array([[meta["f_px"], 0, meta["cx"]], [0, meta["f_px"], meta["cy"]], [0, 0, 1]])
+    RF = {"f": np.eye(3),
+          "r": np.array([[0, 0, 1.], [0, 1, 0], [-1., 0, 0]]),
+          "b": np.array([[-1., 0, 0], [0, 1, 0], [0, 0, -1.]]),
+          "l": np.array([[0, 0, -1.], [0, 1, 0], [1., 0, 0]]),
+          "d": np.array([[1., 0, 0], [0, 0, 1.], [0, -1., 0]])}
+
+    opa = torch.sigmoid(ck["opacities"].cuda())
+    keep = opa > 0.3
+    means = ck["means"].cuda()[keep]; quats = ck["quats"].cuda()[keep]
+    scales = torch.exp(ck["scales"].cuda()[keep]); opa = opa[keep]
+    shs = torch.cat([ck["sh0"].cuda(), ck["shN"].cuda()], 1)[keep]
+
+    def render(c2w_body):
+        c2w = c2w_body.copy()
+        c2w[:3, :3] = c2w[:3, :3] @ RF[face]
+        R = c2w[:3, :3]; C = c2w[:3, 3]
+        w2c = np.eye(4); w2c[:3, :3] = R.T; w2c[:3, 3] = -R.T @ C
+        dirs = means - torch.tensor(C, dtype=torch.float32, device="cuda")
+        dirs = dirs / dirs.norm(dim=1, keepdim=True).clamp(min=1e-9)
+        cols = torch.clamp(spherical_harmonics(shdeg, dirs, shs) + 0.5, 0, 1)
+        img, _, _ = rasterization(
+            means=means, quats=quats, scales=scales, opacities=opa, colors=cols,
+            viewmats=torch.tensor(w2c, dtype=torch.float32, device="cuda")[None],
+            Ks=torch.tensor(K, dtype=torch.float32, device="cuda")[None],
+            width=Wf, height=Hf, packed=False)
+        return cv2.cvtColor((img[0].clamp(0, 1) * 255).byte().cpu().numpy(), cv2.COLOR_RGB2BGR)
+
+    # actual face image
+    act = None
+    full = None
+    for f in meta["frames"]:
+        if f.get("group", "").startswith(still) and f["img"].endswith(f"_{face}.jpg"):
+            act = cv2.imread(f"{spd}/{f['img']}")
+            full = f["group"]
+            break
+    cj = json.loads(s3.get_object(Bucket=R2_BUCKET,
+                                  Key=f"layout/{slug}/colmap_stills.json")["Body"].read())
+    r_col = render(np.array(cj[full]["c2w"]))
+    # ckpt-refined pose via the shared loader's fallback path (force it by skipping colmap)
+    sp = ck["still_pose"]
+    base = {f["group"]: np.array(f["c2w"]) for f in meta["frames"]
+            if f.get("group") and f["img"].endswith("_f.jpg")}
+    gi = sp["names"].index(full)
+    rv = sp["rvec"].cpu().numpy()[gi]; tv = sp["tvec"].cpu().numpy()[gi]
+    c2w_ck = base[full].copy()
+    th = np.linalg.norm(rv)
+    if th > 1e-8:
+        ax = rv / th
+        Kx = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+        c2w_ck[:3, :3] = (np.eye(3) + np.sin(th) * Kx + (1 - np.cos(th)) * (Kx @ Kx)) @ c2w_ck[:3, :3]
+    c2w_ck[:3, 3] += tv
+    r_ckpt = render(c2w_ck)
+    strip = np.concatenate([act, r_col, r_ckpt], axis=1)
+    cv2.putText(strip, "ACTUAL", (20, 50), 0, 1.6, (0, 255, 0), 3)
+    cv2.putText(strip, "COLMAP", (Wf + 20, 50), 0, 1.6, (0, 255, 0), 3)
+    cv2.putText(strip, "CKPT", (2 * Wf + 20, 50), 0, 1.6, (0, 255, 0), 3)
+    cv2.imwrite("/tmp/pc.jpg", strip, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    key = f"ortho/{slug}_posecheck.jpg"
+    s3.upload_file("/tmp/pc.jpg", R2_BUCKET, key)
+    print(f"[posecheck] {still}/{face} -> {key}")
+    return {"key": key}
+
+
+@app.local_entrypoint()
+def posecheck(slug: str, still: str = "ce3508df", face: str = "f"):
+    """modal run modal_app.py::posecheck --slug scottsdale-nadir --still ce3508df"""
+    print(probe_still_pose.remote(slug, still=still, face=face))
+
+
+@app.function(image=gsplat_image, gpu="A10G", timeout=900)
+def splat_env() -> dict:
+    """Smoke test: gsplat imports and a tiny CUDA rasterization runs (incl. ortho camera)."""
+    import torch
+    import gsplat
+    from gsplat import rasterization
+    N = 128
+    means = torch.randn(N, 3, device="cuda") * 0.5
+    quats = torch.randn(N, 4, device="cuda")
+    scales = torch.rand(N, 3, device="cuda") * 0.1
+    opac = torch.rand(N, device="cuda")
+    cols = torch.rand(N, 3, device="cuda")
+    vm = torch.eye(4, device="cuda")[None]; vm[0, 2, 3] = 3.0
+    Km = torch.tensor([[100.0, 0, 64], [0, 100.0, 64], [0, 0, 1]], device="cuda")[None]
+    img, _, _ = rasterization(means, quats, scales, opac, cols, vm, Km, 128, 128)
+    ortho_ok = True
+    try:
+        rasterization(means, quats, scales, opac, cols, vm, Km, 128, 128, camera_model="ortho")
+    except TypeError:
+        ortho_ok = False
+    out = {"torch": str(torch.__version__), "gsplat": str(gsplat.__version__),   # plain str — TorchVersion doesn't unpickle locally
+           "gpu": torch.cuda.get_device_name(0), "render_mean": round(float(img.mean()), 4),
+           "ortho_supported": ortho_ok}
+    print(f"[splatenv] {out}")
+    return out
+
+
+@app.local_entrypoint()
+def splatenv():
+    """modal run modal_app.py::splatenv — verify the gsplat CUDA env before training."""
+    print(splat_env.remote())
+
+
+@app.local_entrypoint()
+def splatdata(slug: str, n_frames: int = 400, face_px: int = 800, fov_deg: float = 95.0,
+              ceiling_ft: float = 8.5, stills: int = 1,
+              stills_prefix: str = "projects/old-town-scottsdale-home/still/"):
+    """Stage 1 — posed pinhole views for splat training (video + localized 360 stills):
+        modal run modal_app.py::splatdata --slug scottsdale-nadir"""
+    print(make_splat_data.remote(slug, n_frames=n_frames, face_px=face_px, fov_deg=fov_deg,
+                                 ceiling_ft=ceiling_ft, stills=stills,
+                                 stills_prefix=stills_prefix))
+
+
+@app.local_entrypoint()
+def splattrain(slug: str, iters: int = 20000, init_pts: int = 500000, sh_degree: int = 2,
+               pose_opt: int = 1, still_start: int = 8000):
+    """Stage 2 — train the splat (A10G, ~30-60 min at 20k iters; stills join with
+    per-still pose refinement at still_start):
+        modal run modal_app.py::splattrain --slug scottsdale-nadir"""
+    print(train_splat.remote(slug, iters=iters, init_pts=init_pts, sh_degree=sh_degree,
+                             pose_opt=pose_opt, still_start=still_start))
+
+
+@app.local_entrypoint()
+def splatrender(slug: str, out_w: int = 2266, ceil_cut: float = 0.8, dollhouse: int = 3,
+                doll_elev_deg: float = 40.0, opa_min: float = 0.35, big_cut: float = 0.2,
+                walls_mode: int = 0, strip_walls: int = 1, wall_lo: float = 0.55,
+                wall_hi: float = 0.75, tex_cut: float = 0.8):
+    """Stage 3 — true-ortho top-down (wall gaussians stripped for de-blur; strokes only
+    with --walls-mode 1) + height/wall-evidence maps + dollhouse renders:
+        modal run modal_app.py::splatrender --slug scottsdale-nadir"""
+    print(render_splat.remote(slug, out_w=out_w, ceil_cut=ceil_cut, dollhouse=dollhouse,
+                              doll_elev_deg=doll_elev_deg, opa_min=opa_min, big_cut=big_cut,
+                              walls_mode=walls_mode, strip_walls=strip_walls, wall_lo=wall_lo,
+                              wall_hi=wall_hi, tex_cut=tex_cut))
 
 
 @app.function(secrets=[cb_secret])
