@@ -860,6 +860,31 @@ export function PlanEditor() {
               ))}
             </g>
           )}
+
+          {/* SELECTED-LAYER drag handle — rendered ABOVE zones/strokes so the layer can be
+              grabbed anywhere, even under a traced room (zones otherwise eat the pointer). */}
+          {tool === "select" && selLayer != null && sheet.layers?.[selLayer] && sheet.layers[selLayer].visible !== false && (() => {
+            const L = sheet.layers![selLayer];
+            return (
+              <rect
+                x={L.x ?? 0}
+                y={L.y ?? 0}
+                width={L.width ?? sheet.width}
+                height={L.height ?? sheet.height}
+                transform={layerTransform(L, sheet.width, sheet.height)}
+                fill="#A6863F"
+                fillOpacity={0.001}
+                stroke="#A6863F"
+                strokeWidth={0.35}
+                strokeDasharray="1.6 1"
+                style={{ cursor: "move", pointerEvents: "all" }}
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  dragRef.current = { type: "layer", li: selLayer, start: toPlan(e), origX: L.x ?? 0, origY: L.y ?? 0 };
+                }}
+              />
+            );
+          })()}
           </g>
 
           {/* zone labels — drawn OUTSIDE the rotate/flip group, at each room's screen
