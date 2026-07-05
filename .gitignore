@@ -48,3 +48,4 @@ cloudflare-env.d.ts
 
 # keep the env example tracked (overrides .env* above)
 !.env.example
+__pycache__/
