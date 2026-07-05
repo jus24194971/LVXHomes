@@ -49,3 +49,30 @@ export function r2PublicUrl(env: AppEnv, key: string): string {
   const host = env.R2_PUBLIC_HOST ?? `${env.R2_BUCKET ?? "media"}.r2.dev`;
   return `https://${host}/${key}`;
 }
+
+/** Presign a GET — for handing an R2 object to a third-party fetcher (e.g. the
+ *  Stream copy API) when the key isn't on the public host. */
+export async function presignR2Get(
+  env: AppEnv,
+  key: string,
+  expiresSeconds = 86400,
+): Promise<string> {
+  if (!r2UploadConfigured(env)) {
+    throw new Error("R2 credentials are not configured");
+  }
+  const client = new AwsClient({
+    accessKeyId: env.R2_ACCESS_KEY_ID as string,
+    secretAccessKey: env.R2_SECRET_ACCESS_KEY as string,
+    service: "s3",
+    region: "auto",
+  });
+  const url = new URL(
+    `https://${env.CF_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET}/${key}`,
+  );
+  url.searchParams.set("X-Amz-Expires", String(expiresSeconds));
+  const signed = await client.sign(url.toString(), {
+    method: "GET",
+    aws: { signQuery: true },
+  });
+  return signed.url;
+}

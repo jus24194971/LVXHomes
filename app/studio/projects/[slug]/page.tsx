@@ -122,6 +122,28 @@ export default function ProjectDetail() {
     void load();
   }
 
+  // Send the tour video to Stream -> it becomes a Library FILM, selectable in
+  // the Pin Studio (and every other film picker) once transcoding finishes.
+  const [filming, setFilming] = useState<"idle" | "sending" | "sent" | "error">("idle");
+  async function makeFilm(fileId: string) {
+    setErr(null);
+    setFilming("sending");
+    try {
+      const res = await fetch(`/studio/api/projects/${slug}/film`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileId }),
+      });
+      const d = (await res.json()) as { uid?: string; error?: string };
+      if (!res.ok || !d.uid) throw new Error(d.error || "Stream import failed");
+      setFilming("sent");
+    } catch (e) {
+      setFilming("error");
+      setErr(e instanceof Error ? e.message : "Stream import failed");
+    }
+  }
+
   // --- missing-files alerts (your "alert on missing files" for a 360 upload) ---
   const hasVideo = files.some((f) => f.role === "video");
   const hasTelem = files.some((f) => f.role === "telemetry");
@@ -230,6 +252,26 @@ export default function ProjectDetail() {
                               }
                             >
                               {f.role === "nadir" ? "▦ Floorplan pass" : "Mark floorplan pass"}
+                            </button>
+                          )}
+                          {f.role === "video" && (
+                            <button
+                              type="button"
+                              onClick={() => void makeFilm(f.id)}
+                              disabled={filming === "sending" || filming === "sent"}
+                              title="Copy this video to Stream as a Library film — selectable in the Pin Studio once it finishes processing"
+                              className={
+                                "rounded-full border px-2.5 py-0.5 text-[0.65rem] uppercase tracking-[0.12em] transition-colors " +
+                                (filming === "sent"
+                                  ? "border-champagne bg-champagne/15 text-champagne"
+                                  : "border-paper/25 text-paper/50 hover:border-champagne/60 hover:text-champagne disabled:opacity-50")
+                              }
+                            >
+                              {filming === "sent"
+                                ? "✓ Film created — processing"
+                                : filming === "sending"
+                                  ? "Sending to Stream…"
+                                  : "→ Pin Studio film"}
                             </button>
                           )}
                           {(f.role === "still" || f.role === "hero") && (

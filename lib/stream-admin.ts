@@ -80,3 +80,23 @@ export async function deleteStreamVideo(env: AppEnv, uid: string): Promise<void>
     headers: headers(env),
   });
 }
+
+/** Ingest a video Stream can fetch itself (copy-from-URL) — how capture-project
+ *  films on R2 become Library films without re-uploading through a browser. */
+export async function importStreamFromUrl(
+  env: AppEnv,
+  opts: { url: string; name?: string },
+): Promise<{ uid: string }> {
+  const body: Record<string, unknown> = { url: opts.url };
+  if (opts.name) body.meta = { name: opts.name };
+  const res = await fetch(`${API}/accounts/${env.CF_ACCOUNT_ID}/stream/copy`, {
+    method: "POST",
+    headers: headers(env),
+    body: JSON.stringify(body),
+  });
+  const json = (await res.json()) as CfResp<{ uid: string }>;
+  if (!res.ok || !json.success || !json.result) {
+    throw new Error(`Stream copy failed: ${JSON.stringify(json.errors ?? res.status)}`);
+  }
+  return { uid: json.result.uid };
+}
