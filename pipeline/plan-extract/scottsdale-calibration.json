@@ -1,0 +1,26 @@
+{
+  "scale": {
+    "ftPerM": 3.113,
+    "pscale": 1.0538,
+    "source": "gps-umeyama",
+    "gpsScaleErrPct": 5.1
+  },
+  "heading": {
+    "thetaDeg": -41.6,
+    "NfTrue": 48.4,
+    "phi": 10.5,
+    "slope": 1,
+    "NfComp": 10.5,
+    "declinationDeg": -37.9,
+    "compassSpreadDeg": 100.9,
+    "nFrames": 160
+  },
+  "fit": {
+    "rmsFt": 1.99,
+    "nStills": 14
+  },
+  "confidence": "low",
+  "notes": [
+    "flythrough compass spread 101° (magnetic interference)"
+  ]
+}
