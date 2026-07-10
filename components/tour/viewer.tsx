@@ -1652,7 +1652,11 @@ export function TourViewer({
       className={cn(
         "relative overflow-hidden bg-ink [container-type:inline-size]",
         // iOS pseudo-fullscreen: fill the viewport above the page chrome.
-        pseudoFs && "fixed inset-0 z-[60] !rounded-none",
+        // The page passes aspect/width classes (e.g. aspect-video w-full) that
+        // must not survive here: with a definite width, aspect-ratio computes
+        // the height and the bottom inset is discarded, so a rotated phone got
+        // a "fullscreen" taller than the screen. Force true viewport sizing.
+        pseudoFs && "fixed inset-0 z-[60] !aspect-auto !h-dvh !w-screen !rounded-none",
         className,
       )}
     >
