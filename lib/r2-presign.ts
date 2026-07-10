@@ -51,11 +51,13 @@ export function r2PublicUrl(env: AppEnv, key: string): string {
 }
 
 /** Presign a GET — for handing an R2 object to a third-party fetcher (e.g. the
- *  Stream copy API) when the key isn't on the public host. */
+ *  Stream copy API). `responseContentType` forces the Content-Type header in the
+ *  response via the signed URL, covering objects stored without one (Stream
+ *  preflights the URL and rejects sources that don't identify as video). */
 export async function presignR2Get(
   env: AppEnv,
   key: string,
-  expiresSeconds = 86400,
+  opts: { expiresSeconds?: number; responseContentType?: string } = {},
 ): Promise<string> {
   if (!r2UploadConfigured(env)) {
     throw new Error("R2 credentials are not configured");
@@ -69,7 +71,10 @@ export async function presignR2Get(
   const url = new URL(
     `https://${env.CF_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET}/${key}`,
   );
-  url.searchParams.set("X-Amz-Expires", String(expiresSeconds));
+  url.searchParams.set("X-Amz-Expires", String(opts.expiresSeconds ?? 86400));
+  if (opts.responseContentType) {
+    url.searchParams.set("response-content-type", opts.responseContentType);
+  }
   const signed = await client.sign(url.toString(), {
     method: "GET",
     aws: { signQuery: true },

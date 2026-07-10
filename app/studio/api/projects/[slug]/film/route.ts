@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { requireAuth } from "@/lib/studio-api";
 import { getProjectBySlug, listProjectFiles, createAsset } from "@/lib/store";
 import { importStreamFromUrl, streamConfigured } from "@/lib/stream-admin";
-import { r2PublicUrl, r2UploadConfigured, presignR2Get } from "@/lib/r2-presign";
+import { r2UploadConfigured, presignR2Get } from "@/lib/r2-presign";
 
 export const dynamic = "force-dynamic";
 
@@ -42,18 +42,19 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ slug: stri
     );
   }
 
-  // Prefer the public media host; fall back to a presigned GET so Stream can
-  // still fetch buckets/keys that aren't publicly routed.
-  let url = env.R2_PUBLIC_HOST ? r2PublicUrl(env, file.r2_key) : null;
-  if (!url) {
-    if (!r2UploadConfigured(env)) {
-      return NextResponse.json(
-        { error: "no public media host and no R2 credentials to presign with" },
-        { status: 503 },
-      );
-    }
-    url = await presignR2Get(env, file.r2_key);
+  // Always hand Stream a presigned GET with the Content-Type forced in the URL:
+  // Stream preflights the source and 10005-rejects URLs that don't identify as
+  // video, and bulk-uploaded objects (e.g. standard.mp4) may be stored without a
+  // content type. The signed override covers every object, stored metadata or not.
+  if (!r2UploadConfigured(env)) {
+    return NextResponse.json(
+      { error: "R2 credentials aren't configured (needed to presign the video for Stream)" },
+      { status: 503 },
+    );
   }
+  const url = await presignR2Get(env, file.r2_key, {
+    responseContentType: file.content_type || "video/mp4",
+  });
 
   try {
     const { uid } = await importStreamFromUrl(env, {
