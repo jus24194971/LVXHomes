@@ -3200,10 +3200,10 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
                 return np.stack([w.real, w.imag], -1)
 
             r = np.linalg.norm(pred(sp) - dp, axis=1)
-            out.append((r.mean(), pred, abs(a), refl, r))
+            out.append((r.mean(), pred, abs(a), refl, r, a))
         out.sort(key=lambda t: t[0])
-        _, pred, sc, refl, r = out[0]
-        return pred, float(sc), refl, r
+        _, pred, sc, refl, r, a = out[0]
+        return pred, float(sc), refl, r, a
 
     best_inl, best_model = [], None
     for i in range(len(src)):
@@ -3228,10 +3228,16 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
                     best_inl, best_model = inl, (sc, M, tt, refl)
     if len(best_inl) < 4:
         raise RuntimeError(f"RANSAC found only {len(best_inl)} inliers — fly localize too poor")
-    predict, scale, refl, resid = cplx_fit(src[best_inl], dst[best_inl])
+    predict, scale, refl, resid, acomp = cplx_fit(src[best_inl], dst[best_inl])
 
     def fit(p):
         return predict(np.asarray(p, np.float64))
+
+    def fit_dir(vx, vy):
+        # direction vectors transform without translation (conjugate first if reflected)
+        z = complex(vx, vy)
+        w = acomp * (z.conjugate() if refl else z)
+        return w.real, w.imag
 
     out_n = len(src) - len(best_inl)
     print(f"[tourdata] RANSAC fit: {len(best_inl)}/{len(src)} inliers ({out_n} wrong-room "
@@ -3240,10 +3246,16 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
     if resid.mean() > 5.0:
         raise RuntimeError(f"inlier residual still high ({resid.mean():.1f} ft mean)")
 
-    # --- camera path at path_hz in sheet coords (viewer derives heading from tangent) ---
+    # --- camera path in sheet coords with REAL headings + altitude: the viewer's
+    #     tangent-heading fallback swims whenever the drone yaws without moving,
+    #     which is what made the rings float. h = VSLAM forward through the fit;
+    #     z = camera feet above floor (keeps anchor pitch in one unit system). ---
     ts = T[:, 0].copy()
     if ts.max() > 3600:                                       # frame-index timestamps guard
         ts = ts / 30.0
+    Rm = np.array([_quat2rot(q) for q in T[:, 4:8]])
+    fwd_all = Rm @ np.array([0.0, 0.0, 1.0])
+    camh_ft = (Cm @ up - floor) * fpu
     order = np.argsort(ts)
     path = []
     last_t = -1e9
@@ -3254,11 +3266,52 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
             continue
         last_t = float(ts[i])
         p = fit(feet[i])
+        fh = fwd_all[i] - np.dot(fwd_all[i], up) * up
+        vx, vy = fit_dir(float(fh @ e1), float(fh @ e2))
+        heading = float(np.degrees(np.arctan2(vx, -vy)))      # viewer bearing convention
         path.append({"t": round(float(ts[i]), 2), "x": round(float(p[0]), 2),
-                     "y": round(float(p[1]), 2)})
+                     "y": round(float(p[1]), 2), "h": round(heading, 1),
+                     "z": round(float(camh_ft[i] * scale), 2)})
+
+    # --- LINE-OF-SIGHT visibility windows per pin: march camera->anchor across the
+    #     nadir splat height field (same occlusion test as the floor unwrap). When a
+    #     wall blocks the room, the ring's window closes — "out of view, dot goes away".
+    hbuf = s3.get_object(Bucket=R2_BUCKET,
+                         Key=f"ortho/{nadir_slug}_splat_height.png")["Body"].read()
+    h16 = cv2.imdecode(np.frombuffer(hbuf, np.uint8), cv2.IMREAD_UNCHANGED)
+    hft_g = h16.astype(np.float32) / 1000.0 - 5.0
+    hft_g[hft_g > 12.0] = 0.0
+    Hg, Wg = hft_g.shape
+    tha_f = np.radians(ROT); caf, saf = np.cos(-tha_f), np.sin(-tha_f)
+
+    def sheet_to_nadir_feet(sx, sy):
+        # inverse of nadir_feet_to_sheet: unrotate about the window centre, unflip
+        dx = sx - cxa; dy = sy - cya
+        p1x = cxa + caf * dx - saf * dy
+        p1y = cya + saf * dx + caf * dy
+        if al.get("FLIPH", True):
+            p1x = 2 * cxa - p1x
+        return (p1x - FX) / FW * nftw, (p1y - FY) / FH * nfth
+
+    def grid_h(fx_ft, fy_ft):
+        gx_ = int(np.clip(fx_ft / nftw * (Wg - 1), 0, Wg - 1))
+        gy_ = int(np.clip(fy_ft / nfth * (Hg - 1), 0, Hg - 1))
+        return float(hft_g[gy_, gx_])
+
+    def los_clear(cam_xy, cam_h, anc_xy, anc_h):
+        ax_, ay_ = sheet_to_nadir_feet(*cam_xy)
+        bx_, by_ = sheet_to_nadir_feet(*anc_xy)
+        for s in np.linspace(0.08, 0.92, 14):
+            hx = ax_ + s * (bx_ - ax_); hy = ay_ + s * (by_ - ay_)
+            ray_h = cam_h + s * (anc_h - cam_h)
+            if grid_h(hx, hy) > ray_h + 0.4:
+                return False
+        return True
 
     # --- one anchored hotspot per still, at its NADIR-CHAIN standpoint (inch-class),
-    #     labeled by the room polygon it stands in; the still becomes its pano ---
+    #     labeled by its room, GATED to line-of-sight windows (hysteresis-merged);
+    #     one hotspot COPY per window so the stock viewer needs no changes ---
+    ANCHOR_H = 4.0                                            # ft above floor (feet units throughout)
     hotspots, panos = [], []
     for name in sorted(sheet_still):
         if name not in skeys:
@@ -3266,6 +3319,26 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
         short = name[:8]
         ax, ay = sheet_still[name]
         label = zone_by_still.get(name, {}).get("label", short)
+        # visibility windows along the path
+        vis = [(pp["t"], los_clear((pp["x"], pp["y"]), max(pp.get("z", 4.5), 1.0),
+                                   (ax, ay), ANCHOR_H)) for pp in path]
+        windows = []
+        run_start = None
+        last_seen = None
+        for tt, v in vis:
+            if v and run_start is None:
+                run_start = tt
+            if v:
+                last_seen = tt
+            elif run_start is not None and last_seen is not None and tt - last_seen > 1.5:
+                windows.append([run_start, last_seen])
+                run_start = None
+        if run_start is not None and last_seen is not None:
+            windows.append([run_start, last_seen])
+        windows = [[max(0.0, w0 - 0.6), w1 + 0.6] for w0, w1 in windows if w1 - w0 >= 1.5][:8]
+        if not windows:
+            print(f"[tourdata] {short} ({label}): NO line-of-sight window — pin dropped")
+            continue
         s3.download_file(R2_BUCKET, skeys[name], "/tmp/sp.jpg")
         im = cv2.imread("/tmp/sp.jpg")
         if im is None:
@@ -3276,12 +3349,15 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
         s3.put_object(Bucket=R2_BUCKET, Key=pkey, Body=enc.tobytes(),
                       ContentType="image/jpeg",
                       CacheControl="public, max-age=31536000, immutable")
-        hotspots.append({"id": f"hs-{short}", "label": label, "panoId": short,
-                         "anchor": {"x": round(float(ax), 2), "y": round(float(ay), 2),
-                                    "h": 1.2},
-                         "fadeNear": 2.5, "fadeFar": 9.0})
+        for k, (w0, w1) in enumerate(windows):
+            hotspots.append({"id": f"hs-{short}-{k}", "label": label, "panoId": short,
+                             "anchor": {"x": round(float(ax), 2), "y": round(float(ay), 2),
+                                        "h": ANCHOR_H},
+                             "fadeNear": 4.0, "fadeFar": 14.0,
+                             "start": round(w0, 2), "end": round(w1, 2)})
         panos.append({"id": short, "label": label,
                       "src": f"https://media.lvxhomes.com/{pkey}?v=1"})
+        print(f"[tourdata] {short} ({label}): {len(windows)} visibility windows")
     out = {"path": path, "hotspots": hotspots, "panos": panos,
            "fit": {"n": len(src), "inliers": len(best_inl), "scale": round(float(scale), 4),
                    "residual_mean_ft": round(float(resid.mean()), 2),
@@ -3297,11 +3373,11 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
 @app.local_entrypoint()
 def tourdata(vslam_slug: str, tour_slug: str, stills_prefix: str,
              min_lon: float, max_lon: float, min_lat: float, max_lat: float,
-             sheet_w: float, sheet_h: float, zones_key: str = ""):
+             sheet_w: float, sheet_h: float, zones_key: str = "", path_hz: float = 3.0):
     """modal run modal_app.py::tourdata --vslam-slug scottsdale-fly --tour-slug old-town-scottsdale-home ..."""
     print(make_tour_data.remote(vslam_slug, tour_slug, stills_prefix,
                                 min_lon, max_lon, min_lat, max_lat, sheet_w, sheet_h,
-                                zones_key=zones_key))
+                                zones_key=zones_key, path_hz=path_hz))
 
 
 @app.function(image=vslam_image, secrets=[r2_secret], cpu=16.0, memory=16384, timeout=7200)
