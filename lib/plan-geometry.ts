@@ -76,6 +76,48 @@ export function closestApproachT(
 }
 
 /**
+ * Time-aware closest approach. A room the flight covers twice has two PASSES
+ * (local minima of distance to the point). Resume at the pass nearest the
+ * viewer's CURRENT moment — just past the kitchen for the first time, tapping
+ * "Kitchen" continues from that first pass, not a later, globally-closer one.
+ * Falls back to the plain closest approach when there's a single pass or no
+ * current time.
+ */
+export function closestApproachNearT(
+  flightKeys: Array<{ t: number; x: number; y: number }>,
+  point: [number, number],
+  nowT: number | null,
+): number | null {
+  if (!flightKeys?.length) return null;
+  const [px, py] = point;
+  const d2 = flightKeys.map((k) => (k.x - px) ** 2 + (k.y - py) ** 2);
+  let best = Infinity;
+  for (const d of d2) if (d < best) best = d;
+  // passes = distinct dips comparable to the best approach (+6 plan-unit slack)
+  const thresh = (Math.sqrt(best) + 6) ** 2;
+  const passes: Array<{ t: number; d: number }> = [];
+  for (let i = 0; i < d2.length; i++) {
+    const prev = i > 0 ? d2[i - 1] : Infinity;
+    const next = i < d2.length - 1 ? d2[i + 1] : Infinity;
+    if (d2[i] <= prev && d2[i] <= next && d2[i] <= thresh) {
+      const last = passes[passes.length - 1];
+      if (last && Math.abs(flightKeys[i].t - last.t) < 6) {
+        if (d2[i] < last.d) { last.t = flightKeys[i].t; last.d = d2[i]; }
+      } else {
+        passes.push({ t: flightKeys[i].t, d: d2[i] });
+      }
+    }
+  }
+  if (!passes.length) return closestApproachT(flightKeys, point);
+  if (nowT == null) return passes[0].t;
+  let pick = passes[0];
+  for (const p of passes) {
+    if (Math.abs(p.t - nowT) < Math.abs(pick.t - nowT)) pick = p;
+  }
+  return pick.t;
+}
+
+/**
  * Font size (in plan units) that keeps `label` inside the zone's bounding box.
  * Shrinks to fit width AND height, floored at `min` so it never vanishes.
  * Returns `base` for empty labels (unused). Solves the "label overflows a small

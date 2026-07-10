@@ -13,7 +13,7 @@ import {
 } from "@/lib/author-client";
 import { TourTutorial } from "@/components/tour/tour-tutorial";
 import { PlanPanel } from "@/components/tour/plan";
-import { centroidOf, closestApproachT } from "@/lib/plan-geometry";
+import { centroidOf, closestApproachNearT } from "@/lib/plan-geometry";
 import { cn } from "@/lib/utils";
 
 /**
@@ -1311,14 +1311,17 @@ export function TourViewer({
       const panoId = zone.panoId ?? matchPanoByLabel(zone.label, tour.panos);
       const chId = zone.chapterId ?? tour.chapters[0]?.id ?? "";
 
-      // GPS/VSLAM resume: the moment the flight passes CLOSEST to this amenity —
-      // no hand-authored keyframe. Falls back to a ring key, then videoTime.
+      // GPS/VSLAM resume: the flight pass closest to this amenity NEAREST the
+      // viewer's current moment — a room covered twice resumes on the pass they
+      // just flew, not a later, globally-closer one. No hand-authored keyframe.
+      // Falls back to a ring key, then videoTime.
+      const nowT = engineRef.current?.video.currentTime ?? null;
       let resumeT: number | null = null;
       if (plan) {
         for (const s of plan.sheets) {
           const keys = s.paths?.[chId];
           if (keys?.length) {
-            resumeT = closestApproachT(keys, centroidOf(zone.points));
+            resumeT = closestApproachNearT(keys, centroidOf(zone.points), nowT);
             break;
           }
         }
