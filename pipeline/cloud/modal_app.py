@@ -3160,6 +3160,13 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
                 d = (cx - pt[0]) ** 2 + (cy - pt[1]) ** 2
                 if d < best_d:
                     best_lab, best_d = z.get("label"), d
+            # nearest-zone is only trustworthy CLOSE to a room — an outdoor still
+            # (backyard pano) otherwise inherits a wrong interior label (audit
+            # finding: putting-green still labeled "Dining"). Flag, don't guess.
+            if best_lab and best_d > 8.0 ** 2:
+                print(f"[tourdata] {name[:8]}: outside all zones "
+                      f"({best_d ** 0.5:.0f} ft from '{best_lab}') — labeling for review")
+                best_lab = f"Review: near {best_lab}"
             if best_lab:
                 zone_by_still[name] = {"label": best_lab}
 
