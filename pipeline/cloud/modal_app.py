@@ -3036,7 +3036,8 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
                    min_lon: float, max_lon: float, min_lat: float, max_lat: float,
                    sheet_w: float, sheet_h: float,
                    pano_px: int = 4096, path_hz: float = 1.0,
-                   zones_key: str = "", nadir_slug: str = "scottsdale-nadir") -> dict:
+                   zones_key: str = "", nadir_slug: str = "scottsdale-nadir",
+                   overrides_key: str = "", prox_ft: float = 9.0) -> dict:
     """Single-anchor tour data, Justin's spec: the math places and fades the pins.
     Fits the flythrough's VSLAM floor frame into the plan sheet (GPS-feet grid) using
     stills that have BOTH a localize position (feet) and EXIF GPS (sheet coords), then
@@ -3322,32 +3323,58 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
     #     one hotspot COPY per window so the stock viewer needs no changes ---
     ANCHOR_H = 1.35   # == viewer CAMERA_HEIGHT_M -> pitch 0: rings horizon-locked
     LOS_H = 4.0       # geometric sight-line target height in FEET (eye-ish, above sofas)
+
+    # sticky label overrides (R2 json {short8: label}) — survive reruns, so a
+    # hand-corrected name (audit fixes) never regresses
+    overrides = {}
+    if overrides_key:
+        try:
+            overrides = json.loads(s3.get_object(Bucket=R2_BUCKET,
+                                                 Key=overrides_key)["Body"].read())
+            print(f"[tourdata] {len(overrides)} label overrides loaded")
+        except Exception:
+            pass
+
+    def merge_windows(flags):
+        """(t, bool) series -> [start,end] windows: bridge <1.5s gaps, drop <1.5s
+        runs, pad 0.6s."""
+        ws = []
+        run_start = None
+        last_seen = None
+        for tt, v in flags:
+            if v and run_start is None:
+                run_start = tt
+            if v:
+                last_seen = tt
+            elif run_start is not None and last_seen is not None and tt - last_seen > 1.5:
+                ws.append([run_start, last_seen])
+                run_start = None
+        if run_start is not None and last_seen is not None:
+            ws.append([run_start, last_seen])
+        return [[max(0.0, w0 - 0.6), w1 + 0.6] for w0, w1 in ws if w1 - w0 >= 1.5][:8]
+
     hotspots, panos = [], []
     for name in sorted(sheet_still):
         if name not in skeys:
             continue
         short = name[:8]
         ax, ay = sheet_still[name]
-        label = zone_by_still.get(name, {}).get("label", short)
-        # visibility windows along the path
-        vis = [(pp["t"], los_clear((pp["x"], pp["y"]), max(pp.get("z", 4.5), 1.0),
-                                   (ax, ay), LOS_H)) for pp in path]
-        windows = []
-        run_start = None
-        last_seen = None
-        for tt, v in vis:
-            if v and run_start is None:
-                run_start = tt
-            if v:
-                last_seen = tt
-            elif run_start is not None and last_seen is not None and tt - last_seen > 1.5:
-                windows.append([run_start, last_seen])
-                run_start = None
-        if run_start is not None and last_seen is not None:
-            windows.append([run_start, last_seen])
-        windows = [[max(0.0, w0 - 0.6), w1 + 0.6] for w0, w1 in windows if w1 - w0 >= 1.5][:8]
+        label = overrides.get(short) or zone_by_still.get(name, {}).get("label", short)
+        # line-of-sight windows along the path
+        windows = merge_windows(
+            [(pp["t"], los_clear((pp["x"], pp["y"]), max(pp.get("z", 4.5), 1.0),
+                                 (ax, ay), LOS_H)) for pp in path])
+        mode = "LOS"
         if not windows:
-            print(f"[tourdata] {short} ({label}): NO line-of-sight window — pin dropped")
+            # walls block every sight-line (interior bathrooms): fall back to
+            # PROXIMITY — the dot shows on each pass within prox_ft (doorway moments)
+            windows = merge_windows(
+                [(pp["t"], (pp["x"] - ax) ** 2 + (pp["y"] - ay) ** 2 < prox_ft ** 2)
+                 for pp in path])
+            mode = "proximity"
+        if not windows:
+            print(f"[tourdata] {short} ({label}): no LOS and never within "
+                  f"{prox_ft} ft — pin dropped")
             continue
         s3.download_file(R2_BUCKET, skeys[name], "/tmp/sp.jpg")
         im = cv2.imread("/tmp/sp.jpg")
@@ -3367,7 +3394,7 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
                              "start": round(w0, 2), "end": round(w1, 2)})
         panos.append({"id": short, "label": label,
                       "src": f"https://media.lvxhomes.com/{pkey}?v=1"})
-        print(f"[tourdata] {short} ({label}): {len(windows)} visibility windows")
+        print(f"[tourdata] {short} ({label}): {len(windows)} {mode} windows")
     out = {"path": path, "hotspots": hotspots, "panos": panos,
            "fit": {"n": len(src), "inliers": len(best_inl), "scale": round(float(scale), 4),
                    "residual_mean_ft": round(float(resid.mean()), 2),
@@ -3383,11 +3410,13 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
 @app.local_entrypoint()
 def tourdata(vslam_slug: str, tour_slug: str, stills_prefix: str,
              min_lon: float, max_lon: float, min_lat: float, max_lat: float,
-             sheet_w: float, sheet_h: float, zones_key: str = "", path_hz: float = 3.0):
+             sheet_w: float, sheet_h: float, zones_key: str = "", path_hz: float = 3.0,
+             overrides_key: str = ""):
     """modal run modal_app.py::tourdata --vslam-slug scottsdale-fly --tour-slug old-town-scottsdale-home ..."""
     print(make_tour_data.remote(vslam_slug, tour_slug, stills_prefix,
                                 min_lon, max_lon, min_lat, max_lat, sheet_w, sheet_h,
-                                zones_key=zones_key, path_hz=path_hz))
+                                zones_key=zones_key, path_hz=path_hz,
+                                overrides_key=overrides_key))
 
 
 @app.function(image=vslam_image, secrets=[r2_secret], cpu=16.0, memory=16384, timeout=7200)
