@@ -3276,9 +3276,11 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
         fh = fwd_all[i] - np.dot(fwd_all[i], up) * up
         vx, vy = fit_dir(float(fh @ e1), float(fh @ e2))
         heading = float(np.degrees(np.arctan2(vx, -vy)))      # viewer bearing convention
+        # no z on purpose: camH then falls back to the viewer's CAMERA_HEIGHT_M and,
+        # with anchor.h set to the same constant, pitch == 0 — every ring rides the
+        # horizon line (Justin's spec: same height, no vertical float, easy to click)
         path.append({"t": round(float(ts[i]), 2), "x": round(float(p[0]), 2),
-                     "y": round(float(p[1]), 2), "h": round(heading, 1),
-                     "z": round(float(camh_ft[i] * scale), 2)})
+                     "y": round(float(p[1]), 2), "h": round(heading, 1)})
 
     # --- LINE-OF-SIGHT visibility windows per pin: march camera->anchor across the
     #     nadir splat height field (same occlusion test as the floor unwrap). When a
@@ -3318,7 +3320,8 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
     # --- one anchored hotspot per still, at its NADIR-CHAIN standpoint (inch-class),
     #     labeled by its room, GATED to line-of-sight windows (hysteresis-merged);
     #     one hotspot COPY per window so the stock viewer needs no changes ---
-    ANCHOR_H = 4.0                                            # ft above floor (feet units throughout)
+    ANCHOR_H = 1.35   # == viewer CAMERA_HEIGHT_M -> pitch 0: rings horizon-locked
+    LOS_H = 4.0       # geometric sight-line target height in FEET (eye-ish, above sofas)
     hotspots, panos = [], []
     for name in sorted(sheet_still):
         if name not in skeys:
@@ -3328,7 +3331,7 @@ def make_tour_data(vslam_slug: str, tour_slug: str,
         label = zone_by_still.get(name, {}).get("label", short)
         # visibility windows along the path
         vis = [(pp["t"], los_clear((pp["x"], pp["y"]), max(pp.get("z", 4.5), 1.0),
-                                   (ax, ay), ANCHOR_H)) for pp in path]
+                                   (ax, ay), LOS_H)) for pp in path]
         windows = []
         run_start = None
         last_seen = None
