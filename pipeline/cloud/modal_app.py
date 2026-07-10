@@ -3029,6 +3029,315 @@ def put_r2(key: str, data_b64: str, content_type: str = "image/jpeg") -> dict:
     return {"key": key}
 
 
+@app.function(image=gsplat_image, secrets=[r2_secret], volumes={"/scratch": vol},
+              memory=16384, timeout=3600)
+def make_tour_data(vslam_slug: str, tour_slug: str,
+                   stills_prefix: str,
+                   min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+                   sheet_w: float, sheet_h: float,
+                   pano_px: int = 4096, path_hz: float = 1.0,
+                   zones_key: str = "", nadir_slug: str = "scottsdale-nadir") -> dict:
+    """Single-anchor tour data, Justin's spec: the math places and fades the pins.
+    Fits the flythrough's VSLAM floor frame into the plan sheet (GPS-feet grid) using
+    stills that have BOTH a localize position (feet) and EXIF GPS (sheet coords), then
+    emits: the camera path {t,x,y} for anchored-ring pose interpolation, one anchored
+    hotspot per localized still (its standpoint), and tour-sized panos on R2.
+    -> layout/{vslam_slug}/tour_data.json"""
+    import io
+    import json
+    import numpy as np
+    import cv2
+
+    s3 = _r2(); sd = f"/scratch/{vslam_slug}"
+
+    # --- fly floor frame (identical derivation to every other engine) ---
+    ply = f"{sd}/{vslam_slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{vslam_slug}/{vslam_slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = "/tmp/kf.txt"
+        s3.download_file(R2_BUCKET, f"vslam/{vslam_slug}/keyframe_trajectory.txt", traj)
+    T = np.loadtxt(traj)
+    if T.ndim == 1:
+        T = T[None, :]
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False); up = Vt[2].astype("f4")
+    cams = T[:, 1:4]
+    if np.dot(cams.mean(0) - c, up) < 0:
+        up = -up
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    hgt = X @ up
+    lo1, hi1 = np.percentile(X @ e1, [1, 99]); lo2, hi2 = np.percentile(X @ e2, [1, 99])
+    floor = float(np.percentile(hgt, 1.5)); ceil_ = float(np.percentile(hgt, 99))
+    fpu = 8.5 / (ceil_ - floor)                              # this property: 8.5 ft ceilings
+    Cm = T[:, 1:4] - c
+    okp = np.isfinite(Cm).all(1)
+    feet = np.stack([(Cm @ e1 - lo1) * fpu, (Cm @ e2 - lo2) * fpu], 1)
+
+    # --- correspondences: localize feet <-> still EXIF GPS (sheet coords) ---
+    loc = json.loads(s3.get_object(Bucket=R2_BUCKET,
+                                   Key=f"layout/{vslam_slug}/localize.json")["Body"].read())
+    resp = s3.list_objects_v2(Bucket=R2_BUCKET, Prefix=stills_prefix)
+    skeys = {os.path.splitext(os.path.basename(o["Key"]))[0]: o["Key"]
+             for o in resp.get("Contents", []) if o["Key"].lower().endswith((".jpg", ".jpeg"))}
+
+    def sheet_xy(lat, lon):
+        x = (lon - min_lon) / (max_lon - min_lon) * sheet_w
+        y = (max_lat - lat) / (max_lat - min_lat) * sheet_h
+        return x, y
+
+    def poly_centroid(pts):
+        pts = np.asarray(pts, np.float64)
+        x, y = pts[:, 0], pts[:, 1]
+        x2, y2 = np.roll(x, -1), np.roll(y, -1)
+        cr = x * y2 - x2 * y
+        A = cr.sum() / 2.0
+        if abs(A) < 1e-6:
+            return float(x.mean()), float(y.mean())
+        return float(((x + x2) * cr).sum() / (6 * A)), float(((y + y2) * cr).sum() / (6 * A))
+
+    # STILL positions on the sheet via the VALIDATED nadir chain: referee-checked
+    # still poses (nadir frame) -> fitted plansheet transform -> CubiCasa canvas,
+    # which sits on the sheet at origin/scale 1. Inch-class anchors, no GPS involved.
+    nspd = f"/scratch/{nadir_slug}/splat"
+    nmeta = json.load(open(f"{nspd}/cameras.json"))
+    nposes = _load_still_poses(s3, nadir_slug, nmeta, nspd)
+    ne1 = np.array(nmeta["e1"]); ne2 = np.array(nmeta["e2"])
+    nlo1, nlo2 = nmeta["lo1"], nmeta["lo2"]
+    nfpu = nmeta["fpu"]
+    nftw = (nmeta["hi1"] - nlo1) * nfpu; nfth = (nmeta["hi2"] - nlo2) * nfpu
+    al = json.loads(s3.get_object(Bucket=R2_BUCKET,
+                                  Key=f"layout/{nadir_slug}/plan_align.json")["Body"].read())
+    FX, FY, FW, FH, ROT = al["FX"], al["FY"], al["FW"], al["FH"], al["ROT"]
+    cxa = FX + FW / 2.0; cya = FY + FH / 2.0
+    tha = np.radians(ROT); ca, sa = np.cos(-tha), np.sin(-tha)
+
+    def nadir_feet_to_sheet(fx_ft, fy_ft):
+        # inverse of the plansheet forward map (photo -> plan canvas = sheet units)
+        p1x = fx_ft / nftw * FW + FX
+        p1y = fy_ft / nfth * FH + FY
+        if al.get("FLIPH", True):
+            p1x = 2 * cxa - p1x
+        dx = p1x - cxa; dy = p1y - cya
+        sx = cxa + ca * dx + sa * dy
+        sy = cya - sa * dx + ca * dy
+        return float(sx), float(sy)
+
+    sheet_still = {}
+    for name, c2w in nposes.items():
+        C = c2w[:3, 3]
+        fx_ft = (float(C @ ne1) - nlo1) * nfpu
+        fy_ft = (float(C @ ne2) - nlo2) * nfpu
+        sheet_still[name] = nadir_feet_to_sheet(fx_ft, fy_ft)
+    print(f"[tourdata] {len(sheet_still)} stills placed on sheet via nadir chain")
+
+    # zones: label each still by the room polygon that contains (or is nearest to) it
+    zone_by_still = {}
+    if zones_key:
+        zones = json.loads(s3.get_object(Bucket=R2_BUCKET, Key=zones_key)["Body"].read())
+
+        def inside(pt, pts):
+            x, y = pt; n = len(pts); j = n - 1; c = False
+            for i in range(n):
+                xi, yi = pts[i]; xj, yj = pts[j]
+                if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi:
+                    c = not c
+                j = i
+            return c
+
+        for name, pt in sheet_still.items():
+            best_lab, best_d = None, 1e9
+            for z in zones:
+                if not z.get("points"):
+                    continue
+                if inside(pt, z["points"]):
+                    best_lab, best_d = z.get("label"), 0.0
+                    break
+                cx, cy = poly_centroid(z["points"])
+                d = (cx - pt[0]) ** 2 + (cy - pt[1]) ** 2
+                if d < best_d:
+                    best_lab, best_d = z.get("label"), d
+            if best_lab:
+                zone_by_still[name] = {"label": best_lab}
+
+    # FLY-frame fit (drives only the camera path; a couple of feet is fine there):
+    # fly localize feet <-> the same stills' sheet positions from the nadir chain.
+    src, dst, names = [], [], []
+    for name, info in loc.items():
+        if name == "_meta" or not isinstance(info, dict) or name not in sheet_still:
+            continue
+        if info.get("matches", 0) < 30:
+            continue
+        src.append(info["feet"])
+        dst.append(sheet_still[name])
+        names.append(name)
+    src = np.array(src); dst = np.array(dst)
+    if len(src) < 3:
+        raise RuntimeError(f"only {len(src)} correspondences — cannot fit feet->sheet")
+
+    # --- 2D similarity via RANSAC: the fly localize contains wrong-room matches
+    #     (gross outliers) — hypothesize from point PAIRS, keep the biggest
+    #     consensus under 4 ft, refit Umeyama on the inliers only ---
+    def cplx_fit(sp, dp):
+        """Closed-form 2D similarity, reflection decided by residual: z' = a z + b
+        vs z' = a conj(z) + b. Returns (predict_fn, scale, reflected, residuals)."""
+        zs = sp[:, 0] + 1j * sp[:, 1]
+        zd = dp[:, 0] + 1j * dp[:, 1]
+        mzs, mzd = zs.mean(), zd.mean()
+        cs, cd = zs - mzs, zd - mzd
+        out = []
+        for refl in (False, True):
+            base = np.conj(cs) if refl else cs
+            a = (cd * np.conj(base)).sum() / ((np.abs(base) ** 2).sum() + 1e-12)
+            b = mzd - a * (np.conj(mzs) if refl else mzs)
+
+            def pred(p, a=a, b=b, refl=refl):
+                z = np.asarray(p)[..., 0] + 1j * np.asarray(p)[..., 1]
+                w = a * (np.conj(z) if refl else z) + b
+                return np.stack([w.real, w.imag], -1)
+
+            r = np.linalg.norm(pred(sp) - dp, axis=1)
+            out.append((r.mean(), pred, abs(a), refl, r))
+        out.sort(key=lambda t: t[0])
+        _, pred, sc, refl, r = out[0]
+        return pred, float(sc), refl, r
+
+    best_inl, best_model = [], None
+    for i in range(len(src)):
+        for j in range(i + 1, len(src)):
+            v_s = src[j] - src[i]; v_d = dst[j] - dst[i]
+            ns_ = np.linalg.norm(v_s); nd_ = np.linalg.norm(v_d)
+            if ns_ < 3.0 or nd_ < 3.0:
+                continue
+            for refl in (1.0, -1.0):
+                vs = v_s.copy()
+                if refl < 0:
+                    vs = np.array([vs[0], -vs[1]])
+                sc = nd_ / ns_
+                ang = np.arctan2(v_d[1], v_d[0]) - np.arctan2(vs[1], vs[0])
+                Rr = np.array([[np.cos(ang), -np.sin(ang)], [np.sin(ang), np.cos(ang)]])
+                M = Rr @ np.diag([1.0, refl])
+                tt = dst[i] - sc * M @ src[i]
+                pred = (sc * (M @ src.T)).T + tt
+                err = np.linalg.norm(pred - dst, axis=1)
+                inl = list(np.where(err < 4.0)[0])
+                if len(inl) > len(best_inl):
+                    best_inl, best_model = inl, (sc, M, tt, refl)
+    if len(best_inl) < 4:
+        raise RuntimeError(f"RANSAC found only {len(best_inl)} inliers — fly localize too poor")
+    predict, scale, refl, resid = cplx_fit(src[best_inl], dst[best_inl])
+
+    def fit(p):
+        return predict(np.asarray(p, np.float64))
+
+    out_n = len(src) - len(best_inl)
+    print(f"[tourdata] RANSAC fit: {len(best_inl)}/{len(src)} inliers ({out_n} wrong-room "
+          f"rejected), scale {scale:.3f}, inlier residual mean {resid.mean():.2f} ft / "
+          f"max {resid.max():.2f} ft (reflection {'yes' if refl else 'no'})")
+    if resid.mean() > 5.0:
+        raise RuntimeError(f"inlier residual still high ({resid.mean():.1f} ft mean)")
+
+    # --- camera path at path_hz in sheet coords (viewer derives heading from tangent) ---
+    ts = T[:, 0].copy()
+    if ts.max() > 3600:                                       # frame-index timestamps guard
+        ts = ts / 30.0
+    order = np.argsort(ts)
+    path = []
+    last_t = -1e9
+    for i in order:
+        if not okp[i] or not np.isfinite(ts[i]):
+            continue
+        if ts[i] - last_t < 1.0 / path_hz:
+            continue
+        last_t = float(ts[i])
+        p = fit(feet[i])
+        path.append({"t": round(float(ts[i]), 2), "x": round(float(p[0]), 2),
+                     "y": round(float(p[1]), 2)})
+
+    # --- one anchored hotspot per still, at its NADIR-CHAIN standpoint (inch-class),
+    #     labeled by the room polygon it stands in; the still becomes its pano ---
+    hotspots, panos = [], []
+    for name in sorted(sheet_still):
+        if name not in skeys:
+            continue
+        short = name[:8]
+        ax, ay = sheet_still[name]
+        label = zone_by_still.get(name, {}).get("label", short)
+        s3.download_file(R2_BUCKET, skeys[name], "/tmp/sp.jpg")
+        im = cv2.imread("/tmp/sp.jpg")
+        if im is None:
+            continue
+        pano = cv2.resize(im, (pano_px, pano_px // 2), interpolation=cv2.INTER_AREA)
+        ok2, enc = cv2.imencode(".jpg", pano, [cv2.IMWRITE_JPEG_QUALITY, 84])
+        pkey = f"tours/{tour_slug}/pano-{short}.jpg"
+        s3.put_object(Bucket=R2_BUCKET, Key=pkey, Body=enc.tobytes(),
+                      ContentType="image/jpeg",
+                      CacheControl="public, max-age=31536000, immutable")
+        hotspots.append({"id": f"hs-{short}", "label": label, "panoId": short,
+                         "anchor": {"x": round(float(ax), 2), "y": round(float(ay), 2),
+                                    "h": 1.2},
+                         "fadeNear": 2.5, "fadeFar": 9.0})
+        panos.append({"id": short, "label": label,
+                      "src": f"https://media.lvxhomes.com/{pkey}?v=1"})
+    out = {"path": path, "hotspots": hotspots, "panos": panos,
+           "fit": {"n": len(src), "inliers": len(best_inl), "scale": round(float(scale), 4),
+                   "residual_mean_ft": round(float(resid.mean()), 2),
+                   "residual_max_ft": round(float(resid.max()), 2),
+                   "reflection": bool(refl)}}
+    s3.put_object(Bucket=R2_BUCKET, Key=f"layout/{vslam_slug}/tour_data.json",
+                  Body=json.dumps(out).encode(), ContentType="application/json")
+    print(f"[tourdata] {len(path)} path samples, {len(hotspots)} anchored pins, "
+          f"{len(panos)} panos -> layout/{vslam_slug}/tour_data.json")
+    return {"path": len(path), "pins": len(hotspots), "panos": len(panos), "fit": out["fit"]}
+
+
+@app.local_entrypoint()
+def tourdata(vslam_slug: str, tour_slug: str, stills_prefix: str,
+             min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+             sheet_w: float, sheet_h: float, zones_key: str = ""):
+    """modal run modal_app.py::tourdata --vslam-slug scottsdale-fly --tour-slug old-town-scottsdale-home ..."""
+    print(make_tour_data.remote(vslam_slug, tour_slug, stills_prefix,
+                                min_lon, max_lon, min_lat, max_lat, sheet_w, sheet_h,
+                                zones_key=zones_key))
+
+
+@app.function(image=vslam_image, secrets=[r2_secret], cpu=16.0, memory=16384, timeout=7200)
+def make_mezzanine(src_key: str, out_key: str, maxw: int = 3840, crf: int = 19) -> dict:
+    """Stream-ingestable mezzanine from a raw export: Cloudflare Stream rejects >4K
+    input (the 6K HEVC 360 masters), so transcode to H.264 <=maxw wide, faststart,
+    and put it back on R2 next to the original."""
+    import subprocess
+
+    s3 = _r2()
+    src = "/tmp/mezz_src.mp4"
+    out = "/tmp/mezz_out.mp4"
+    print(f"[mezz] downloading {src_key}")
+    s3.download_file(R2_BUCKET, src_key, src)
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", src,
+         "-vf", f"scale='min({maxw},iw)':-2",
+         "-c:v", "libx264", "-preset", "fast", "-crf", str(crf),
+         "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+         "-c:a", "aac", "-b:a", "192k",
+         out],
+        check=True,
+    )
+    s3.upload_file(out, R2_BUCKET, out_key,
+                   ExtraArgs={"ContentType": "video/mp4"})
+    bytes_out = os.path.getsize(out)
+    print(f"[mezz] {src_key} -> {out_key} ({bytes_out/1e9:.2f} GB)")
+    return {"out": out_key, "bytes": int(bytes_out)}
+
+
+@app.local_entrypoint()
+def mezzanine(src_key: str, out_key: str, maxw: int = 3840):
+    """modal run modal_app.py::mezzanine --src-key projects/x/video/a.mp4 --out-key projects/x/video/a_4k.mp4"""
+    print(make_mezzanine.remote(src_key, out_key, maxw=maxw))
+
+
 @app.function(image=test_image, secrets=[r2_secret])
 def presign_r2(keys_csv: str, expires: int = 604800) -> dict:
     """Presigned GET links (default 7 days) so renders can be viewed from any browser
