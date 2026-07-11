@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { IngestLab } from "@/components/studio/ingest-lab";
+import { RoomLabeler } from "@/components/studio/room-labeler";
 import { Container } from "@/components/ui/container";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { Section } from "@/components/ui/section";
@@ -32,6 +33,19 @@ export default function LabPage() {
         </p>
         <div className="mt-8">
           <IngestLab />
+        </div>
+
+        <div className="mt-16 border-t border-paper/10 pt-10">
+          <h2 className="font-display text-xl tracking-[0.06em] text-paper">
+            ROOM LABELER
+          </h2>
+          <p className="mt-3 max-w-2xl font-sans text-sm font-light leading-relaxed text-paper/70">
+            Identify rooms on any render — dots and labels are yours, geometry
+            is the pipeline&apos;s. Copy the JSON out when done.
+          </p>
+          <div className="mt-6">
+            <RoomLabeler />
+          </div>
         </div>
 
         <div className="mt-16 border-t border-paper/10 pt-10">
