@@ -30,7 +30,9 @@
     // The matching shared secret is VSLAM_CALLBACK_TOKEN, set with
     // `wrangler secret put VSLAM_CALLBACK_TOKEN` — it MUST equal the
     // LVX_CALLBACK_TOKEN in your Modal `lvx-callback` secret.
-    "MODAL_SUBMIT_URL": "https://jus2419497--lvx-vslam-submit.modal.run"
+    "MODAL_SUBMIT_URL": "https://jus2419497--lvx-vslam-submit.modal.run",
+    // Scene ingest (Studio Lab): photo -> furniture dims. Same shared secret.
+    "MODAL_INGEST_URL": "https://jus2419497--lvx-asset-ingest-ingestservice-web.modal.run"
   },
   "d1_databases": [
     {

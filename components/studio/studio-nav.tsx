@@ -17,6 +17,7 @@ const LINKS: { href: string; label: string; exact?: boolean }[] = [
   { href: "/studio/plan", label: "Floorplans" },
   { href: "/studio/pins", label: "Pins" },
   { href: "/studio/render", label: "Render" },
+  { href: "/studio/lab", label: "Lab" },
 ];
 
 export function StudioNav() {

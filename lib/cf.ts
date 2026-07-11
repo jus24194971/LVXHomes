@@ -74,6 +74,9 @@ export type AppEnv = {
   /** Modal `submit` web-endpoint URL that kicks off cloud processing.
    *  Set after `modal deploy`. */
   MODAL_SUBMIT_URL?: string;
+  /** Modal scene-ingest web endpoint (Studio Lab: photo → furniture dims).
+   *  Set after `modal deploy pipeline/cloud/asset_ingest.py`. */
+  MODAL_INGEST_URL?: string;
   /** Shared secret used both ways: Worker→Modal (job auth) and Modal→Worker
    *  (callback auth). Must equal LVX_CALLBACK_TOKEN in the Modal secret. */
   VSLAM_CALLBACK_TOKEN?: string;
