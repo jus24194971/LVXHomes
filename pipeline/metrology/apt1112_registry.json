@@ -33,6 +33,18 @@
     {"id": "datum:great.couch-corner", "kind": "datum", "note": "back corner with the speaker and the couch"}
   ],
   "constants": {"ceiling_ft": 8.99, "ceiling_raw": "8'11-7/8\"", "instrument": "bosch-glm"},
+  "owner_labels": {
+    "date": "2026-07-10",
+    "operator": "Justin (red markup on labs/apartment-1112-dollhouse-measured.jpg, unleveled splat-ortho frame)",
+    "identifications": {
+      "master_bedroom": "teal-bed region, left side (~0.12, 0.50 norm)",
+      "master_bathroom": "striped-bath-mat region, bottom-left (~0.24, 0.68) — CORRECTS the schematic that placed the J&J bath on this side",
+      "bonus_room": "gray-carpet region, upper right (~0.66, 0.15) — confirmed (not patio)",
+      "kitchen_island": "island with stools, bottom center-right (~0.63, 0.72, red box)",
+      "couch_and_table": "sectional + coffee table, center-top (red loop ~0.24-0.55 x, 0.17-0.45 y)"
+    },
+    "derived": "master suite occupies the LEFT column (bedroom upper, bathroom lower); great room living end center-top; kitchen bottom center-right (front door there); bonus + presumably J&J on the right/upper-right; leveled frame = rotate -28 deg from this"
+  },
   "objects": [
     {"id": "obj:sectional", "category": "sofa", "label": "black leather L-sectional",
      "dims_in": {"long_side": 127.469, "short_side": 89.0, "back_height": 41.625},
