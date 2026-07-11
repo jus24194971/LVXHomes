@@ -1,0 +1,44 @@
+{
+  "property": "apartment-1112",
+  "locked": "2026-07-10",
+  "note": "Predictions computed and recorded BEFORE the corresponding Bosch ground truth arrived. Ceiling anchor 8.99 ft (laser). Two independent methods: (a) video = consensus min-area rects of per-frame HorizonNet layouts from the June flythrough (44 frames, layout/apartment-1112/rooms.json); (b) pano = HorizonNet on the single named 360 still per room (still_layout, projects/apartment-1112/still/).",
+  "rooms": {
+    "master_bedroom": {
+      "video_ft": [13.3, 11.7],
+      "pano_ft": [14.47, 10.97],
+      "truth_ft": [13.69, 10.09],
+      "scored": "video L -2.9%, pano S +8.7%; BOTH methods over-span the short axis (door-through into the small hall, the suspected mechanism)"
+    },
+    "guest_bedroom_aka_bonus": {
+      "video_ft": "ambiguous (two candidate clusters)",
+      "pano_ft": [12.22, 10.69],
+      "truth_ft": [11.86, 10.51],
+      "scored": "pano L +3.0%, S +1.7% - the one-pano-per-room protocol's flagship result"
+    },
+    "secondary_bath_jack_and_jill": {
+      "video_ft": [9.5, 5.7],
+      "pano_ft": [9.3, 7.95],
+      "truth_ft": [9.0, 5.417],
+      "scored": "VIDEO wins: +5.6% / +5.2%. Pano L +3.3% but width +46.7% — over-spanned through the jack-and-jill doors AND the shower curtain (HorizonNet cannot see the wall behind a curtain)"
+    },
+    "primary_bath": {
+      "video_ft": [10.1, 6.3],
+      "pano_ft": [10.78, 8.23],
+      "truth_ft": [10.667, 6.0],
+      "scored": "SPLIT: pano L +1.1%, video S +5.0%. Pano width +37% — the shower nook + closet doorway. Ensemble rule emerges: pano for lengths, video-consensus for widths in small rooms with openings"
+    },
+    "great_room": {
+      "video_ft": [33, 19],
+      "pano_ft": "kitchen still 32.8 x 15.0, living still 31.6 x 13.4",
+      "truth_diagonal_ft": 35.208,
+      "scored_diagonal": "kitchen-pano rect implies diag 36.09 (+2.5%), living-pano 34.30 (-2.6%) — the two bracket truth, ensemble mean 35.19 = -0.05%. Video rect implies 38.08 (+8.1%), its 19 ft width over-span showing. Wall-parallel L and W still open; diagonal constrains W = sqrt(35.21^2 - L^2), so one wall measurement closes the room"
+    },
+    "small_hall": {
+      "video_ft": [17.3, 3.7],
+      "pano_ft": null,
+      "truth_ft": [4.891, 3.484],
+      "scored": "width +6.2% (the corridor-sliver frames were right); length wildly over — lengthwise corridor views span through doorways into connected halls, as expected"
+    }
+  },
+  "drone_heights_ft": {"bedroom": 4.08, "bonus": 4.5, "guest-bath": 4.53, "kitchen": 4.51, "living": 4.47, "primary-bath": 4.29}
+}

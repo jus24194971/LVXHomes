@@ -1,0 +1,133 @@
+{
+  "property": "apartment-1112 (The George)",
+  "instrument": "Bosch GLM laser (Bluetooth, ~165 ft)",
+  "date": "2026-07-10",
+  "conventions": {
+    "walls": "finished paint surface to paint surface, above baseboard",
+    "openings": "inside jamb to inside jamb",
+    "datums": "measured from drywall corners, not standing positions"
+  },
+  "topology": {
+    "rooms": {
+      "great_room": "kitchen + living, open combined plan; front door enters at kitchen",
+      "guest_bedroom": "the tour's 'Bonus Room' — actually a guest bedroom; TWO openings (entry + doorway to the jack-and-jill secondary bath); a 3D printer occupies floor space (occlusion)",
+      "secondary_bath": "the tour's 'Guest Bath' — jack-and-jill, shared with the guest bedroom",
+      "small_hall": "short hall off the main hallway leading into the master suite",
+      "master_bedroom": "entered via the small hall",
+      "master_bath": "off the master suite (via small hall/bedroom)",
+      "master_closet": "walk-through off the master bath — NOT FILMED (invisible to every pipeline layer; laser is the only truth source)"
+    },
+    "connectivity": [
+      ["hallway", "great_room"],
+      ["hallway", "guest_bedroom"],
+      ["guest_bedroom", "secondary_bath"],
+      ["hallway", "small_hall"],
+      ["small_hall", "master_bedroom"],
+      ["master_bedroom_or_small_hall", "master_bath"],
+      ["master_bath", "master_closet"]
+    ]
+  },
+  "measurements": [
+    {
+      "name": "sightline_front_door_to_back_door",
+      "raw": "32'5\" 7/32",
+      "inches": 389.219,
+      "feet": 32.435,
+      "kind": "sightline",
+      "note": "front door (in kitchen) straight to back door"
+    },
+    {
+      "name": "front_door_to_hallway_edge",
+      "raw": "16'9\" 1/16",
+      "inches": 201.063,
+      "feet": 16.755,
+      "kind": "sightline_segment",
+      "note": "to the hallway edge between guest bath and bonus room; interpretation confirmed by closure with the two other sightline segments (sum matches full sightline within 0.8in)"
+    },
+    {
+      "name": "hallway_wall_to_back_door",
+      "raw": "15'8\" 31/32",
+      "inches": 188.969,
+      "feet": 15.747,
+      "kind": "sightline_segment"
+    },
+    {
+      "name": "door_height_all",
+      "raw": "8'1\" 7/32",
+      "inches": 97.219,
+      "feet": 8.102,
+      "kind": "feature",
+      "note": "all interior doors, 8-ft door package"
+    },
+    {
+      "name": "ceiling_height_all",
+      "raw": "8'11\" 7/8",
+      "inches": 107.875,
+      "feet": 8.990,
+      "kind": "anchor",
+      "note": "validates the 9.0 ft ceiling-scale anchor used for all 1112 VSLAM scale: error +0.12%"
+    },
+    {
+      "name": "primary_bedroom",
+      "raw": "13'8\" 7/32 x 10'1\" 1/32",
+      "inches": [164.219, 121.031],
+      "feet": [13.685, 10.086],
+      "kind": "room_LxW"
+    },
+    {
+      "name": "bonus_room",
+      "raw": "11'10\" 11/32 x 10'6\" 3/32",
+      "inches": [142.344, 126.094],
+      "feet": [11.862, 10.508],
+      "kind": "room_LxW"
+    },
+    {
+      "name": "secondary_bath",
+      "raw": "9'0\" x 5'5\"",
+      "inches": [108.0, 65.0],
+      "feet": [9.0, 5.417],
+      "kind": "room_LxW",
+      "note": "jack-and-jill; shower WITH CURTAIN inside measuring 4'10 x 2'7-29/32 (58 x 31.9 in) — curtain occludes the wall from any camera"
+    },
+    {
+      "name": "small_hall",
+      "raw": "4'10 11/16 x 3'5 13/16 edge to edge",
+      "inches": [58.688, 41.813],
+      "feet": [4.891, 3.484],
+      "kind": "room_LxW"
+    },
+    {
+      "name": "great_room_edge_to_edge",
+      "raw": "35'2\" 1/2",
+      "inches": 422.5,
+      "feet": 35.208,
+      "kind": "diagonal",
+      "note": "CONFIRMED complete diagonal: front-door corner to the back corner (the one with the speaker and the couch — the same sectional from the furniture metrology test). Wall-parallel extents not yet measured"
+    },
+    {
+      "name": "master_bath",
+      "raw": "6' x 10'8\"",
+      "inches": [72.0, 128.0],
+      "feet": [6.0, 10.667],
+      "kind": "room_LxW",
+      "note": "has a shower nook (extends beyond the 6 ft width — explains the pano width over-span)"
+    },
+    {
+      "name": "kitchen_counter_run",
+      "raw": "82.5 x 35 in",
+      "inches": [82.5, 35.0],
+      "kind": "feature",
+      "note": "counter run length x counter height; 36in standard prior was +2.9% off"
+    }
+  ],
+  "pending": [
+    "great room (kitchen+living combined): overall extents both directions + diagonal",
+    "guest bath L x W, primary bath L x W",
+    "room diagonals (primary bedroom, bonus)",
+    "door opening WIDTHS + position from nearest corner",
+    "kitchen back wall to counter/island front edge (kitchen zone depth)",
+    "guest bath tub length (60in standard check), vanity widths, window widths",
+    "3-5 furniture pieces L x W x H",
+    "one casual phone photo per room from the doorway (Lab ingest pairing)"
+  ]
+}
