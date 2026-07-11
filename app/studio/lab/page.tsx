@@ -33,6 +33,31 @@ export default function LabPage() {
         <div className="mt-8">
           <IngestLab />
         </div>
+
+        <div className="mt-16 border-t border-paper/10 pt-10">
+          <h2 className="font-display text-xl tracking-[0.06em] text-paper">
+            LAB ARTIFACTS
+          </h2>
+          <p className="mt-3 max-w-2xl font-sans text-sm font-light leading-relaxed text-paper/70">
+            Apartment 1112, measured: every laser-verified surface on one
+            sheet, capture-derived numbers where the Bosch hasn&apos;t spoken,
+            and the scorecard of capture vs truth — predictions locked before
+            measurement.
+          </p>
+          <a
+            href="https://media.lvxhomes.com/labs/apartment-1112-measured.jpg"
+            target="_blank"
+            rel="noreferrer"
+            className="mt-6 block max-w-3xl border border-paper/15 transition-colors hover:border-champagne/50"
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src="https://media.lvxhomes.com/labs/apartment-1112-measured.jpg"
+              alt="Apartment 1112 measured baseline sheet"
+              className="w-full"
+            />
+          </a>
+        </div>
       </Container>
     </Section>
   );
