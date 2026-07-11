@@ -43,7 +43,8 @@
       "kitchen_island": "island with stools, bottom center-right (~0.63, 0.72, red box)",
       "couch_and_table": "sectional + coffee table, center-top (red loop ~0.24-0.55 x, 0.17-0.45 y)"
     },
-    "derived": "master suite occupies the LEFT column (bedroom upper, bathroom lower); great room living end center-top; kitchen bottom center-right (front door there); bonus + presumably J&J on the right/upper-right; leveled frame = rotate -28 deg from this"
+    "derived": "master suite occupies the LEFT column (bedroom upper, bathroom lower); great room living end center-top; kitchen bottom center-right (front door there); bonus + presumably J&J on the right/upper-right; leveled frame = rotate -28 deg from this",
+    "handedness": "OWNER-CONFIRMED 2026-07-10: the capture/ortho frame is MIRRORED vs reality (the known Avata/VSLAM handedness — same flipH as Scottsdale). Real-world plan = flip X: master suite is on the RIGHT, bonus/J&J on the LEFT when standing in the apartment. All image-space labels above are in the mirrored capture frame; the v2 floorplan renders mirror-corrected."
   },
   "objects": [
     {"id": "obj:sectional", "category": "sofa", "label": "black leather L-sectional",
