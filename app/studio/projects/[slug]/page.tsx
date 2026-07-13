@@ -38,6 +38,7 @@ export default function ProjectDetail() {
   const [uploading, setUploading] = useState<string | null>(null);
   const [job, setJob] = useState<Job | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [ceilingFt, setCeilingFt] = useState("9");
 
   const load = useCallback(async () => {
     const r = await fetch(`/studio/api/projects/${slug}`, { credentials: "same-origin" });
@@ -102,6 +103,8 @@ export default function ProjectDetail() {
     const res = await fetch(`/studio/api/projects/${slug}/process`, {
       method: "POST",
       credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ceiling_ft: parseFloat(ceilingFt) || 9 }),
     });
     const d = (await res.json()) as { jobId?: string; error?: string };
     if (!res.ok || !d.jobId) {
@@ -300,6 +303,20 @@ export default function ProjectDetail() {
       </div>
 
       <div className="mt-6 flex items-center gap-3">
+        <label className="flex items-center gap-2 font-sans text-xs text-paper/70">
+          <span className="uppercase tracking-[0.16em]">Ceiling</span>
+          <input
+            type="number"
+            step="0.05"
+            min="5"
+            max="30"
+            value={ceilingFt}
+            onChange={(e) => setCeilingFt(e.target.value)}
+            title="Laser-measured ceiling height — the scale anchor for the whole floorplan (Bosch GLM, floor to ceiling)"
+            className="w-20 rounded-md border border-paper/25 bg-transparent px-2 py-1.5 text-sm text-paper/85 focus:border-champagne focus:outline-none"
+          />
+          <span className="text-paper/40">ft</span>
+        </label>
         <button
           type="button"
           onClick={process}

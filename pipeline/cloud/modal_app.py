@@ -392,7 +392,9 @@ def process(job: dict) -> dict:
     # floorplan chain (still_layout → VSLAM → localize → fuse → deliver). It delivers itself.
     if still_keys:
         try:
-            return process_floorplan.remote(slug, ceiling_ft=ceiling_ft)
+            return process_floorplan.remote(slug, ceiling_ft=ceiling_ft,
+                                            video_key=video_key or "",
+                                            srt_key=job.get("srt_key") or "")
         except Exception as e:
             payload = {"slug": slug, "status": "failed", "error": str(e)}
             _notify(payload)
@@ -5286,20 +5288,24 @@ def fuse_localized(slug: str, stills_json: str, vslam_slug: str, overview_key: s
 
 
 @app.function(image=test_image, secrets=[r2_secret, cb_secret], timeout=7200)
-def process_floorplan(slug: str, ceiling_ft: float = 9.0) -> dict:
+def process_floorplan(slug: str, ceiling_ft: float = 9.0, video_key: str = "", srt_key: str = "") -> dict:
     """ONE-CLICK: a project's stills + flythrough -> localized, georeferenced floorplan -> delivered
-    onto the project (callback writes it to D1). Discovers inputs from R2 projects/{slug}/."""
+    onto the project (callback writes it to D1). Prefers the explicit video_key/srt_key from the
+    submit payload (the Studio picks nadir-role over cinematic); falls back to R2 discovery."""
     s3 = _r2()
     resp = s3.list_objects_v2(Bucket=R2_BUCKET, Prefix=f"projects/{slug}/")
     keys = [o["Key"] for o in resp.get("Contents", [])]
     stills = [k for k in keys if "/still/" in k and k.lower().endswith((".jpg", ".jpeg"))]
-    videos = [k for k in keys if "/video/" in k and k.lower().endswith((".mp4", ".mov", ".m4v"))]
-    if not stills or not videos:
+    videos = [k for k in keys if ("/video/" in k or "/nadir/" in k) and k.lower().endswith((".mp4", ".mov", ".m4v"))]
+    if not stills or not (videos or video_key):
         _notify({"slug": slug, "status": "failed", "error": "need stills + a flythrough video in the project"})
         return {"error": "missing inputs", "stills": len(stills), "videos": len(videos)}
-    flythrough = sorted(videos)[0]
+    flythrough = video_key or sorted(videos)[0]
+    srts = [k for k in keys if "/telemetry/" in k and k.lower().endswith(".srt")]
+    srt_key = srt_key or (sorted(srts)[0] if srts else "")
     vslam_slug = f"{slug}-fly"
-    print(f"[process_floorplan] {slug}: {len(stills)} stills, flythrough {flythrough}")
+    print(f"[process_floorplan] {slug}: {len(stills)} stills, flythrough {flythrough}, "
+          f"srt {srt_key or 'NONE'}, ceiling {ceiling_ft} ft")
 
     sl = still_layout.remote(slug)                                  # HorizonNet + GPS per still
     rooms = sl.get("stills", [])
@@ -5312,7 +5318,8 @@ def process_floorplan(slug: str, ceiling_ft: float = 9.0) -> dict:
     stills_json = json.dumps(rooms)
 
     run_vslam.remote(flythrough, vslam_slug)                        # VSLAM the flythrough
-    localize_stills.remote(vslam_slug, flythrough, stills_prefix=f"projects/{slug}/still/")
+    localize_stills.remote(vslam_slug, flythrough, ceiling_ft=ceiling_ft,
+                           stills_prefix=f"projects/{slug}/still/", srt_key=srt_key)
     fz = fuse_localized.remote(slug, stills_json, vslam_slug, ov_key, ceiling_ft=ceiling_ft)
     d = deliver_plan.remote(slug, fz["plan_json"], fz["base_b64"])  # upload + callback -> D1
     print(f"[process_floorplan] {slug}: delivered {d}")
@@ -5320,6 +5327,6 @@ def process_floorplan(slug: str, ceiling_ft: float = 9.0) -> dict:
 
 
 @app.local_entrypoint()
-def floorplan(slug: str, ceiling_ft: float = 9.0):
+def floorplan(slug: str, ceiling_ft: float = 9.0, video_key: str = "", srt_key: str = ""):
     """modal run modal_app.py::floorplan --slug old-town-scottsdale-home --ceiling-ft 8.5"""
-    print(process_floorplan.remote(slug, ceiling_ft=ceiling_ft))
+    print(process_floorplan.remote(slug, ceiling_ft=ceiling_ft, video_key=video_key, srt_key=srt_key))
