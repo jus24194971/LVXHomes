@@ -11,8 +11,8 @@ import { VIDEO_PINS, type VideoPinSet } from "@/data/video-pins";
  * backend is provisioned, and the very first Save persists the baked doc.
  */
 
-export type Kind = "tour" | "plan" | "pinset";
-export const KINDS: Kind[] = ["tour", "plan", "pinset"];
+export type Kind = "tour" | "plan" | "pinset" | "measure";
+export const KINDS: Kind[] = ["tour", "plan", "pinset", "measure"];
 
 async function getDb(): Promise<D1Database | null> {
   try {
@@ -70,6 +70,7 @@ export async function listPlanSlugs(): Promise<string[]> {
 export async function getDocLive(kind: Kind, id: string): Promise<unknown> {
   if (kind === "tour") return (await getTourLive(id)) ?? null;
   if (kind === "plan") return (await getPlanLive(id)) ?? null;
+  if (kind === "measure") return await readRow("measure", id); // no baked fallback — generated in the Studio
   return (await getPinSetLive(id)) ?? null;
 }
 

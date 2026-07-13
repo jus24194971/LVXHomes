@@ -6,7 +6,7 @@
  * authorizes the call.
  */
 
-export type AuthorKind = "tour" | "plan" | "pinset";
+export type AuthorKind = "tour" | "plan" | "pinset" | "measure";
 
 export type RevisionMeta = {
   id: number;
