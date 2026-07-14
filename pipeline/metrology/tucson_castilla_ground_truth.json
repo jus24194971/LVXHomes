@@ -1,0 +1,29 @@
+{
+  "property": "tucson-castilla",
+  "address": "4932 N Avenida De Castilla, Tucson AZ 85718",
+  "recorded": "2026-07-14",
+  "instrument": "Bosch GLM via MeasureOn (Bluetooth transfer, measured photos)",
+  "note": "Pre-capture vertical ground truth, lasered on site by Justin during capture day 1. Recorded BEFORE any pipeline output for this property — every capture-derived height gets scored against these. Assessor GLA witness: 3,622 sqft (parcel 108132920).",
+  "vertical_model": {
+    "doors_ft": 8.0,
+    "doors_note": "all interior/exterior doors 8'0\" nominal; photo-1 vertical at the French doors read 7'11-3/4\" (frame vs slab)",
+    "hallway_archways_low_ft": 8.390625,
+    "hallway_archways_low_note": "two archways, 8'4-11/16\" at the lowest point",
+    "hallway_avg_ft": 9.8333,
+    "bedrooms_ft": 9.8333,
+    "bedrooms_note": "all bedrooms except master at 9'10\"",
+    "great_room_kitchen_ft": 10.8385,
+    "great_room_kitchen_note": "10'10\" class; photo-1 top tier read 10'10-1/16\"",
+    "master_bedroom_max_ft": 10.8776,
+    "master_bedroom_note": "10'10-17/32\" max, tray/trim stepping DOWN at the same tier heights as the entry sequence",
+    "entry_tier_sequence_ft": [8.9375, 9.4323, 9.9375, 10.8385],
+    "entry_tier_sequence_note": "photo-1 verticals: 8'11-1/4\" / 9'5-3/16\" / 9'11-1/4\" / 10'10-1/16\" — consistent ~6 in tier steps, ~10.8 in to the top tier",
+    "floor_levels": "PENDING CONFIRMATION: whether the floor is one continuous level (all 'steps' are ceiling tiers) or the entry has physical floor steps up"
+  },
+  "flight_implications": {
+    "nadir_cruise_ft": 6.5,
+    "reason": "8'0\" doors minus 18 in margin; archway low point 8'4-11/16\" leaves 1.9 ft clearance at cruise",
+    "ceiling_anchor_zones": "per-room anchoring required: 9.83 ft bedrooms/halls vs 10.84 ft great/kitchen vs tiered master — single-value anchoring would smear scale across zones; GPS cross-boundary scale is the independent check"
+  },
+  "process_ceiling_ft_recommendation": 10.83
+}
