@@ -5330,3 +5330,238 @@ def process_floorplan(slug: str, ceiling_ft: float = 9.0, video_key: str = "", s
 def floorplan(slug: str, ceiling_ft: float = 9.0, video_key: str = "", srt_key: str = ""):
     """modal run modal_app.py::floorplan --slug old-town-scottsdale-home --ceiling-ft 8.5"""
     print(process_floorplan.remote(slug, ceiling_ft=ceiling_ft, video_key=video_key, srt_key=srt_key))
+
+
+# ---------------------------------------------------------------------------
+# Cross-boundary validation (§4.4): the six-gate report that scores a single
+# continuous outdoor→indoor take. GPS georeferences the exterior segment; the
+# unbroken VSLAM track carries that scale/heading/position through the door.
+# ---------------------------------------------------------------------------
+
+def _parse_srt_blocks(txt: str) -> list:
+    """DJI SRT -> [{t, lat, lon, alt, sats, yaw}] (fields None when absent).
+    Handles both `latitude: x longitude: y` and `GPS(lon,lat,alt)` block styles."""
+    import re
+    out = []
+    for b in re.split(r"\n\s*\n", txt):
+        tm = re.search(r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->", b)
+        if not tm:
+            continue
+        t = int(tm[1]) * 3600 + int(tm[2]) * 60 + int(tm[3]) + int(tm[4]) / 1000.0
+        lat = re.search(r"latitude\s*[:=]\s*([-\d.]+)", b, re.I)
+        lon = re.search(r"longitude\s*[:=]\s*([-\d.]+)", b, re.I)
+        if lat and lon:
+            la, lo = float(lat[1]), float(lon[1])
+        else:
+            g = re.search(r"GPS\s*\(\s*([-\d.]+)\s*,\s*([-\d.]+)", b, re.I)
+            lo, la = (float(g[1]), float(g[2])) if g else (None, None)
+        alt = re.search(r"(?:rel_alt|abs_alt|altitude)\s*[:=]\s*([-\d.]+)", b, re.I)
+        sats = re.search(r"satellites?\s*[:=]\s*(\d+)", b, re.I)
+        yaw = re.search(r"gb_yaw\s*[:=]\s*([-\d.]+)", b, re.I)
+        out.append({
+            "t": t,
+            "lat": la, "lon": lo,
+            "alt": float(alt[1]) if alt else None,
+            "sats": int(sats[1]) if sats else None,
+            "yaw": float(yaw[1]) if yaw else None,
+        })
+    return out
+
+
+def _umeyama3(X, Y):
+    """Similarity fit Y ≈ s·R·X + t (both (n,3)). Returns s, R, t."""
+    import numpy as np
+    mx, my = X.mean(0), Y.mean(0)
+    Xc, Yc = X - mx, Y - my
+    C = Yc.T @ Xc / len(X)
+    U, D, Vt = np.linalg.svd(C)
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[2, 2] = -1
+    R = U @ S @ Vt
+    varX = (Xc ** 2).sum() / len(X)
+    s = float((D * S.diagonal()).sum() / varX)
+    return s, R, my - s * R @ mx
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol},
+              timeout=1200, memory=8192)
+def cross_boundary(slug: str, srt_key: str, ceiling_fpu: float = 0.0,
+                   fps: float = 30.0, min_exterior_s: float = 15.0) -> dict:
+    """Six-gate §4.4 report for one continuous outdoor→indoor take.
+    Gates: (1) VSLAM continuity, (2) GPS anchor quality, (3) Umeyama georef of the
+    exterior window + RMS, (4) GPS scale vs ceiling scale Δ%, (5) closure drift if
+    GPS reacquired (out-and-back), (6) north tie (heading of the fitted rotation).
+    -> layout/{slug}/crossboundary.json + labs/{slug}-crossboundary.png"""
+    import json
+    import os
+    import numpy as np
+    import cv2
+
+    s3 = _r2()
+    sd = f"/scratch/{slug}"
+    traj_p = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj_p):
+        traj_p = f"{sd}/keyframe_trajectory.txt"
+    if not os.path.exists(traj_p):
+        traj_p = "/tmp/kf.txt"
+        s3.download_file(R2_BUCKET, f"vslam/{slug}/keyframe_trajectory.txt", traj_p)
+    T = np.loadtxt(traj_p)
+    if T.ndim == 1:
+        T = T[None, :]
+    ts, P = T[:, 0].copy(), T[:, 1:4]
+
+    sp = "/tmp/cb.srt"
+    s3.download_file(R2_BUCKET, srt_key, sp)
+    blocks = _parse_srt_blocks(open(sp, encoding="utf-8", errors="ignore").read())
+    if not blocks:
+        return {"error": "no SRT blocks parsed"}
+    srt_dur = blocks[-1]["t"]
+    # trajectory timestamps: frame-index vs seconds heuristic against the SRT clock
+    if ts.max() > srt_dur * 2.5:
+        ts = ts / fps
+
+    # ---- valid fixes -> local ENU feet ----
+    fixes = [b for b in blocks if b["lat"] and b["lon"] and abs(b["lat"]) > 0.5 and abs(b["lon"]) > 0.5]
+    if len(fixes) < 10:
+        return {"error": f"only {len(fixes)} GPS fixes in SRT — no exterior anchor"}
+    la0 = float(np.median([b["lat"] for b in fixes]))
+    lo0 = float(np.median([b["lon"] for b in fixes]))
+    R_E = 6371000.0 * 3.28084
+    def enu(b):
+        north = np.radians(b["lat"] - la0) * R_E
+        east = np.radians(b["lon"] - lo0) * R_E * np.cos(np.radians(la0))
+        return [east, north, (b["alt"] or 0.0) * 3.28084]
+    # multipath/outlier filter: implied speed < 45 ft/s between consecutive fixes
+    clean = [fixes[0]]
+    for b in fixes[1:]:
+        dt = b["t"] - clean[-1]["t"]
+        if dt <= 0:
+            continue
+        d = np.linalg.norm(np.array(enu(b)[:2]) - np.array(enu(clean[-1])[:2]))
+        if d / dt < 45.0:
+            clean.append(b)
+    # contiguous runs (gap <= 2 s)
+    runs, cur = [], [clean[0]]
+    for b in clean[1:]:
+        if b["t"] - cur[-1]["t"] <= 2.0:
+            cur.append(b)
+        else:
+            runs.append(cur); cur = [b]
+    runs.append(cur)
+    ext = next((r for r in runs if r[-1]["t"] - r[0]["t"] >= min_exterior_s), runs[0])
+    t_transition = ext[-1]["t"]  # last clean fix before the wall
+    reacq = next((r for r in runs if r is not ext and r[0]["t"] > t_transition + 3
+                  and r[-1]["t"] - r[0]["t"] >= 4.0), None)
+
+    # ---- gate 1: VSLAM continuity ----
+    dts = np.diff(ts)
+    win = (ts[:-1] > t_transition - 10) & (ts[:-1] < t_transition + 10)
+    gate1 = {
+        "traj_points": int(len(ts)),
+        "traj_span_s": round(float(ts[-1] - ts[0]), 1),
+        "srt_span_s": round(float(srt_dur), 1),
+        "max_gap_s": round(float(dts.max()), 2) if len(dts) else None,
+        "max_gap_at_threshold_s": round(float(dts[win].max()), 2) if win.any() else None,
+        "pass": bool(len(dts) and (not win.any() or dts[win].max() <= 1.0)),
+    }
+
+    # ---- gate 2: anchor quality ----
+    gate2 = {
+        "exterior_fix_s": round(ext[-1]["t"] - ext[0]["t"], 1),
+        "n_fixes": len(ext),
+        "sats_min": min((b["sats"] for b in ext if b["sats"] is not None), default=None),
+        "t_transition_s": round(t_transition, 1),
+        "pass": (ext[-1]["t"] - ext[0]["t"]) >= min_exterior_s,
+    }
+
+    # ---- gate 3: Umeyama georef on the exterior window ----
+    X, Y = [], []
+    for b in ext:
+        i = int(np.searchsorted(ts, b["t"]))
+        if i <= 0 or i >= len(ts):
+            continue
+        w = (b["t"] - ts[i - 1]) / max(1e-9, ts[i] - ts[i - 1])
+        X.append(P[i - 1] * (1 - w) + P[i] * w)
+        Y.append(enu(b))
+    X, Y = np.array(X), np.array(Y)
+    if len(X) < 8:
+        return {"error": f"only {len(X)} GPS<->VSLAM pairs in the exterior window",
+            "gate1": gate1, "gate2": gate2}
+    s, Rm, tv = _umeyama3(X, Y)
+    res = Y - (s * (Rm @ X.T).T + tv)
+    rms = float(np.sqrt((res ** 2).sum(1).mean()))
+    gate3 = {"n_pairs": int(len(X)), "scale_ft_per_unit": round(s, 4),
+             "rms_ft": round(rms, 2), "pass": rms < 6.0}
+
+    # ---- gate 4: dual-anchor scale ----
+    gate4 = {"gps_fpu": round(s, 4), "ceiling_fpu": ceiling_fpu or None}
+    if ceiling_fpu > 0:
+        gate4["delta_pct"] = round(100.0 * (s - ceiling_fpu) / ceiling_fpu, 2)
+        gate4["pass"] = abs(gate4["delta_pct"]) < 5.0
+    else:
+        gate4["note"] = "no ceiling scale supplied yet — rerun with --ceiling-fpu after the layout stage"
+
+    # ---- gate 5: closure (out-and-back) ----
+    if reacq:
+        Xr, Yr = [], []
+        for b in reacq:
+            i = int(np.searchsorted(ts, b["t"]))
+            if i <= 0 or i >= len(ts):
+                continue
+            w = (b["t"] - ts[i - 1]) / max(1e-9, ts[i] - ts[i - 1])
+            Xr.append(P[i - 1] * (1 - w) + P[i] * w)
+            Yr.append(enu(b))
+        if Xr:
+            pred = s * (Rm @ np.array(Xr).T).T + tv
+            drift = float(np.linalg.norm((np.array(Yr) - pred)[:, :2], axis=1).mean())
+            gate5 = {"reacq_fixes": len(Xr), "drift_ft": round(drift, 2), "pass": drift < 10.0}
+        else:
+            gate5 = {"note": "reacquisition run had no overlapping trajectory"}
+    else:
+        gate5 = {"note": "not flown (no GPS reacquisition — crash-ended or single crossing)"}
+
+    # ---- gate 6: north tie ----
+    e_east = Rm.T @ np.array([1.0, 0, 0])   # ENU east expressed in VSLAM frame
+    heading = float(np.degrees(np.arctan2(e_east[1], e_east[0])))
+    gate6 = {"vslam_to_east_deg": round(heading, 1),
+             "note": "verify visually against the satellite footprint"}
+
+    # ---- exhibit: GPS track vs transformed VSLAM track ----
+    G = np.array([enu(b) for b in clean])[:, :2]
+    V = (s * (Rm @ P.T).T + tv)[:, :2]
+    allp = np.vstack([G, V])
+    lo_, hi_ = allp.min(0), allp.max(0)
+    span = max(float((hi_ - lo_).max()), 1.0)
+    Wp = 1200
+    def px(p):
+        q = (p - lo_) / span
+        return (int(60 + q[0] * (Wp - 120)), int(Wp - 60 - q[1] * (Wp - 120)))
+    img = np.full((Wp, Wp, 3), 16, np.uint8)
+    for arr, col in ((V, (255, 220, 80)), (G, (60, 200, 90))):
+        for a, b2 in zip(arr[:-1], arr[1:]):
+            cv2.line(img, px(a), px(b2), col, 2, cv2.LINE_AA)
+    cv2.circle(img, px(np.array(enu(ext[-1]))[:2]), 9, (60, 60, 255), 2)
+    cv2.putText(img, f"{slug}  GPS(green) vs VSLAM->ENU(gold)  rms {rms:.1f}ft  scale {s:.3f}ft/u",
+                (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (235, 230, 220), 1, cv2.LINE_AA)
+    cv2.putText(img, f"transition at t={t_transition:.0f}s (red)", (20, 58),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (140, 140, 220), 1, cv2.LINE_AA)
+    ok1, buf = cv2.imencode(".png", img)
+    if ok1:
+        s3.put_object(Bucket=R2_BUCKET, Key=f"labs/{slug}-crossboundary.png",
+                      Body=buf.tobytes(), ContentType="image/png")
+
+    report = {"slug": slug, "srt_key": srt_key,
+              "gate1_continuity": gate1, "gate2_anchor": gate2, "gate3_georef": gate3,
+              "gate4_dual_scale": gate4, "gate5_closure": gate5, "gate6_north": gate6,
+              "exhibit": f"labs/{slug}-crossboundary.png"}
+    s3.put_object(Bucket=R2_BUCKET, Key=f"layout/{slug}/crossboundary.json",
+                  Body=json.dumps(report, indent=1).encode(), ContentType="application/json")
+    print(json.dumps(report, indent=1))
+    return report
+
+
+@app.local_entrypoint()
+def crossboundary(slug: str, srt_key: str, ceiling_fpu: float = 0.0, fps: float = 30.0):
+    """modal run modal_app.py::crossboundary --slug tucson-castilla --srt-key projects/tucson-castilla/telemetry/<id>.srt"""
+    print(cross_boundary.remote(slug, srt_key, ceiling_fpu=ceiling_fpu, fps=fps))
