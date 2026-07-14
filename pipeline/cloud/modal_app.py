@@ -5358,14 +5358,65 @@ def _parse_srt_blocks(txt: str) -> list:
         alt = re.search(r"(?:rel_alt|abs_alt|altitude)\s*[:=]\s*([-\d.]+)", b, re.I)
         sats = re.search(r"satellites?\s*[:=]\s*(\d+)", b, re.I)
         yaw = re.search(r"gb_yaw\s*[:=]\s*([-\d.]+)", b, re.I)
+        iso = re.search(r"\[iso\s*[:=]\s*(\d+)", b, re.I)
+        shut = re.search(r"shutter\s*[:=]\s*1/([\d.]+)", b, re.I)
         out.append({
             "t": t,
             "lat": la, "lon": lo,
             "alt": float(alt[1]) if alt else None,
             "sats": int(sats[1]) if sats else None,
             "yaw": float(yaw[1]) if yaw else None,
+            "iso": int(iso[1]) if iso else None,
+            "shutter_s": 1.0 / float(shut[1]) if shut and float(shut[1]) > 0 else None,
         })
     return out
+
+
+def _exposure_windows(blocks, min_exterior_s):
+    """Indoor/outdoor segmentation from the camera's own exposure telemetry.
+    Signal = iso * shutter_s (scene darkness): desert exterior ~0.06, interior
+    ~5+ — a two-decade step at the threshold. Returns (t_transition, windows)
+    where windows = list of (t0, t1, 'exterior'|'interior'), or (None, [])
+    when exposure fields are absent (fallback to GPS-run logic)."""
+    import numpy as np
+    ev = [(b["t"], b["iso"] * b["shutter_s"]) for b in blocks
+          if b.get("iso") and b.get("shutter_s")]
+    if len(ev) < 50:
+        return None, []
+    t = np.array([e[0] for e in ev])
+    x = np.log10(np.array([e[1] for e in ev]))
+    # rolling median (~1 s) to kill single-frame exposure hunts
+    k = max(1, int(len(x) / max(1.0, t[-1]) ))  # ≈ blocks per second
+    k = max(3, k | 1)
+    pad = k // 2
+    xs = np.convolve(np.pad(x, pad, mode="edge"), np.ones(k) / k, mode="valid")
+    base = np.median(xs[t < min(min_exterior_s, t[-1] / 3)])      # bright exterior baseline
+    dark = np.percentile(xs, 90)                                   # interior plateau
+    if dark - base < 1.0:
+        return None, []                                            # no real cliff (never went inside?)
+    thr = (base + dark) / 2.0
+    inside = xs > thr
+    # sustained-state segmentation (>= 2 s to flip)
+    windows, cur_state, t0 = [], bool(inside[0]), t[0]
+    run_start = 0
+    for i in range(1, len(inside)):
+        if inside[i] != cur_state:
+            j = i
+            hold = 0.0
+            while j < len(inside) and inside[j] != cur_state:
+                hold = t[j] - t[i]
+                if hold >= 2.0:
+                    break
+                j += 1
+            if hold >= 2.0:
+                windows.append((t0, t[i], "interior" if cur_state else "exterior"))
+                cur_state, t0 = inside[i], t[i]
+    windows.append((t0, t[-1], "interior" if cur_state else "exterior"))
+    ext = [w for w in windows if w[2] == "exterior"]
+    if not ext:
+        return None, []
+    t_transition = ext[0][1]
+    return float(t_transition), windows
 
 
 def _umeyama3(X, Y):
@@ -5441,18 +5492,36 @@ def cross_boundary(slug: str, srt_key: str, ceiling_fpu: float = 0.0,
         d = np.linalg.norm(np.array(enu(b)[:2]) - np.array(enu(clean[-1])[:2]))
         if d / dt < 45.0:
             clean.append(b)
-    # contiguous runs (gap <= 2 s)
-    runs, cur = [], [clean[0]]
-    for b in clean[1:]:
-        if b["t"] - cur[-1]["t"] <= 2.0:
-            cur.append(b)
-        else:
-            runs.append(cur); cur = [b]
-    runs.append(cur)
-    ext = next((r for r in runs if r[-1]["t"] - r[0]["t"] >= min_exterior_s), runs[0])
-    t_transition = ext[-1]["t"]  # last clean fix before the wall
-    reacq = next((r for r in runs if r is not ext and r[0]["t"] > t_transition + 3
-                  and r[-1]["t"] - r[0]["t"] >= 4.0), None)
+    # ---- indoor/outdoor segmentation ----
+    # Preferred: the exposure cliff (DJI keeps publishing stale/drifting GPS
+    # indoors, so fix presence can't mark the wall — but iso*shutter can).
+    t_exp, exp_windows = _exposure_windows(blocks, min_exterior_s)
+    if t_exp is not None:
+        ext = [b for b in clean if b["t"] <= t_exp - 1.0]
+        if len(ext) < 10:
+            ext = [b for b in clean if b["t"] <= t_exp]
+        t_transition = t_exp
+        # reacquisition = a later exterior window (out-and-back)
+        later_ext = [w for w in exp_windows if w[2] == "exterior" and w[0] > t_exp + 3]
+        reacq = None
+        if later_ext:
+            w0 = later_ext[0]
+            reacq = [b for b in clean if w0[0] + 1.0 <= b["t"] <= w0[1]] or None
+        seg_method = "exposure-cliff"
+    else:
+        # Fallback: contiguous valid-fix runs (older SRTs that zero out indoors)
+        runs, cur = [], [clean[0]]
+        for b in clean[1:]:
+            if b["t"] - cur[-1]["t"] <= 2.0:
+                cur.append(b)
+            else:
+                runs.append(cur); cur = [b]
+        runs.append(cur)
+        ext = next((r for r in runs if r[-1]["t"] - r[0]["t"] >= min_exterior_s), runs[0])
+        t_transition = ext[-1]["t"]
+        reacq = next((r for r in runs if r is not ext and r[0]["t"] > t_transition + 3
+                      and r[-1]["t"] - r[0]["t"] >= 4.0), None)
+        seg_method = "gps-fix-runs"
 
     # ---- gate 1: VSLAM continuity ----
     dts = np.diff(ts)
@@ -5472,6 +5541,7 @@ def cross_boundary(slug: str, srt_key: str, ceiling_fpu: float = 0.0,
         "n_fixes": len(ext),
         "sats_min": min((b["sats"] for b in ext if b["sats"] is not None), default=None),
         "t_transition_s": round(t_transition, 1),
+        "segmentation": seg_method,
         "pass": (ext[-1]["t"] - ext[0]["t"]) >= min_exterior_s,
     }
 
