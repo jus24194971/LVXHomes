@@ -147,13 +147,32 @@ export function PlanEditor() {
   }, [sheet?.rotation, sheet?.flipX, sheet?.width, sheet?.height]);
 
   // ---------- zoom / pan (viewBox-driven; toPlan stays exact via getScreenCTM) ----------
-  const fitView = useCallback(() => {
+  // The visible "world" = the sheet UNION every base layer + the trace, because a
+  // locked/oversized plan image can extend well past the sheet. Zoom-out and fit
+  // clamp to THIS, so you can always pull back to see the whole plan.
+  const contentBounds = useCallback(() => {
     const w = sheet?.width ?? 100, h = sheet?.height ?? 70;
+    let minX = 0, minY = 0, maxX = w, maxY = h;
+    const grow = (x: number, y: number, bw: number, bh: number) => {
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x + bw > maxX) maxX = x + bw;
+      if (y + bh > maxY) maxY = y + bh;
+    };
+    for (const L of sheet?.layers ?? []) grow(L.x ?? 0, L.y ?? 0, L.width ?? w, L.height ?? h);
+    if (trace) { const tw = w * trace.scale; grow(trace.x, trace.y, tw, tw); }
+    return { minX, minY, maxX, maxY };
+  }, [sheet?.width, sheet?.height, sheet?.layers, trace]);
+
+  const fitView = useCallback(() => {
+    const b = contentBounds();
+    const w = b.maxX - b.minX, h = b.maxY - b.minY;
+    const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
     const a = ((sheet?.rotation ?? 0) * Math.PI) / 180;
     const bw = Math.abs(w * Math.cos(a)) + Math.abs(h * Math.sin(a)); // rotated bbox
     const bh = Math.abs(w * Math.sin(a)) + Math.abs(h * Math.cos(a));
-    return { x: w / 2 - bw / 2 - 2, y: h / 2 - bh / 2 - 2, w: bw + 4, h: bh + 4 };
-  }, [sheet?.width, sheet?.height, sheet?.rotation]);
+    return { x: cx - bw / 2 - 2, y: cy - bh / 2 - 2, w: bw + 4, h: bh + 4 };
+  }, [contentBounds, sheet?.rotation]);
   // refit when switching sheets
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { setView(fitView()); }, [sheetIdx, sheet?.id]);
@@ -161,18 +180,19 @@ export function PlanEditor() {
   const zoomAt = useCallback(
     (factor: number, ox: number, oy: number) => {
       const el = svgRef.current;
-      if (!el || !sheet) return;
+      if (!el) return;
       const rect = el.getBoundingClientRect();
       setView((v) => {
         const planX = v.x + (ox / rect.width) * v.w;
         const planY = v.y + (oy / rect.height) * v.h;
-        const fw = sheet.width + 4, fh = sheet.height + 4;
+        const b = contentBounds();
+        const fw = b.maxX - b.minX + 4, fh = b.maxY - b.minY + 4;
         const nw = Math.max(fw * 0.04, Math.min(v.w * factor, fw));
         const nh = nw * (fh / fw);
         return { x: planX - (ox / rect.width) * nw, y: planY - (oy / rect.height) * nh, w: nw, h: nh };
       });
     },
-    [sheet?.width, sheet?.height],
+    [contentBounds],
   );
 
   // wheel-to-zoom (non-passive so we can stop the page from scrolling)
