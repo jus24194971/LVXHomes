@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Plan, PlanSheet, PlanZone, PlanZoneKind } from "@/data/plans";
+import type { Plan, PlanSheet, PlanZone, PlanZoneKind, PlanWall } from "@/data/plans";
 import { PLANS, layerTransform } from "@/data/plans";
 import { ZONE_FILL } from "@/components/tour/plan";
 import { smoothPathD, zoneFontSize } from "@/lib/plan-geometry";
@@ -28,7 +28,7 @@ const snap = (n: number) => Math.round(n / SNAP) * SNAP;
 
 const KINDS: PlanZoneKind[] = ["room", "structure", "outdoor", "water", "hardscape"];
 
-type Tool = "select" | "zone" | "stroke" | "trace";
+type Tool = "select" | "zone" | "stroke" | "trace" | "measure";
 
 type TraceImg = { url: string; opacity: number; scale: number; x: number; y: number };
 
@@ -37,7 +37,22 @@ type Drag =
   | { type: "zone"; zi: number; start: [number, number]; orig: [number, number][] }
   | { type: "layer"; li: number; start: [number, number]; origX: number; origY: number }
   | { type: "trace"; start: [number, number]; origX: number; origY: number }
+  | { type: "wallpt"; wi: number; end: "a" | "b" }
   | null;
+
+/** Segment length in plan units — which are ≈ feet, so this doubles as the
+ *  "drawn" dimension shown next to the lased number. */
+const wallLen = (w: PlanWall) => Math.hypot(w.b[0] - w.a[0], w.b[1] - w.a[1]);
+
+/** Feet (decimal) → builder ft-in, e.g. 18.33 → `18'4"`. */
+const fmtFeet = (ft: number) => {
+  let f = Math.floor(ft);
+  let inch = Math.round((ft - f) * 12);
+  if (inch === 12) { f += 1; inch = 0; }
+  return inch ? `${f}'${inch}"` : `${f}'`;
+};
+
+const wallId = () => `w${Math.random().toString(36).slice(2, 8)}`;
 
 const newSheet = (kind: "floor" | "site", n: number): PlanSheet => ({
   id: `sheet-${n}`,
@@ -61,6 +76,8 @@ export function PlanEditor() {
   const [selZone, setSelZone] = useState<number | null>(null);
   const [selVertex, setSelVertex] = useState<number | null>(null);
   const [selLayer, setSelLayer] = useState<number | null>(null);
+  const [selWall, setSelWall] = useState<number | null>(null); // measured-wall selection
+  const [wallStart, setWallStart] = useState<[number, number] | null>(null); // 1st click of a new wall
   const [traces, setTraces] = useState<Record<string, TraceImg>>({});
   const [importText, setImportText] = useState("");
   const [liveSlugs, setLiveSlugs] = useState<string[]>([]);
@@ -96,6 +113,8 @@ export function PlanEditor() {
     setSheets(JSON.parse(prev) as PlanSheet[]);
     setSelZone(null);
     setSelVertex(null);
+    setSelWall(null);
+    setWallStart(null);
   }, []);
 
   const mutateSheet = useCallback(
@@ -196,6 +215,7 @@ export function PlanEditor() {
       }));
       setSelZone(sheet.zones.length);
       setSelVertex(null);
+      setSelWall(null);
       setTool("select");
     } else if (tool === "stroke" && draft.length >= 2) {
       snapshot();
@@ -207,6 +227,18 @@ export function PlanEditor() {
   const onSvgClick = useCallback(
     (e: React.MouseEvent) => {
       if (panMode) return; // Space-drag is panning, not drawing
+      if (tool === "measure") {
+        const pt = toPlan(e);
+        if (!wallStart) { setWallStart(pt); return; } // first click drops the start
+        if (Math.hypot(pt[0] - wallStart[0], pt[1] - wallStart[1]) < SNAP) return; // ignore a zero-length tap
+        snapshot();
+        const nextIdx = sheet.walls?.length ?? 0;
+        mutateSheet((s) => ({ ...s, walls: [...(s.walls ?? []), { id: wallId(), a: wallStart, b: pt }] }));
+        setSelWall(nextIdx);
+        setSelZone(null);
+        setWallStart(null);
+        return;
+      }
       if (tool !== "zone" && tool !== "stroke") return;
       const pt = toPlan(e);
       // Closing click on the first vertex finishes a zone.
@@ -219,7 +251,7 @@ export function PlanEditor() {
       }
       setDraft((d) => [...d, pt]);
     },
-    [tool, draft, toPlan, commitDraft, panMode],
+    [tool, draft, toPlan, commitDraft, panMode, wallStart, sheet, mutateSheet, snapshot],
   );
 
   // ---------- select / drag ----------
@@ -237,9 +269,10 @@ export function PlanEditor() {
         return;
       }
       if (tool !== "select") return;
-      // background press clears selection (zones/vertices stop propagation)
+      // background press clears selection (zones/vertices/walls stop propagation)
       setSelZone(null);
       setSelVertex(null);
+      setSelWall(null);
     },
     [tool, trace, toPlan, panMode, view],
   );
@@ -288,6 +321,11 @@ export function PlanEditor() {
             li === drag.li ? { ...L, x: drag.origX + dx, y: drag.origY + dy } : L,
           ),
         }));
+      } else if (drag.type === "wallpt") {
+        mutateSheet((s) => ({
+          ...s,
+          walls: s.walls?.map((w, wi) => (wi === drag.wi ? { ...w, [drag.end]: pt } : w)),
+        }));
       } else if (drag.type === "trace" && sheet) {
         const dx = pt[0] - drag.start[0];
         const dy = pt[1] - drag.start[1];
@@ -315,7 +353,16 @@ export function PlanEditor() {
         setDraft([]);
         setSelZone(null);
         setSelVertex(null);
+        setSelWall(null);
+        setWallStart(null);
       } else if (e.key === "Delete" || e.key === "Backspace") {
+        if (selWall !== null) {
+          e.preventDefault();
+          snapshot();
+          mutateSheet((s) => ({ ...s, walls: s.walls?.filter((_, i) => i !== selWall) }));
+          setSelWall(null);
+          return;
+        }
         if (selZone === null) return;
         e.preventDefault();
         snapshot();
@@ -339,7 +386,7 @@ export function PlanEditor() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [commitDraft, selZone, selVertex, sheet, mutateSheet, snapshot, undo]);
+  }, [commitDraft, selZone, selVertex, selWall, sheet, mutateSheet, snapshot, undo]);
 
   // ---------- zone meta ----------
   const updateZone = useCallback(
@@ -363,6 +410,8 @@ export function PlanEditor() {
     setSheetIdx(0);
     setSelZone(null);
     setSelVertex(null);
+    setSelWall(null);
+    setWallStart(null);
     setDraft([]);
   }, []);
 
@@ -397,6 +446,12 @@ export function PlanEditor() {
     async (slugRaw: string) => {
       const slug = slugRaw.trim();
       if (!slug) return;
+      // Suppress autosave for the ENTIRE async load window. The property picker
+      // sets tourSlug=new synchronously while `sheets` still holds the OUTGOING
+      // plan; without this a debounced save could fire mid-load and write the old
+      // sheets under the new slug (clobbering that property's saved plan, walls
+      // included). loadPlan re-arms this flag when the data actually lands.
+      justLoaded.current = true;
       try {
         const doc = await loadDoc<Plan>("plan", slug);
         if (doc && Array.isArray(doc.sheets)) {
@@ -547,11 +602,26 @@ export function PlanEditor() {
   const labelSize = Math.max(sheet.width, sheet.height) * 0.03;
   const handleR = Math.max(sheet.width, sheet.height) * 0.012;
 
+  // plan coords → on-screen coords (undo sheet rotation + flip) so wall
+  // dimension labels stay upright, exactly like the room labels do.
+  const toScreen = ([x, y]: [number, number]): [number, number] => {
+    const rotg = sheet.rotation ?? 0, flg = sheet.flipX ?? false;
+    let lx = x, ly = y;
+    if (rotg) {
+      const a = (rotg * Math.PI) / 180, hx = sheet.width / 2, hy = sheet.height / 2;
+      const dx = x - hx, dy = y - hy;
+      lx = hx + dx * Math.cos(a) - dy * Math.sin(a);
+      ly = hy + dx * Math.sin(a) + dy * Math.cos(a);
+    }
+    if (flg) lx = sheet.width - lx;
+    return [lx, ly];
+  };
+
   const toolBtn = (t: Tool, label: string) => (
     <button
       key={t}
       type="button"
-      onClick={() => { setTool(t); setDraft([]); }}
+      onClick={() => { setTool(t); setDraft([]); setWallStart(null); }}
       className={cn(
         "rounded border px-3 py-1.5 font-sans text-[0.6875rem] uppercase tracking-[0.14em] transition-colors",
         tool === t
@@ -572,7 +642,7 @@ export function PlanEditor() {
             <button
               key={s.id}
               type="button"
-              onClick={() => { setSheetIdx(i); setSelZone(null); setSelVertex(null); setDraft([]); }}
+              onClick={() => { setSheetIdx(i); setSelZone(null); setSelVertex(null); setSelWall(null); setWallStart(null); setDraft([]); }}
               className={cn(
                 "rounded-full px-4 py-1.5 font-sans text-[0.6875rem] uppercase tracking-[0.16em] transition-colors",
                 i === sheetIdx ? "bg-champagne text-ink" : "text-paper/70 hover:text-champagne",
@@ -583,14 +653,14 @@ export function PlanEditor() {
           ))}
           <button
             type="button"
-            onClick={() => { snapshot(); setSheets((p) => [...p, newSheet("floor", p.length + 1)]); setSheetIdx(sheets.length); }}
+            onClick={() => { snapshot(); setSheets((p) => [...p, newSheet("floor", p.length + 1)]); setSheetIdx(sheets.length); setSelZone(null); setSelVertex(null); setSelWall(null); setWallStart(null); }}
             className="rounded-full border border-paper/30 px-3 py-1.5 font-sans text-[0.6875rem] uppercase tracking-[0.14em] text-paper/70 hover:border-champagne/60 hover:text-champagne"
           >
             + Floor
           </button>
           <button
             type="button"
-            onClick={() => { snapshot(); setSheets((p) => [...p, newSheet("site", p.length + 1)]); setSheetIdx(sheets.length); }}
+            onClick={() => { snapshot(); setSheets((p) => [...p, newSheet("site", p.length + 1)]); setSheetIdx(sheets.length); setSelZone(null); setSelVertex(null); setSelWall(null); setWallStart(null); }}
             className="rounded-full border border-paper/30 px-3 py-1.5 font-sans text-[0.6875rem] uppercase tracking-[0.14em] text-paper/70 hover:border-champagne/60 hover:text-champagne"
           >
             + Grounds
@@ -601,6 +671,7 @@ export function PlanEditor() {
           {toolBtn("select", "Select")}
           {toolBtn("zone", "Draw zone")}
           {toolBtn("stroke", "Draw wall")}
+          {toolBtn("measure", "Measure wall")}
           <label className="cursor-pointer rounded border border-paper/30 px-3 py-1.5 font-sans text-[0.6875rem] uppercase tracking-[0.14em] text-paper/70 hover:border-champagne/60 hover:text-champagne">
             Trace image…
             <input type="file" accept="image/*" className="hidden" onChange={(e) => onTraceFile(e.target.files?.[0])} />
@@ -677,7 +748,7 @@ export function PlanEditor() {
           style={panMode ? { cursor: panRef.current ? "grabbing" : "grab" } : undefined}
           className={cn(
             "block w-full touch-none border border-champagne/30 bg-[#FBF8F1]",
-            !panMode && (tool === "zone" || tool === "stroke") && "cursor-crosshair",
+            !panMode && (tool === "zone" || tool === "stroke" || tool === "measure") && "cursor-crosshair",
             !panMode && tool === "trace" && trace && "cursor-move",
           )}
           onClick={onSvgClick}
@@ -813,6 +884,7 @@ export function PlanEditor() {
                     e.stopPropagation();
                     setSelZone(zi);
                     setSelVertex(null);
+                    setSelWall(null);
                     dragRef.current = { type: "zone", zi, start: toPlan(e), orig: z.points.map((p) => [...p] as [number, number]) };
                   }}
                 />
@@ -853,6 +925,50 @@ export function PlanEditor() {
               </g>
             );
           })}
+
+          {/* measured walls — click to select, drag either end, type the lased length.
+              Green once measured, amber while still just drawn. */}
+          {sheet.walls?.map((w, wi) => {
+            const sel = wi === selWall;
+            const w0 = Math.max(sheet.width, sheet.height);
+            return (
+              <g key={w.id}>
+                {/* transparent hit-line so a thin wall is easy to click — kept ≈ the
+                    visible halo width so it doesn't blanket-block zone clicks beneath it */}
+                <line
+                  x1={w.a[0]} y1={w.a[1]} x2={w.b[0]} y2={w.b[1]}
+                  stroke="transparent" strokeWidth={w0 * 0.02} strokeLinecap="round"
+                  style={{ cursor: tool === "select" ? "pointer" : undefined, pointerEvents: tool === "select" ? "stroke" : "none" }}
+                  onPointerDown={(e) => {
+                    if (tool !== "select" || panMode) return;
+                    e.stopPropagation();
+                    setSelWall(wi); setSelZone(null); setSelVertex(null);
+                  }}
+                />
+                <line x1={w.a[0]} y1={w.a[1]} x2={w.b[0]} y2={w.b[1]}
+                  stroke="#FBF8F1" strokeOpacity={0.85} strokeWidth={w0 * 0.018} strokeLinecap="round" className="pointer-events-none" />
+                <line x1={w.a[0]} y1={w.a[1]} x2={w.b[0]} y2={w.b[1]}
+                  stroke={sel ? "#A6863F" : w.measured ? "#1F6F45" : "#9A7A2E"}
+                  strokeWidth={w0 * (sel ? 0.011 : 0.008)} strokeLinecap="round" className="pointer-events-none" />
+                {sel && tool === "select" &&
+                  (["a", "b"] as const).map((end) => (
+                    <circle key={end} cx={w[end][0]} cy={w[end][1]} r={handleR}
+                      fill="#FBF8F1" stroke="#A6863F" strokeWidth={0.3} className="cursor-grab"
+                      onPointerDown={(e) => {
+                        if (panMode) return;
+                        e.stopPropagation();
+                        snapshot();
+                        dragRef.current = { type: "wallpt", wi, end };
+                      }}
+                    />
+                  ))}
+              </g>
+            );
+          })}
+          {/* in-progress measured wall: the dropped start point */}
+          {tool === "measure" && wallStart && (
+            <circle cx={wallStart[0]} cy={wallStart[1]} r={handleR * 1.3} fill="#A6863F" className="pointer-events-none" />
+          )}
 
           {/* draft */}
           {draft.length > 0 && (
@@ -921,6 +1037,28 @@ export function PlanEditor() {
           })}
           </g>
           )}
+
+          {/* wall dimension labels — upright. The lased number once entered, else a
+              faint drawn length for just the selected wall (so the plan stays clean). */}
+          {sheet.walls?.map((w, wi) => {
+            const [lx, ly] = toScreen([(w.a[0] + w.b[0]) / 2, (w.a[1] + w.b[1]) / 2]);
+            const sel = wi === selWall;
+            const text = w.measured ? w.measured : sel ? `≈ ${fmtFeet(wallLen(w))}` : "";
+            if (!text) return null;
+            const fs = labelSize * 0.72;
+            const halfW = text.length * fs * 0.32 + fs * 0.4;
+            return (
+              <g key={`wl-${w.id}`} className="pointer-events-none select-none">
+                <rect x={lx - halfW} y={ly - fs * 0.85} width={halfW * 2} height={fs * 1.7} rx={fs * 0.3}
+                  fill="#FBF8F1" fillOpacity={0.92} stroke={sel ? "#A6863F" : "none"} strokeWidth={0.2} />
+                <text x={lx} y={ly} textAnchor="middle" dominantBaseline="central" fontSize={fs}
+                  fontWeight={w.measured ? 700 : 400} fill={w.measured ? "#1F6F45" : "#9A7A2E"}
+                  className="font-sans tabular-nums">
+                  {text}
+                </text>
+              </g>
+            );
+          })}
         </svg>
       </div>
 
@@ -942,7 +1080,7 @@ export function PlanEditor() {
               {sheets.length > 1 && (
                 <button
                   type="button"
-                  onClick={() => { snapshot(); setSheets((p) => p.filter((_, i) => i !== sheetIdx)); setSheetIdx(0); }}
+                  onClick={() => { snapshot(); setSheets((p) => p.filter((_, i) => i !== sheetIdx)); setSheetIdx(0); setSelZone(null); setSelVertex(null); setSelWall(null); setWallStart(null); }}
                   className="ml-auto text-paper/50 hover:text-champagne"
                 >
                   Delete sheet
@@ -1127,7 +1265,7 @@ export function PlanEditor() {
                 <li key={z.id}>
                   <button
                     type="button"
-                    onClick={() => { setTool("select"); setSelZone(zi); setSelVertex(null); }}
+                    onClick={() => { setTool("select"); setSelZone(zi); setSelVertex(null); setSelWall(null); }}
                     className="text-paper/75 hover:text-champagne"
                   >
                     {z.label} <span className="text-paper/35">· {z.kind}{z.panoId ? " · pano" : z.videoTime !== undefined ? ` · ${z.videoTime}s` : ""}</span>
@@ -1144,6 +1282,77 @@ export function PlanEditor() {
             >
               Remove last wall ({sheet.strokes?.length})
             </button>
+          )}
+        </div>
+
+        {/* measured walls — click a wall on the plan, type its lased length */}
+        <div className="rounded border border-paper/15 p-4">
+          <p className="font-display text-[0.6875rem] uppercase tracking-[0.2em] text-champagne">
+            {selWall !== null && sheet.walls?.[selWall] ? "Selected wall" : "Walls"}
+          </p>
+          {selWall !== null && sheet.walls?.[selWall] ? (
+            <div className="mt-3 flex flex-col gap-2 text-xs">
+              <label className="flex flex-col gap-1 text-paper/60">
+                Lased length
+                <input
+                  autoFocus
+                  value={sheet.walls[selWall].measured ?? ""}
+                  onChange={(e) =>
+                    mutateSheet((s) => ({
+                      ...s,
+                      walls: s.walls?.map((w, i) => (i === selWall ? { ...w, measured: e.target.value || undefined } : w)),
+                    }))
+                  }
+                  placeholder={`e.g. ${fmtFeet(wallLen(sheet.walls[selWall]))}`}
+                  className="rounded border border-paper/20 bg-transparent px-2 py-1.5 text-sm text-paper outline-none focus:border-champagne"
+                />
+              </label>
+              <p className="text-paper/45">
+                Drawn ≈ {fmtFeet(wallLen(sheet.walls[selWall]))}
+                <span className="text-paper/30"> · {wallLen(sheet.walls[selWall]).toFixed(1)} ft on plan</span>
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  snapshot();
+                  mutateSheet((s) => ({ ...s, walls: s.walls?.filter((_, i) => i !== selWall) }));
+                  setSelWall(null);
+                }}
+                className="self-start text-paper/50 hover:text-champagne"
+              >
+                Delete wall
+              </button>
+            </div>
+          ) : (
+            <>
+              <p className="mt-1 text-[0.65rem] leading-relaxed text-paper/45">
+                <b className="text-paper/70">Measure wall</b> tool: click a start, then an end, to lay a
+                wall over the plan. In <b className="text-paper/70">Select</b>, click any wall to type its
+                lased length — it prints right on the wall.
+              </p>
+              <ul className="mt-3 flex max-h-40 flex-col gap-1 overflow-auto text-xs">
+                {(sheet.walls?.length ?? 0) === 0 && <li className="text-paper/40">No walls yet →</li>}
+                {sheet.walls?.map((w, wi) => (
+                  <li key={w.id}>
+                    <button
+                      type="button"
+                      onClick={() => { setTool("select"); setSelWall(wi); setSelZone(null); }}
+                      className="text-left text-paper/75 hover:text-champagne"
+                    >
+                      Wall {wi + 1}
+                      <span className={w.measured ? "text-emerald-400/80" : "text-paper/35"}>
+                        {" · "}{w.measured ? w.measured : `≈ ${fmtFeet(wallLen(w))} · unmeasured`}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {(sheet.walls?.length ?? 0) > 0 && (
+                <p className="mt-2 text-[0.65rem] uppercase tracking-[0.14em] text-paper/45">
+                  {sheet.walls!.filter((w) => w.measured).length}/{sheet.walls!.length} measured
+                </p>
+              )}
+            </>
           )}
         </div>
 

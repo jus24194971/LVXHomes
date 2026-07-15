@@ -83,6 +83,19 @@ export function layerTransform(L: PlanLayer, sheetW: number, sheetH: number): st
   return parts.length ? parts.join(" ") : undefined;
 }
 
+/**
+ * A single wall segment you can CLICK to record its lased length — the
+ * "measure onto the plan" workflow. `measured` is free text (`18'4"`) so ft-in
+ * reads naturally in the field; the drawn length (endpoints × sheet scale, i.e.
+ * plan-unit ≈ feet) renders beside it so the field number and the plan agree.
+ */
+export type PlanWall = {
+  id: string;
+  a: [number, number];
+  b: [number, number];
+  measured?: string;
+};
+
 export type PlanSheet = {
   id: string;
   label: string;
@@ -93,6 +106,8 @@ export type PlanSheet = {
   zones: PlanZone[];
   /** Heavy strokes: exterior walls, property boundary, fences. */
   strokes?: [number, number][][];
+  /** Clickable, measurable wall segments — click one, type its lased length. */
+  walls?: PlanWall[];
   /** Flight-path keyframes per chapter id — drives the traveling dot. */
   paths?: Record<string, PlanPathKey[]>;
   /** WGS84 bbox when georeferenced from GPS — enables the Studio's one-click
