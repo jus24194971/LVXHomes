@@ -1003,14 +1003,16 @@ export function PlanEditor() {
               Green once measured, amber while still just drawn. */}
           {sheet.walls?.map((w, wi) => {
             const sel = wi === selWall;
-            const w0 = Math.max(sheet.width, sheet.height);
+            // screen-constant sizing: view.w spans the visible width, so widths taken
+            // as a fraction of it stay hairline-thin at ANY zoom — precision for tight
+            // spots like a fireplace, instead of fattening as you zoom in.
+            const u = view.w;
             return (
               <g key={w.id}>
-                {/* transparent hit-line so a thin wall is easy to click — kept ≈ the
-                    visible halo width so it doesn't blanket-block zone clicks beneath it */}
+                {/* transparent hit-line so a thin wall stays easy to click */}
                 <line
                   x1={w.a[0]} y1={w.a[1]} x2={w.b[0]} y2={w.b[1]}
-                  stroke="transparent" strokeWidth={w0 * 0.02} strokeLinecap="round"
+                  stroke="transparent" strokeWidth={u * 0.012} strokeLinecap="round"
                   style={{ cursor: tool === "select" ? "pointer" : undefined, pointerEvents: tool === "select" ? "stroke" : "none" }}
                   onPointerDown={(e) => {
                     if (tool !== "select" || panMode) return;
@@ -1019,14 +1021,14 @@ export function PlanEditor() {
                   }}
                 />
                 <line x1={w.a[0]} y1={w.a[1]} x2={w.b[0]} y2={w.b[1]}
-                  stroke="#FBF8F1" strokeOpacity={0.85} strokeWidth={w0 * 0.018} strokeLinecap="round" className="pointer-events-none" />
+                  stroke="#FBF8F1" strokeOpacity={0.85} strokeWidth={u * 0.0045} strokeLinecap="round" className="pointer-events-none" />
                 <line x1={w.a[0]} y1={w.a[1]} x2={w.b[0]} y2={w.b[1]}
                   stroke={sel ? "#A6863F" : w.measured ? "#1F6F45" : "#9A7A2E"}
-                  strokeWidth={w0 * (sel ? 0.011 : 0.008)} strokeLinecap="round" className="pointer-events-none" />
+                  strokeWidth={u * (sel ? 0.0032 : 0.0022)} strokeLinecap="round" className="pointer-events-none" />
                 {sel && tool === "select" &&
                   (["a", "b"] as const).map((end) => (
-                    <circle key={end} cx={w[end][0]} cy={w[end][1]} r={handleR}
-                      fill="#FBF8F1" stroke="#A6863F" strokeWidth={0.3} className="cursor-grab"
+                    <circle key={end} cx={w[end][0]} cy={w[end][1]} r={u * 0.006}
+                      fill="#FBF8F1" stroke="#A6863F" strokeWidth={u * 0.0015} className="cursor-grab"
                       onPointerDown={(e) => {
                         if (panMode) return;
                         e.stopPropagation();
@@ -1040,7 +1042,7 @@ export function PlanEditor() {
           })}
           {/* in-progress measured wall: the dropped start point */}
           {tool === "measure" && wallStart && (
-            <circle cx={wallStart[0]} cy={wallStart[1]} r={handleR * 1.3} fill="#A6863F" className="pointer-events-none" />
+            <circle cx={wallStart[0]} cy={wallStart[1]} r={view.w * 0.008} fill="#A6863F" className="pointer-events-none" />
           )}
 
           {/* draft */}
@@ -1118,7 +1120,7 @@ export function PlanEditor() {
             const sel = wi === selWall;
             const text = w.measured ? w.measured : sel ? `≈ ${fmtFeet(wallLen(w))}` : "";
             if (!text) return null;
-            const fs = labelSize * 0.72;
+            const fs = view.w * 0.014; // screen-constant so numbers don't balloon on zoom-in
             const halfW = text.length * fs * 0.32 + fs * 0.4;
             return (
               <g key={`wl-${w.id}`} className="pointer-events-none select-none">
