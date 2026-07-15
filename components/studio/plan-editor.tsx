@@ -510,6 +510,51 @@ export function PlanEditor() {
     [sheet],
   );
 
+  /** Weld the movable trace underlay into a SAVED base layer at its exact current
+   *  position + scale. After this the plan and the measured walls share ONE
+   *  coordinate system: zoom/pan moves them together, and the image persists to
+   *  the doc (baked to a data-URL — the trace's blob: URL wouldn't survive a
+   *  reload). This is the fix for "measurements don't stick to the plan". */
+  const lockTraceAsLayer = useCallback(() => {
+    if (!trace || !sheet) return;
+    const img = new Image();
+    img.onload = () => {
+      const natW = img.naturalWidth || 1;
+      const natH = img.naturalHeight || 1;
+      // downscale so the baked data-URL stays small enough for the plan doc
+      const dw = Math.min(natW, 1600);
+      const dh = Math.max(1, Math.round(dw * (natH / natW)));
+      const cv = document.createElement("canvas");
+      cv.width = dw;
+      cv.height = dh;
+      cv.getContext("2d")?.drawImage(img, 0, 0, dw, dh);
+      let url = trace.url;
+      try {
+        url = cv.toDataURL("image/jpeg", 0.85);
+      } catch {
+        /* tainted canvas — keep the (non-persistent) objectURL rather than fail */
+      }
+      // trace renders at x/y with width = sheet.width*scale, height by aspect
+      const w = sheet.width * trace.scale;
+      const h = w * (natH / natW);
+      snapshot();
+      mutateSheet((s) => ({
+        ...s,
+        layers: [
+          ...(s.layers ?? []),
+          { id: `plan-${s.id}-${(s.layers?.length ?? 0) + 1}`, label: "Plan", url, x: trace.x, y: trace.y, width: w, height: h, opacity: trace.opacity },
+        ],
+      }));
+      setTraces((t) => {
+        const n = { ...t };
+        delete n[sheet.id];
+        return n;
+      });
+      setTool("select");
+    };
+    img.src = trace.url;
+  }, [trace, sheet, mutateSheet, snapshot]);
+
   /** One-click satellite trace: stitch Esri World Imagery tiles for the sheet's
    *  GPS bbox (via the same-origin proxy) and drop the cropped, aligned image in
    *  as the trace — so the path overlays the real grounds and you just draw. */
@@ -684,6 +729,14 @@ export function PlanEditor() {
           {trace && (
             <>
               {toolBtn("trace", "Move trace")}
+              <button
+                type="button"
+                onClick={lockTraceAsLayer}
+                title="Weld the plan into the sheet so it + your measurements zoom/pan together and persist"
+                className="rounded border border-champagne bg-champagne px-3 py-1.5 font-sans text-[0.6875rem] uppercase tracking-[0.14em] text-ink transition-colors hover:bg-champagne/80"
+              >
+                Lock plan ✓
+              </button>
               <label className="flex items-center gap-2 font-sans text-[0.625rem] uppercase tracking-[0.14em] text-paper/60">
                 Dim
                 <input
