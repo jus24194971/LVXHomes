@@ -60,6 +60,10 @@ export type TourChapter = {
    *  the camera's forward (drone heading) sits opposite the equirect center,
    *  so the flight opens facing the direction of travel. */
   startYaw?: number;
+  /** Degrees from the equirect front to compass NORTH. Heading-stabilized
+   *  captures carry one fixed offset (from the flight IMU/compass log); when
+   *  set, the viewer shows a small compass HUD that tracks the view heading. */
+  northYaw?: number;
   hotspots: TourHotspot[];
 };
 

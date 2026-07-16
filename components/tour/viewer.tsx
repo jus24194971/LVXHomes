@@ -130,6 +130,9 @@ export function TourViewer({
   const ringHitsRef = useRef<{ x: number; y: number; r: number; node: HTMLDivElement }[]>([]);
   const panoCache = useRef(new Map<string, THREE.Texture>());
   const readoutRef = useRef<HTMLSpanElement | null>(null);
+  /** Compass HUD needle — rotated imperatively each frame (heading-stabilized
+   *  captures carry a fixed front→north offset in chapter.northYaw). */
+  const compassRef = useRef<HTMLDivElement | null>(null);
 
   const [started, setStarted] = useState(false);
   const [isMobileUi, setIsMobileUi] = useState(false);
@@ -732,6 +735,14 @@ export function TourViewer({
         500 * Math.sin(phi) * Math.sin(theta),
       );
       camera.updateMatrixWorld();
+
+      // Compass HUD: counter-rotate the needle so it always points at compass
+      // north — facing bearing = view yaw minus the chapter's front→north offset.
+      const northYaw = tour.chapters[0]?.northYaw;
+      if (compassRef.current && northYaw != null) {
+        const bearing = norm180(look.lon - FRONT_LON - northYaw);
+        compassRef.current.style.transform = `rotate(${-bearing}deg)`;
+      }
 
       // Project hotspots into the viewport (video mode only).
       const w = mount.clientWidth;
@@ -1746,6 +1757,27 @@ export function TourViewer({
       />
 
       {/* Pano chrome */}
+      {/* Compass HUD — captures with a known front→north offset (chapter.northYaw) */}
+      {started && !pano && tour.chapters[0]?.northYaw != null && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute bottom-[4.5rem] right-4 z-20 flex h-11 w-11 items-center justify-center rounded-full border border-champagne/50 bg-ink/50 backdrop-blur-sm"
+        >
+          <div
+            ref={compassRef}
+            className="relative flex h-full w-full items-center justify-center will-change-transform"
+          >
+            <svg viewBox="0 0 24 24" className="h-7 w-7">
+              <path d="M12 3.5 L14.6 13 L12 11.4 L9.4 13 Z" className="fill-champagne" />
+              <path d="M12 20.5 L9.4 13 L12 14.6 L14.6 13 Z" className="fill-paper/40" />
+            </svg>
+            <span className="absolute top-[2px] font-sans text-[8px] font-semibold tracking-widest text-champagne">
+              N
+            </span>
+          </div>
+        </div>
+      )}
+
       {pano && !fading && (
         <>
           <div className="pointer-events-none absolute inset-x-0 top-0 flex justify-center p-4">
