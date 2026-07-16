@@ -258,8 +258,8 @@ def _write_mask(path: pathlib.Path, w: int, h: int, nadir=0.14, zenith=0.03):
 
 # --- GPU stage --------------------------------------------------------------
 @app.function(image=vslam_image, gpu=GPU_TYPE, volumes={"/scratch": vol},
-              secrets=[r2_secret], timeout=3600)
-def run_vslam(r2_key: str, slug: str) -> dict:
+              secrets=[r2_secret], timeout=10800)
+def run_vslam(r2_key: str, slug: str, frame_step: int = FRAME_STEP) -> dict:
     work = pathlib.Path(f"/scratch/{slug}")
     work.mkdir(parents=True, exist_ok=True)
     raw, norm = work / "raw.mp4", work / "slam.mp4"
@@ -295,7 +295,7 @@ def run_vslam(r2_key: str, slug: str) -> dict:
          "-m", str(norm), "--mask", str(work / "mask.png"),
          "-o", str(db), "-p", str(ply),
          "--eval-log-dir", str(work),
-         "--frame-step", str(FRAME_STEP), "--disable-viewer", "--auto-term"],
+         "--frame-step", str(frame_step), "--disable-viewer", "--auto-term"],
         check=True, cwd=workdir,
     )
     if not ply.exists():
@@ -502,6 +502,670 @@ def _quat2rot(q):
         [s * (x * y + z * w), 1 - s * (x * x + z * z), s * (y * z - x * w)],
         [s * (x * z - y * w), s * (y * z + x * w), 1 - s * (x * x + y * y)],
     ])
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol},
+              timeout=1800, memory=16384)
+def nadir_walls(slug: str, ceiling_ft: float = 10.83, pxft: float = 10.0,
+                wall_lo: float = 1.2, wall_hi: float = 7.5) -> dict:
+    """The house as ONE CONTIGUOUS STRUCTURE — walls are the primitive, not rooms.
+    From the nadir dense cloud: (1) floor-occupancy = the connected interior slab;
+    (2) wall density = vertical point mass in the [wall_lo, wall_hi] ft band (walls
+    light up as continuous shared lines); (3) the building (Manhattan) axis from the
+    dominant wall orientation, and the map rotated axis-aligned. Rooms are the FACES
+    between walls, so they can't pull apart. -> labs/{slug}-walls.jpg"""
+    import io
+    import os
+    import numpy as np
+    import cv2
+
+    s3 = _r2()
+    sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"
+        s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    c = xyz.mean(0)
+    X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::37], full_matrices=False)
+    up = Vt[2].astype("f4")
+    hgt = X @ up
+    # orient up so floor is low
+    if np.percentile(hgt, 50) < 0:
+        up = -up
+        hgt = -hgt
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1)
+    e2 = np.cross(up, e1)
+    floor = float(np.percentile(hgt, 2))
+    ceil_ = float(np.percentile(hgt, 98))
+    fpu = ceiling_ft / max(ceil_ - floor, 1e-6)          # units -> ft
+    hft = (hgt - floor) * fpu
+    p1 = (X @ e1) * fpu
+    p2 = (X @ e2) * fpu
+
+    lo1, hi1 = np.percentile(p1, [0.5, 99.5])
+    lo2, hi2 = np.percentile(p2, [0.5, 99.5])
+    W = int((hi1 - lo1) * pxft) + 1
+    H = int((hi2 - lo2) * pxft) + 1
+    ix = np.clip(((p1 - lo1) * pxft).astype(np.int32), 0, W - 1)
+    iy = np.clip(((p2 - lo2) * pxft).astype(np.int32), 0, H - 1)
+
+    # floor occupancy (near-floor points) = the contiguous interior slab
+    floor_m = (hft > -0.5) & (hft < wall_lo)
+    occ = np.zeros((H, W), np.float32)
+    np.add.at(occ, (iy[floor_m], ix[floor_m]), 1.0)
+    occ = cv2.dilate((occ > 0).astype(np.uint8), np.ones((3, 3), np.uint8), iterations=2)
+    occ = cv2.morphologyEx(occ, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+
+    # wall density = vertical mass in the wall band
+    wall_m = (hft >= wall_lo) & (hft <= wall_hi)
+    wal = np.zeros((H, W), np.float32)
+    np.add.at(wal, (iy[wall_m], ix[wall_m]), 1.0)
+    wal = cv2.GaussianBlur(wal, (0, 0), 1.2)
+    thr = np.percentile(wal[wal > 0], 80) if (wal > 0).any() else 1.0
+    walls = (wal > thr).astype(np.uint8)
+
+    # building (Manhattan) axis from wall-pixel gradient orientation
+    gx = cv2.Sobel(wal, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(wal, cv2.CV_32F, 0, 1, ksize=3)
+    ang = (np.degrees(np.arctan2(gy, gx)) % 90.0)
+    mag = np.hypot(gx, gy)
+    sel = mag > np.percentile(mag, 95)
+    hist = np.histogram(ang[sel], bins=90, range=(0, 90))[0]
+    axis_deg = float(np.argmax(hist))                    # dominant wall angle in [0,90)
+
+    # render: contiguous floor slab (warm) with walls as dark shared lines
+    img = np.full((H, W, 3), 20, np.uint8)
+    img[occ > 0] = (232, 224, 206)          # contiguous interior floor slab
+    img[walls > 0] = (40, 34, 28)           # walls = dark shared dividers
+    # rotate to axis-aligned (Manhattan up)
+    rot = axis_deg if axis_deg <= 45 else axis_deg - 90
+    M = cv2.getRotationMatrix2D((W / 2, H / 2), rot, 1.0)
+    img = cv2.warpAffine(img, M, (W, H), borderValue=(20, 20, 20))
+
+    cov_ft2 = float((occ > 0).sum()) / (pxft * pxft)
+    cv2.putText(img, f"{slug}  CONTIGUOUS FLOOR + WALLS  ~{cov_ft2:,.0f} sqft floor  axis {axis_deg:.0f}deg",
+                (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (245, 240, 230), 1, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    key = f"labs/{slug}-walls.jpg"
+    s3.put_object(Bucket=R2_BUCKET, Key=key, Body=buf.tobytes(), ContentType="image/jpeg")
+    return {"walls": key, "px": [W, H], "floor_sqft": round(cov_ft2), "axis_deg": round(axis_deg, 1),
+            "npts": int(len(xyz))}
+
+
+@app.local_entrypoint()
+def walls_nadir(slug: str, ceiling_ft: float = 10.83):
+    """modal run modal_app.py::walls_nadir --slug tucson-castilla-nadir1"""
+    print(nadir_walls.remote(slug, ceiling_ft=ceiling_ft))
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol},
+              timeout=1800, memory=32768)
+def nadir_structure(slug: str, ceiling_ft: float = 10.83, pxft: float = 12.0,
+                    fill_thresh: float = 0.5) -> dict:
+    """Architectural pass that respects a NON-SQUARE, curved house:
+      - contiguous floor slab -> the building envelope by its OUTER CONTOUR
+        (curves preserved, glass included — glass is 'floor edge with nothing above');
+      - true walls by VERTICAL CONTINUITY (column-fill fraction floor->ceiling), which
+        keeps floor-to-ceiling walls and drops mid-height furniture;
+      - windows/glazing = envelope runs with floor present but low wall mass behind them.
+    No Manhattan snapping. -> labs/{slug}-structure.jpg"""
+    import os
+    import numpy as np
+    import cv2
+
+    s3 = _r2()
+    sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"
+        s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::37], full_matrices=False)
+    up = Vt[2].astype("f4"); hgt = X @ up
+    if np.percentile(hgt, 50) < 0:
+        up = -up; hgt = -hgt
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    floor = float(np.percentile(hgt, 2)); ceil_ = float(np.percentile(hgt, 98))
+    fpu = ceiling_ft / max(ceil_ - floor, 1e-6)
+    hft = (hgt - floor) * fpu
+    p1 = (X @ e1) * fpu; p2 = (X @ e2) * fpu
+    lo1, hi1 = np.percentile(p1, [0.3, 99.7]); lo2, hi2 = np.percentile(p2, [0.3, 99.7])
+    W = int((hi1 - lo1) * pxft) + 1; H = int((hi2 - lo2) * pxft) + 1
+    ix = np.clip(((p1 - lo1) * pxft).astype(np.int32), 0, W - 1)
+    iy = np.clip(((p2 - lo2) * pxft).astype(np.int32), 0, H - 1)
+
+    # ---- vertical-continuity column fill (wall vs furniture) ----
+    band_lo, band_hi = 0.8, ceiling_ft - 1.0
+    NB = 18
+    inb = (hft >= band_lo) & (hft <= band_hi)
+    hbin = np.clip(((hft[inb] - band_lo) / (band_hi - band_lo) * NB).astype(np.int32), 0, NB - 1)
+    col = np.zeros((H, W, NB), bool)
+    col[iy[inb], ix[inb], hbin] = True
+    fill = col.sum(axis=2).astype(np.float32) / NB          # 0..1 floor->ceiling coverage
+    dens = np.zeros((H, W), np.float32)
+    np.add.at(dens, (iy[inb], ix[inb]), 1.0)
+    walls = ((fill >= fill_thresh) & (dens > np.percentile(dens[dens > 0], 60))).astype(np.uint8)
+    walls = cv2.morphologyEx(walls, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+    # ---- contiguous floor slab + envelope contour (curves preserved) ----
+    fl = (hft > -0.5) & (hft < 0.8)
+    occ = np.zeros((H, W), np.uint8)
+    np.add.at(occ, (iy[fl], ix[fl]), 1)
+    occ = (occ > 0).astype(np.uint8)
+    occ = cv2.morphologyEx(occ, cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8))
+    occ = cv2.morphologyEx(occ, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    cnts, _ = cv2.findContours(occ, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    env = max(cnts, key=cv2.contourArea) if cnts else None
+
+    # ---- render ----
+    img = np.full((H, W, 3), 22, np.uint8)
+    img[occ > 0] = (230, 222, 205)                          # contiguous floor
+    # interior walls (dark), only where they sit on the slab
+    img[(walls > 0) & (occ > 0)] = (44, 36, 30)
+    glaze_px = 0
+    if env is not None:
+        # classify each envelope point: wall mass just inside -> solid, else glazing
+        wf = cv2.GaussianBlur(fill, (0, 0), 2.0)
+        M = cv2.moments(env); cxp = M["m10"] / (M["m00"] + 1e-6); cyp = M["m01"] / (M["m00"] + 1e-6)
+        pts = env.reshape(-1, 2)
+        for i in range(len(pts)):
+            x, y = pts[i]
+            dx = cxp - x; dy = cyp - y; d = np.hypot(dx, dy) + 1e-6
+            sx = int(x + dx / d * 5); sy = int(y + dy / d * 5)   # 5px inward
+            solid = 0 <= sy < H and 0 <= sx < W and wf[sy, sx] >= 0.45
+            col_ = (44, 36, 30) if solid else (235, 180, 90)     # dark wall / warm glazing
+            if not solid:
+                glaze_px += 1
+            xn, yn = pts[(i + 1) % len(pts)]
+            cv2.line(img, (x, y), (xn, yn), col_, 3, cv2.LINE_AA)
+
+    floor_sqft = float((occ > 0).sum()) / (pxft * pxft)
+    glaze_pct = 100.0 * glaze_px / max(1, len(env) if env is not None else 1)
+    cv2.putText(img, f"{slug}  ENVELOPE+WALLS  ~{floor_sqft:,.0f} sqft  glazing {glaze_pct:.0f}% of perimeter",
+                (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (245, 240, 230), 1, cv2.LINE_AA)
+    cv2.putText(img, "floor=slab  dark=solid wall  amber=glass/opening (curves preserved, no right-angle snapping)",
+                (14, H - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 195, 185), 1, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    key = f"labs/{slug}-structure.jpg"
+    s3.put_object(Bucket=R2_BUCKET, Key=key, Body=buf.tobytes(), ContentType="image/jpeg")
+    return {"structure": key, "px": [W, H], "floor_sqft": round(floor_sqft),
+            "glazing_pct": round(glaze_pct, 1), "npts": int(len(xyz))}
+
+
+@app.local_entrypoint()
+def structure(slug: str, ceiling_ft: float = 10.83):
+    """modal run modal_app.py::structure --slug tucson-castilla-nadir1"""
+    print(nadir_structure.remote(slug, ceiling_ft=ceiling_ft))
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol},
+              timeout=1800, memory=32768)
+def nadir_slices(slug: str, ceiling_ft: float = 10.83, pxft: float = 14.0,
+                 high_lo: float = 8.2, high_hi: float = 9.5,
+                 mid_lo: float = 3.5, mid_hi: float = 6.8) -> dict:
+    """Read the house DOWN FROM THE CEILING — Justin's insight: the top of the sphere
+    is furniture-free structure.
+      - HIGH slab [high_lo,high_hi] ft: pure wall stencil (above all furniture; door
+        headers bridge openings -> clean sealed rooms, curves preserved);
+      - MID slab [mid_lo,mid_hi] ft: walls with door openings as gaps;
+      - DOORWAY = HIGH solid AND MID empty (header over a walk-through);
+      - WINDOW hint = exterior wall where MID has a regular void rhythm behind a solid
+        HIGH header (frame present, glass absent).
+    -> labs/{slug}-slices.jpg"""
+    import os
+    import numpy as np
+    import cv2
+
+    s3 = _r2()
+    sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"
+        s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::37], full_matrices=False)
+    up = Vt[2].astype("f4"); hgt = X @ up
+    if np.percentile(hgt, 50) < 0:
+        up = -up; hgt = -hgt
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    floor = float(np.percentile(hgt, 2)); ceil_ = float(np.percentile(hgt, 98))
+    fpu = ceiling_ft / max(ceil_ - floor, 1e-6)
+    hft = (hgt - floor) * fpu
+    p1 = (X @ e1) * fpu; p2 = (X @ e2) * fpu
+    lo1, hi1 = np.percentile(p1, [0.3, 99.7]); lo2, hi2 = np.percentile(p2, [0.3, 99.7])
+    W = int((hi1 - lo1) * pxft) + 1; H = int((hi2 - lo2) * pxft) + 1
+    ix = np.clip(((p1 - lo1) * pxft).astype(np.int32), 0, W - 1)
+    iy = np.clip(((p2 - lo2) * pxft).astype(np.int32), 0, H - 1)
+
+    def slab(lo, hi):
+        m = (hft >= lo) & (hft <= hi)
+        g = np.zeros((H, W), np.float32)
+        np.add.at(g, (iy[m], ix[m]), 1.0)
+        return g
+
+    high = slab(high_lo, high_hi)      # walls only (furniture-free)
+    mid = slab(mid_lo, mid_hi)         # walls + door gaps
+    hb = cv2.GaussianBlur(high, (0, 0), 1.0)
+    mb = cv2.GaussianBlur(mid, (0, 0), 1.0)
+    hthr = np.percentile(hb[hb > 0], 70) if (hb > 0).any() else 1.0
+    mthr = np.percentile(mb[mb > 0], 70) if (mb > 0).any() else 1.0
+    wall_hi = (hb > hthr).astype(np.uint8)
+    wall_mid = (mb > mthr).astype(np.uint8)
+    wall_hi = cv2.morphologyEx(wall_hi, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+    # doorway = header present up high, gap down low, on a wall line
+    wall_hi_d = cv2.dilate(wall_hi, np.ones((5, 5), np.uint8))
+    door = ((wall_hi_d > 0) & (wall_mid == 0)).astype(np.uint8)
+    door = cv2.morphologyEx(door, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    # keep door pixels that hug a wall (near wall_hi), drop open-room interior
+    near_wall = cv2.dilate(wall_hi, np.ones((9, 9), np.uint8))
+    door = (door & near_wall).astype(np.uint8)
+
+    # render: clean high-slab wall stencil, doorways marked
+    img = np.full((H, W, 3), 248, np.uint8)
+    img[wall_hi > 0] = (44, 36, 30)             # walls (the truth stencil)
+    ys, xs = np.nonzero(door)
+    for x, y in zip(xs, ys):
+        img[y, x] = (90, 160, 240)              # doorways = warm blue breaks
+
+    n_wall = int((wall_hi > 0).sum())
+    n_door = int(door.sum())
+    cv2.putText(img, f"{slug}  CEILING-DOWN STENCIL  high {high_lo:.1f}-{high_hi:.1f}ft (furniture-free)  doorways={('yes' if n_door>50 else 'few')}",
+                (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (30, 26, 22), 1, cv2.LINE_AA)
+    cv2.putText(img, "dark = walls from the high slice (no furniture) · blue = doorway (header up high, gap down low)",
+                (14, H - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 84, 76), 1, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 93])
+    key = f"labs/{slug}-slices.jpg"
+    s3.put_object(Bucket=R2_BUCKET, Key=key, Body=buf.tobytes(), ContentType="image/jpeg")
+    return {"slices": key, "px": [W, H], "wall_px": n_wall, "door_px": n_door,
+            "high_band_ft": [high_lo, high_hi], "npts": int(len(xyz))}
+
+
+@app.local_entrypoint()
+def slices(slug: str, ceiling_ft: float = 10.83):
+    """modal run modal_app.py::slices --slug tucson-castilla-nadir1"""
+    print(nadir_slices.remote(slug, ceiling_ft=ceiling_ft))
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol},
+              timeout=1800, memory=32768)
+def nadir_ceiling(slug: str, ceiling_ft: float = 10.83, pxft: float = 12.0) -> dict:
+    """CEILING-HEIGHT ROOM MAP (Justin's key signal): each room has its own ceiling
+    height/treatment, so the ceiling is a fingerprint map of the rooms. Project the
+    CEILING surface (upper points) top-down, color by height — rooms appear as
+    plateaus, the STEPS between them are walls / arches / soffits (doorways drop to
+    ~8 ft headers). -> labs/{slug}-ceiling.jpg + per-cell height array."""
+    import os
+    import numpy as np
+    import cv2
+
+    s3 = _r2()
+    sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"
+        s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::37], full_matrices=False)
+    up = Vt[2].astype("f4"); hgt = X @ up
+    if np.percentile(hgt, 50) < 0:
+        up = -up; hgt = -hgt
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    floor = float(np.percentile(hgt, 2)); ceil_ = float(np.percentile(hgt, 99))
+    fpu = ceiling_ft / max(ceil_ - floor, 1e-6)
+    hft = (hgt - floor) * fpu
+    p1 = (X @ e1) * fpu; p2 = (X @ e2) * fpu
+    lo1, hi1 = np.percentile(p1, [0.3, 99.7]); lo2, hi2 = np.percentile(p2, [0.3, 99.7])
+    W = int((hi1 - lo1) * pxft) + 1; H = int((hi2 - lo2) * pxft) + 1
+    ix = np.clip(((p1 - lo1) * pxft).astype(np.int32), 0, W - 1)
+    iy = np.clip(((p2 - lo2) * pxft).astype(np.int32), 0, H - 1)
+
+    # ceiling height per cell = high point in the upper structure (>6 ft)
+    up_m = hft > 6.0
+    ceilmap = np.zeros((H, W), np.float32)
+    np.maximum.at(ceilmap, (iy[up_m], ix[up_m]), hft[up_m])
+    # fill holes + denoise: dilate then median
+    mask = (ceilmap > 0).astype(np.uint8)
+    ceilmap = cv2.morphologyEx(ceilmap, cv2.MORPH_CLOSE, np.ones((5, 5), np.float32))
+    ceilmap = cv2.medianBlur(ceilmap.astype(np.float32), 5)
+    # only where floor exists (interior)
+    fl = (hft > -0.5) & (hft < 0.8)
+    occ = np.zeros((H, W), np.uint8)
+    np.add.at(occ, (iy[fl], ix[fl]), 1)
+    interior = cv2.morphologyEx((occ > 0).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8)) > 0
+
+    # color by height: quantize to plateaus and colormap
+    valid = interior & (ceilmap > 6.5)
+    disp = np.zeros((H, W), np.uint8)
+    if valid.any():
+        lo, hi = 8.0, ceiling_ft + 0.3
+        norm = np.clip((ceilmap - lo) / (hi - lo), 0, 1)
+        disp = (norm * 255).astype(np.uint8)
+    heat = cv2.applyColorMap(disp, cv2.COLORMAP_TURBO)
+    heat[~valid] = (30, 26, 22)
+
+    # ceiling STEPS (edges = walls/arches): gradient of the height map
+    gm = cv2.Sobel(cv2.GaussianBlur(ceilmap, (0, 0), 1.5), cv2.CV_32F, 1, 0, 3)
+    gy = cv2.Sobel(cv2.GaussianBlur(ceilmap, (0, 0), 1.5), cv2.CV_32F, 0, 1, 3)
+    step = np.hypot(gm, gy)
+    step_edge = (step > np.percentile(step[valid], 88) if valid.any() else step > 1e9) & valid
+    heat[step_edge] = (20, 20, 20)   # dark lines where the ceiling steps = walls/arches
+
+    hist = {}
+    if valid.any():
+        for lo_h, hi_h, lab in [(8.0, 8.7, "~8ft arch/soffit"), (8.7, 9.4, "~9ft"),
+                                (9.4, 10.2, "~9'10 bedroom/hall"), (10.2, 11.2, "~10'10 great/kitchen")]:
+            m = valid & (ceilmap >= lo_h) & (ceilmap < hi_h)
+            if m.sum() > 50:
+                hist[lab] = round(float(m.sum()) / (pxft * pxft), 0)
+    cv2.putText(heat, f"{slug}  CEILING-HEIGHT ROOM MAP  (blue=low ~8ft  red=high ~10'10)  dark lines=ceiling steps=walls/arches",
+                (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (240, 240, 240), 1, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", heat, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    key = f"labs/{slug}-ceiling.jpg"
+    s3.put_object(Bucket=R2_BUCKET, Key=key, Body=buf.tobytes(), ContentType="image/jpeg")
+    return {"ceiling": key, "px": [W, H], "height_zones_sqft": hist, "npts": int(len(xyz))}
+
+
+@app.local_entrypoint()
+def ceiling(slug: str, ceiling_ft: float = 10.83):
+    """modal run modal_app.py::ceiling --slug tucson-castilla-nadir1"""
+    print(nadir_ceiling.remote(slug, ceiling_ft=ceiling_ft))
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol},
+              timeout=1800, memory=32768)
+def nadir_vectorize(slug: str, ceiling_ft: float = 10.83, pxft: float = 16.0,
+                    high_lo: float = 8.2, high_hi: float = 9.5,
+                    mid_lo: float = 3.5, mid_hi: float = 6.8,
+                    wall_thick_ft: float = 1.0, door_lo: float = 2.2, door_hi: float = 4.5,
+                    exterior_only: int = 1) -> dict:
+    """Turn the furniture-free ceiling slice into VECTOR walls — the truth as geometry:
+      1. HIGH slab -> wall pixels; morphological opening rejects fat blobs (cabinets,
+         skylights) because a cabinet isn't a line;
+      2. Hough segments -> straight interior walls; angles clustered + light-snapped to
+         the house's OWN dominant directions (no forced 90 deg — curves/angles kept);
+      3. floor-slab outer contour -> the curved exterior ENVELOPE;
+      4. doors = gaps of door-width in the MID slab sampled ALONG each wall line;
+      5. every wall segment labelled with its length (ft) for tomorrow's laser.
+    -> labs/{slug}-vector.jpg + labs/{slug}-walls.json"""
+    import io
+    import json
+    import os
+    import numpy as np
+    import cv2
+
+    s3 = _r2()
+    sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"
+        s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::37], full_matrices=False)
+    up = Vt[2].astype("f4"); hgt = X @ up
+    if np.percentile(hgt, 50) < 0:
+        up = -up; hgt = -hgt
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    floor = float(np.percentile(hgt, 2)); ceil_ = float(np.percentile(hgt, 98))
+    fpu = ceiling_ft / max(ceil_ - floor, 1e-6)
+    hft = (hgt - floor) * fpu
+    p1 = (X @ e1) * fpu; p2 = (X @ e2) * fpu
+    lo1, hi1 = np.percentile(p1, [0.3, 99.7]); lo2, hi2 = np.percentile(p2, [0.3, 99.7])
+    W = int((hi1 - lo1) * pxft) + 1; H = int((hi2 - lo2) * pxft) + 1
+    ix = np.clip(((p1 - lo1) * pxft).astype(np.int32), 0, W - 1)
+    iy = np.clip(((p2 - lo2) * pxft).astype(np.int32), 0, H - 1)
+
+    def slab(lo, hi):
+        m = (hft >= lo) & (hft <= hi)
+        g = np.zeros((H, W), np.float32)
+        np.add.at(g, (iy[m], ix[m]), 1.0)
+        return cv2.GaussianBlur(g, (0, 0), 1.0)
+
+    # A WALL is the only thing that touches BOTH the floor and the ceiling (Justin's
+    # rule, from reading the actual rooms). Vaults/domes/arches/soffits/coffers/
+    # skylights/fixtures touch ONLY the ceiling; furniture/islands touch ONLY the floor.
+    # So require presence in a LOW band AND a HIGH band at the same (x,y).
+    lowg = slab(2.0, 4.0)                                  # wall base (couches reach here, stop here)
+    hg = slab(high_lo, high_hi)                            # wall top / ceiling architecture
+    mg = slab(mid_lo, mid_hi)                              # for door-gap sampling
+    low_b = lowg > (np.percentile(lowg[lowg > 0], 62) if (lowg > 0).any() else 1)
+    high_b = hg > (np.percentile(hg[hg > 0], 62) if (hg > 0).any() else 1)
+    wall_hi = (low_b & high_b).astype(np.uint8)           # floor-to-ceiling verticals only
+    wall_hi = cv2.morphologyEx(wall_hi, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    wall_mid = (mg > (np.percentile(mg[mg > 0], 68) if (mg > 0).any() else 1)).astype(np.uint8)
+
+    # (1) blob rejection: opening with a disk WIDER than a wall removes walls, keeps blob
+    # cores; subtract the (dilated) blob mask to leave thin wall ridges.
+    rad = max(3, int(wall_thick_ft * pxft * 0.7))
+    disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (rad, rad))
+    blob = cv2.morphologyEx(wall_hi, cv2.MORPH_OPEN, disk)
+    blob = cv2.dilate(blob, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    thin = ((wall_hi > 0) & (blob == 0)).astype(np.uint8)
+    thin = cv2.morphologyEx(thin, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+    # (2) Hough segments on the thin wall mask
+    lines = cv2.HoughLinesP(thin * 255, 1, np.pi / 180.0,
+                            threshold=int(1.3 * pxft),
+                            minLineLength=int(2.2 * pxft),
+                            maxLineGap=int(1.3 * pxft))
+    segs = [] if lines is None else [tuple(l[0]) for l in lines]
+
+    # light angle-snap to the house's own dominant directions (NOT forced 90)
+    def ang(s):
+        return (np.degrees(np.arctan2(s[3] - s[1], s[2] - s[0]))) % 180.0
+    if segs:
+        angs = np.array([ang(s) for s in segs])
+        hist = np.histogram(angs, bins=180, range=(0, 180))[0]
+        hs = cv2.GaussianBlur(hist.astype(np.float32).reshape(-1, 1), (0, 0), 2).ravel()
+        peaks = [i for i in range(180) if hs[i] >= hs[(i - 1) % 180] and hs[i] >= hs[(i + 1) % 180] and hs[i] > hs.max() * 0.25]
+        def snap_ang(t):
+            if not peaks:
+                return t
+            dd = [min(abs(t - pk), 180 - abs(t - pk)) for pk in peaks]
+            pk = peaks[int(np.argmin(dd))]
+            return pk if min(dd) <= 9 else t
+        snapped = []
+        for s in segs:
+            x0, y0, x1, y1 = s
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            L = np.hypot(x1 - x0, y1 - y0)
+            th = np.radians(snap_ang(ang(s)))
+            dx, dy = np.cos(th) * L / 2, np.sin(th) * L / 2
+            snapped.append((int(cx - dx), int(cy - dy), int(cx + dx), int(cy + dy)))
+        segs = snapped
+
+        # ARCHITECTURAL CONSOLIDATION — walls are FEW, LONG, STRAIGHT. Collapse
+        # collinear fragments into one wall; drop short weak bits. (Justin: "are
+        # there really that many segments?" — no. Fit the building, don't trace noise.)
+        off_tol = 0.9 * pxft
+        groups = []
+        for s in segs:
+            x0, y0, x1, y1 = s
+            thd = ang(s)
+            th = np.radians(thd)
+            nx, ny = -np.sin(th), np.cos(th)          # unit normal
+            off = nx * ((x0 + x1) / 2) + ny * ((y0 + y1) / 2)
+            hit = None
+            for g in groups:
+                da = abs(g["ang"] - thd); da = min(da, 180 - da)
+                if da <= 8.0 and abs(g["off"] - off) <= off_tol:
+                    hit = g; break
+            if hit is None:
+                groups.append({"ang": thd, "off": off, "pts": [(x0, y0), (x1, y1)]})
+            else:
+                hit["pts"] += [(x0, y0), (x1, y1)]
+        # a REAL wall is continuous along its whole length (everything is connected —
+        # incl. the wall to itself). Verify point support in the wall mask; reject
+        # phantom lines that merged collinear fragments by bridging across empty rooms.
+        supp = cv2.dilate(thin, np.ones((3, 3), np.uint8))
+        merged = []
+        for g in groups:
+            pts = np.array(g["pts"], float)
+            th = np.radians(g["ang"]); dvec = np.array([np.cos(th), np.sin(th)])
+            cc = pts.mean(0); t = (pts - cc) @ dvec
+            a2 = cc + dvec * t.min(); b2 = cc + dvec * t.max()
+            L = np.hypot(*(b2 - a2))
+            if L < 3.0 * pxft:
+                continue
+            ns = max(8, int(L))
+            xs = np.clip(np.linspace(a2[0], b2[0], ns).astype(int), 0, W - 1)
+            ys = np.clip(np.linspace(a2[1], b2[1], ns).astype(int), 0, H - 1)
+            support = (supp[ys, xs] > 0).mean()
+            if support >= 0.55:                          # >=55% of the run rides real wall
+                merged.append((int(a2[0]), int(a2[1]), int(b2[0]), int(b2[1])))
+        segs = merged
+
+    # (3) curved exterior envelope from the floor slab
+    fl = (hft > -0.5) & (hft < 0.8)
+    occ = np.zeros((H, W), np.uint8)
+    np.add.at(occ, (iy[fl], ix[fl]), 1)
+    occ = (occ > 0).astype(np.uint8)
+    occ = cv2.morphologyEx(occ, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    occ = cv2.morphologyEx(occ, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    cnts, _ = cv2.findContours(occ, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    env = None
+    if cnts:
+        e = max(cnts, key=cv2.contourArea)
+        # exterior walls are STRAIGHT — aggressively simplify the noisy floor contour
+        # into a clean few-vertex outline, then straighten near-collinear runs. NOT a
+        # sawtooth trace (Justin's callout). Curved bays survive as short arc runs.
+        peri = cv2.arcLength(e, True)
+        env = cv2.approxPolyDP(e, 0.012 * peri, True).reshape(-1, 2).astype(float)
+        # merge vertices whose incoming/outgoing edges are near-collinear (< 12 deg)
+        cleaned = []
+        n = len(env)
+        for i in range(n):
+            p0 = env[(i - 1) % n]; p1 = env[i]; p2 = env[(i + 1) % n]
+            v1 = p1 - p0; v2 = p2 - p1
+            a1 = np.degrees(np.arctan2(v1[1], v1[0])); a2 = np.degrees(np.arctan2(v2[1], v2[0]))
+            da = abs((a1 - a2 + 180) % 360 - 180)
+            if da > 12:                                  # real corner -> keep vertex
+                cleaned.append(p1)
+        env = (np.array(cleaned) if len(cleaned) >= 3 else env).astype(int)
+
+    # EVERYTHING IS CONNECTED (Justin): the wall network is ONE connected graph
+    # anchored to the envelope. Keep segments reachable from the shell (directly or
+    # through other walls); drop free-floating masses (a four-poster bed's canopy,
+    # standing furniture) — they sit IN the house but aren't OF the structure.
+    if segs:
+        D = 1.7 * pxft
+        E = [(np.array([s[0], s[1]], float), np.array([s[2], s[3]], float)) for s in segs]
+        kept = np.zeros(len(segs), bool)
+        if env is not None:
+            ep = env.astype(float)
+            for i, (a, b) in enumerate(E):
+                da = np.min(np.hypot(ep[:, 0] - a[0], ep[:, 1] - a[1]))
+                db = np.min(np.hypot(ep[:, 0] - b[0], ep[:, 1] - b[1]))
+                if min(da, db) <= D:
+                    kept[i] = True
+        else:
+            kept[:] = True
+        for _ in range(30):                     # grow the connected component
+            changed = False
+            kidx = np.where(kept)[0]
+            for i, (a, b) in enumerate(E):
+                if kept[i]:
+                    continue
+                for j in kidx:
+                    c, d = E[j]
+                    if min(np.hypot(*(a - c)), np.hypot(*(a - d)),
+                           np.hypot(*(b - c)), np.hypot(*(b - d))) <= D:
+                        kept[i] = True; changed = True; break
+            if not changed:
+                break
+        n_before = len(segs)
+        segs = [s for i, s in enumerate(segs) if kept[i]]
+        n_dropped_floating = n_before - len(segs)
+    else:
+        n_dropped_floating = 0
+
+    # EXTERIOR FIRST (Justin #2): show the clean straight building frame alone. The
+    # point-cloud Hough interior walls are the WRONG method for interior — those come
+    # next from imagery (ceiling-wall corner, paint changes, furniture) + the heroes
+    # (one room each) + the flight path (free space / turns). Don't ship the guesses.
+    if exterior_only:
+        segs = []
+
+    # (4) doors: sample the MID slab along each wall segment; a door-width gap flanked
+    # by wall = a doorway (header up high, opening down low).
+    doors = []
+    for (x0, y0, x1, y1) in segs:
+        L = int(np.hypot(x1 - x0, y1 - y0))
+        if L < int(door_lo * pxft):
+            continue
+        xs = np.linspace(x0, x1, L).astype(int); ys = np.linspace(y0, y1, L).astype(int)
+        xs = np.clip(xs, 0, W - 1); ys = np.clip(ys, 0, H - 1)
+        present = wall_mid[ys, xs] > 0
+        i = 0
+        while i < L:
+            if not present[i]:
+                j = i
+                while j < L and not present[j]:
+                    j += 1
+                gap_ft = (j - i) / pxft
+                flanked = (i > 2 and present[max(0, i - 3):i].any()) and (j < L - 2 and present[j:min(L, j + 3)].any())
+                if door_lo <= gap_ft <= door_hi and flanked:
+                    mid = (i + j) // 2
+                    doors.append((int(xs[mid]), int(ys[mid])))
+                i = j
+            else:
+                i += 1
+
+    # ---- render the vector plan ----
+    img = np.full((H, W, 3), 250, np.uint8)
+    if env is not None:
+        cv2.polylines(img, [env.reshape(-1, 1, 2)], True, (40, 32, 26), 4, cv2.LINE_AA)
+        # label the exterior wall lengths so the frame reads like a plan
+        for i in range(len(env)):
+            a2 = env[i]; b2 = env[(i + 1) % len(env)]
+            Lft = np.hypot(b2[0] - a2[0], b2[1] - a2[1]) / pxft
+            if Lft >= 4.0:
+                mx, my = (a2[0] + b2[0]) // 2, (a2[1] + b2[1]) // 2
+                cv2.putText(img, f"{int(Lft)}'{int(round((Lft-int(Lft))*12))}\"", (mx - 10, my - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 90, 30), 1, cv2.LINE_AA)
+    walls_out = []
+    F = cv2.FONT_HERSHEY_SIMPLEX
+    for (x0, y0, x1, y1) in segs:
+        Lft = np.hypot(x1 - x0, y1 - y0) / pxft
+        cv2.line(img, (x0, y0), (x1, y1), (44, 36, 30), 3, cv2.LINE_AA)
+        walls_out.append({"a": [x0, y0], "b": [x1, y1], "len_ft": round(Lft, 2)})
+        if Lft >= 3.0:
+            mx, my = (x0 + x1) // 2, (y0 + y1) // 2
+            txt = f"{int(Lft)}'{int(round((Lft-int(Lft))*12))}\""
+            cv2.putText(img, txt, (mx - 12, my - 4), F, 0.42, (150, 90, 30), 1, cv2.LINE_AA)
+    for (dx, dy) in doors:
+        cv2.circle(img, (dx, dy), int(0.6 * pxft), (90, 160, 240), 2, cv2.LINE_AA)
+
+    cv2.putText(img, f"{slug}  VECTOR WALLS  {len(segs)} segments · {len(doors)} doorways · envelope curves kept",
+                (14, 26), F, 0.52, (30, 26, 22), 1, cv2.LINE_AA)
+    cv2.putText(img, "dark = wall vectors (labelled ft) · outline = curved envelope · blue O = doorway. Furniture rejected as non-linear.",
+                (14, H - 14), F, 0.42, (90, 84, 76), 1, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 93])
+    key = f"labs/{slug}-vector.jpg"
+    s3.put_object(Bucket=R2_BUCKET, Key=key, Body=buf.tobytes(), ContentType="image/jpeg")
+    s3.put_object(Bucket=R2_BUCKET, Key=f"labs/{slug}-walls.json",
+                  Body=json.dumps({"walls": walls_out, "doors": doors,
+                                   "envelope": env.tolist() if env is not None else [],
+                                   "pxft": pxft}).encode(), ContentType="application/json")
+    return {"vector": key, "px": [W, H], "segments": len(segs), "doorways": len(doors),
+            "dropped_floating": int(n_dropped_floating), "npts": int(len(xyz))}
+
+
+@app.local_entrypoint()
+def vectorize(slug: str, ceiling_ft: float = 10.83):
+    """modal run modal_app.py::vectorize --slug tucson-castilla-nadir1"""
+    print(nadir_vectorize.remote(slug, ceiling_ft=ceiling_ft))
 
 
 @app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=2400)
@@ -2829,7 +3493,8 @@ def make_furnish(slug: str, nadir_name: str = "nadir_hires.mp4", base_key: str =
 @app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=3600,
               memory=10240)
 def make_trueortho(slug: str, ceiling_ft: float = 9.0, pxm: float = 100.0,
-                   max_off_deg: float = 32.0, n_frames: int = 900, fov_pow: float = 12.0) -> dict:
+                   max_off_deg: float = 32.0, n_frames: int = 900, fov_pow: float = 12.0,
+                   ceil_cut: float = 0.9, bounds_pctl: float = 1.0, pad_ft: float = 0.0) -> dict:
     """TRUE-ORTHO base from the 360's BOTTOM HEMISPHERE (Justin's dewarp insight, done per-ray):
     every cell samples only NEAR-VERTICAL rays (<=max_off_deg off straight-down) from the 4K
     equirect, projected at the cell's OWN surface height from the dense cloud's DSM — no flat-floor
@@ -2860,14 +3525,19 @@ def make_trueortho(slug: str, ceiling_ft: float = 9.0, pxm: float = 100.0,
     a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
     e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
     pxa = X @ e1; pya = X @ e2; hgt = X @ up
-    lo1, hi1 = np.percentile(pxa, [1, 99]); lo2, hi2 = np.percentile(pya, [1, 99])
     floor = float(np.percentile(hgt, 1.5)); ceil = float(np.percentile(hgt, 99)); room = ceil - floor
     fpu = ceiling_ft / room if room > 0 else 1.0
+    # bounds: tighter default (1..99 pctl) clips sparse far rooms (music room sat ON the edge);
+    # bounds_pctl + pad_ft widen the canvas so every reconstructed room renders.
+    pad_u = pad_ft / fpu if fpu > 0 else 0.0
+    lo1, hi1 = np.percentile(pxa, [bounds_pctl, 100 - bounds_pctl]); lo1 -= pad_u; hi1 += pad_u
+    lo2, hi2 = np.percentile(pya, [bounds_pctl, 100 - bounds_pctl]); lo2 -= pad_u; hi2 += pad_u
     W = min(6000, int((hi1 - lo1) * pxm) + 1); H = min(6000, int((hi2 - lo2) * pxm) + 1)
     span1 = hi1 - lo1; span2 = hi2 - lo2
 
-    # float-ish DSM (top surface below a near-ceiling cut)
-    cut = floor + 0.9 * room
+    # float-ish DSM (top surface below a near-ceiling cut). Lower ceil_cut to drop
+    # ceiling fans/hangers/soffits so each cell samples the FLOOR beneath (LaMa fills the hole).
+    cut = floor + ceil_cut * room
     keep = (hgt < cut) & (pxa >= lo1) & (pxa <= hi1) & (pya >= lo2) & (pya <= hi2)
     ix = np.clip(((pxa[keep] - lo1) / span1 * (W - 1)), 0, W - 1).astype(np.int64)
     iy = np.clip(((pya[keep] - lo2) / span2 * (H - 1)), 0, H - 1).astype(np.int64)
@@ -2973,10 +3643,14 @@ def make_trueortho(slug: str, ceiling_ft: float = 9.0, pxm: float = 100.0,
 
 
 @app.local_entrypoint()
-def trueortho(slug: str, ceiling_ft: float = 8.5, pxm: float = 100.0, max_off_deg: float = 32.0):
+def trueortho(slug: str, ceiling_ft: float = 8.5, pxm: float = 100.0, max_off_deg: float = 32.0,
+              n_frames: int = 900, ceil_cut: float = 0.9, bounds_pctl: float = 1.0, pad_ft: float = 0.0):
     """True-ortho base from the 360 bottom hemisphere (per-ray dewarp at DSM height):
-        modal run modal_app.py::trueortho --slug scottsdale-nadir --ceiling-ft 8.5"""
-    print(make_trueortho.remote(slug, ceiling_ft=ceiling_ft, pxm=pxm, max_off_deg=max_off_deg))
+        modal run modal_app.py::trueortho --slug scottsdale-nadir --ceiling-ft 8.5
+        --ceil-cut 0.62 drops ceiling fans; --n-frames 3000 lifts coverage;
+        --bounds-pctl 0.1 --pad-ft 4 un-clips sparse edge rooms (music room)."""
+    print(make_trueortho.remote(slug, ceiling_ft=ceiling_ft, pxm=pxm, max_off_deg=max_off_deg,
+                                n_frames=n_frames, ceil_cut=ceil_cut, bounds_pctl=bounds_pctl, pad_ft=pad_ft))
 
 
 @app.local_entrypoint()
@@ -3470,6 +4144,21 @@ def presign(keys: str, expires: int = 604800):
     """modal run modal_app.py::presign --keys ortho/x.png,ortho/y.jpg"""
     for k, u in presign_r2.remote(keys, expires).items():
         print(f"{k}\n  {u}\n")
+
+
+@app.function(image=test_image, secrets=[r2_secret])
+def presign_put(key: str, content_type: str = "video/mp4", expires: int = 21600) -> str:
+    """Presigned PUT URL so the desktop can stream a large local file straight to R2
+    (single PUT up to 5 GiB — used for the 4K nadir proxies). Sign host only so the
+    client may send its own Content-Type."""
+    return _r2().generate_presigned_url(
+        "put_object", Params={"Bucket": R2_BUCKET, "Key": key}, ExpiresIn=expires)
+
+
+@app.local_entrypoint()
+def presignput(key: str):
+    """modal run modal_app.py::presignput --key projects/x/video/y.mp4"""
+    print(presign_put.remote(key))
 
 
 @app.local_entrypoint()
@@ -5635,3 +6324,105 @@ def cross_boundary(slug: str, srt_key: str, ceiling_fpu: float = 0.0,
 def crossboundary(slug: str, srt_key: str, ceiling_fpu: float = 0.0, fps: float = 30.0):
     """modal run modal_app.py::crossboundary --slug tucson-castilla --srt-key projects/tucson-castilla/telemetry/<id>.srt"""
     print(cross_boundary.remote(slug, srt_key, ceiling_fpu=ceiling_fpu, fps=fps))
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=1200, memory=10240)
+def emit_ortho_meta(slug: str, ceiling_ft: float = 10.83, pxm: float = 100.0,
+                    bounds_pctl: float = 1.0, pad_ft: float = 0.0) -> dict:
+    """Overlay metadata for the trueortho: recompute the SAME (c,up,e1,e2,lo,hi,W,H) frame make_trueortho
+    uses, project frame_trajectory cams to ortho pixel coords, emit extent + metric scale (ft/unit)."""
+    import os
+    import json
+    import numpy as np
+    s3 = _r2(); sd = f"/scratch/{slug}"
+    ply = f"{sd}/{slug}.ply"
+    if not os.path.exists(ply):
+        ply = "/tmp/c.ply"; s3.download_file(R2_BUCKET, f"vslam/{slug}/{slug}.ply", ply)
+    xyz, _ = _read_ply_xyzrgb(ply)
+    traj = f"{sd}/frame_trajectory.txt"
+    if not os.path.exists(traj):
+        traj = f"{sd}/keyframe_trajectory.txt"
+    T = np.loadtxt(traj)
+    c = xyz.mean(0); X = xyz - c
+    _, _, Vt = np.linalg.svd(X[::41], full_matrices=False); up = Vt[2].astype("f4")
+    cams = T[:, 1:4]
+    if np.dot(cams.mean(0) - c, up) < 0:
+        up = -up
+    a = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
+    e1 = np.cross(up, a); e1 /= np.linalg.norm(e1); e2 = np.cross(up, e1)
+    pxa = X @ e1; pya = X @ e2; hgt = X @ up
+    floor = float(np.percentile(hgt, 1.5)); ceil = float(np.percentile(hgt, 99)); room = ceil - floor
+    fpu0 = ceiling_ft / room if room > 0 else 1.0
+    pad_u = pad_ft / fpu0 if fpu0 > 0 else 0.0   # MUST match make_trueortho's bounds exactly
+    lo1, hi1 = np.percentile(pxa, [bounds_pctl, 100 - bounds_pctl]); lo1 -= pad_u; hi1 += pad_u
+    lo2, hi2 = np.percentile(pya, [bounds_pctl, 100 - bounds_pctl]); lo2 -= pad_u; hi2 += pad_u
+    W = min(6000, int((hi1 - lo1) * pxm) + 1); H = min(6000, int((hi2 - lo2) * pxm) + 1)
+    span1 = hi1 - lo1; span2 = hi2 - lo2
+    Ce1 = (cams - c) @ e1; Ce2 = (cams - c) @ e2; Chh = (cams - c) @ up
+    ix = (Ce1 - lo1) / span1 * (W - 1); iy = (Ce2 - lo2) / span2 * (H - 1)
+    fpu = ceiling_ft / room if room > 0 else 1.0
+    # camera FORWARD yaw in the (e1,e2) plane — same frame as traj_px. Pairs with the SRT's
+    # gb_yaw (compass) to solve cloud->compass rotation from ORIENTATIONS (no GPS baseline).
+    Rm = np.array([_quat2rot(q) for q in T[:, 4:8]])
+    fwd = Rm[:, :, 2]                              # world direction of camera +Z per frame
+    f1 = fwd @ e1; f2 = fwd @ e2
+    yaw_px = np.degrees(np.arctan2(f2, f1))
+    out = {"W": int(W), "H": int(H), "lo1": float(lo1), "hi1": float(hi1), "lo2": float(lo2), "hi2": float(hi2),
+           "span1": float(span1), "span2": float(span2), "room_units": float(room), "fpu": float(fpu),
+           "pxm": float(pxm), "n_traj": int(len(T)),
+           "traj_px": [[round(float(x), 1), round(float(y), 1)] for x, y in zip(ix, iy)],
+           "cam_h_ft": [round(float(h * fpu), 2) for h in Chh],
+           "cam_yaw_px": [round(float(y), 2) for y in yaw_px]}
+    key = f"ortho/{slug}_orthometa.json"
+    s3.put_object(Bucket=R2_BUCKET, Key=key, Body=json.dumps(out).encode(), ContentType="application/json")
+    print(f"[orthometa] {slug}: {W}x{H}, {len(T)} traj pts, ft/unit={fpu:.4f}, span {span1 * fpu:.1f} x {span2 * fpu:.1f} ft")
+    return {"meta": key, "W": int(W), "H": int(H), "n_traj": int(len(T)), "fpu": round(float(fpu), 4),
+            "ft_w": round(float(span1 * fpu), 1), "ft_h": round(float(span2 * fpu), 1)}
+
+
+@app.local_entrypoint()
+def orthometa(slug: str, ceiling_ft: float = 10.83, bounds_pctl: float = 1.0, pad_ft: float = 0.0):
+    """Emit trueortho extent + flight-path pixels + metric scale (for the plan overlay).
+    Pass the SAME --bounds-pctl/--pad-ft used for trueortho so frames match."""
+    print(emit_ortho_meta.remote(slug, ceiling_ft=ceiling_ft, bounds_pctl=bounds_pctl, pad_ft=pad_ft))
+
+
+@app.function(image=ortho_image, secrets=[r2_secret], timeout=1800, memory=8192)
+def pano_prep(stills_prefix: str, out_prefix: str, maxw: int = 4096, quality: int = 88) -> dict:
+    """Web panos from the full-res hero stills: downscale each equirect still under
+    stills_prefix to maxw and publish as <out_prefix>pano-<short8>.jpg (tour-doc convention)."""
+    import os
+    import numpy as np
+    import cv2
+    s3 = _r2()
+    out = []
+    pg = s3.get_paginator("list_objects_v2")
+    for page in pg.paginate(Bucket=R2_BUCKET, Prefix=stills_prefix):
+        for o in page.get("Contents", []):
+            k = o["Key"]
+            base = os.path.basename(k)
+            if not base.lower().endswith((".jpg", ".jpeg")) or base.startswith("topdown"):
+                continue
+            s3.download_file(R2_BUCKET, k, "/tmp/s.jpg")
+            im = cv2.imread("/tmp/s.jpg")
+            if im is None:
+                continue
+            h, w = im.shape[:2]
+            if w > maxw:
+                im = cv2.resize(im, (maxw, int(h * maxw / w)), interpolation=cv2.INTER_AREA)
+            cv2.imwrite("/tmp/p.jpg", im, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            short = base.split("-")[0][:8]
+            ok = f"{out_prefix}pano-{short}.jpg"
+            s3.upload_file("/tmp/p.jpg", R2_BUCKET, ok,
+                           ExtraArgs={"ContentType": "image/jpeg"})
+            out.append({"src": base, "pano": ok, "src_px": [w, h],
+                        "mb": round(os.path.getsize("/tmp/p.jpg") / 1e6, 1)})
+            print(f"[pano] {base[:12]} {w}x{h} -> {ok}")
+    return {"panos": out, "n": len(out)}
+
+
+@app.local_entrypoint()
+def panoprep(stills_prefix: str, out_prefix: str, maxw: int = 4096):
+    """modal run modal_app.py::panoprep --stills-prefix projects/tucson-castilla/still/ --out-prefix tours/tucson-castilla/"""
+    import json as _j
+    print(_j.dumps(pano_prep.remote(stills_prefix, out_prefix, maxw=maxw), indent=1))
