@@ -168,6 +168,7 @@ export function TourViewer({
   const [revs, setRevs] = useState<RevisionMeta[]>([]);
   const [revsOpen, setRevsOpen] = useState(false);
   const [planOpen, setPlanOpen] = useState(false);
+  const [planExpanded, setPlanExpanded] = useState(false);
   /** Auto-hiding player chrome for the immersive mobile flight. */
   const [controlsVisible, setControlsVisible] = useState(true);
   const [isPortrait, setIsPortrait] = useState(false);
@@ -2028,26 +2029,41 @@ export function TourViewer({
         </div>
       )}
 
-      {/* Living minimap */}
+      {/* Living minimap — pops out to a stage-filling plan on demand */}
       {plan && started && planOpen && (
-        <div className="absolute bottom-[clamp(4.5rem,6cqw,7rem)] right-4">
-          <PlanPanel
-            plan={plan}
-            activeSheetId={activeSheetId}
-            onSheetChange={setActiveSheetId}
-            activeZoneId={
-              pano
-                ? plan.sheets
-                    .flatMap((s) => s.zones)
-                    .find((z) => z.panoId === pano.id)?.id
-                : undefined
-            }
-            onZoneClick={handleZoneClick}
-            onClose={() => setPlanOpen(false)}
-            indicatorRef={planIndicatorRef}
-            authorMode={author}
-            onCanvasClick={author ? recordPathMark : undefined}
-          />
+        <div
+          className={
+            planExpanded
+              ? "absolute inset-0 z-30 flex items-center justify-center bg-ink/55 p-[clamp(0.75rem,3cqw,2.5rem)] backdrop-blur-[2px]"
+              : "absolute bottom-[clamp(4.5rem,6cqw,7rem)] right-4"
+          }
+          onClick={planExpanded ? () => setPlanExpanded(false) : undefined}
+        >
+          <div onClick={planExpanded ? (e) => e.stopPropagation() : undefined}>
+            <PlanPanel
+              plan={plan}
+              activeSheetId={activeSheetId}
+              onSheetChange={setActiveSheetId}
+              activeZoneId={
+                pano
+                  ? plan.sheets
+                      .flatMap((s) => s.zones)
+                      .find((z) => z.panoId === pano.id)?.id
+                  : undefined
+              }
+              onZoneClick={handleZoneClick}
+              onClose={() => {
+                setPlanExpanded(false);
+                setPlanOpen(false);
+              }}
+              indicatorRef={planIndicatorRef}
+              authorMode={author}
+              onCanvasClick={author ? recordPathMark : undefined}
+              expanded={planExpanded}
+              onToggleExpand={() => setPlanExpanded((v) => !v)}
+              className={planExpanded ? "w-[min(94cqw,72rem)]" : undefined}
+            />
+          </div>
         </div>
       )}
 

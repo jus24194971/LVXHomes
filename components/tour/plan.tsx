@@ -30,6 +30,7 @@ function PlanSheetSVG({
   indicatorRef,
   authorMode,
   onCanvasClick,
+  fit,
 }: {
   sheet: PlanSheet;
   activeZoneId?: string;
@@ -39,6 +40,8 @@ function PlanSheetSVG({
   /** Author mode: every click reports plan coords instead of zone actions. */
   authorMode?: boolean;
   onCanvasClick?: (x: number, y: number) => void;
+  /** Expanded/pop-out mode: fit the sheet inside the viewport height too. */
+  fit?: boolean;
 }) {
   const labelBase = Math.max(sheet.width, sheet.height) * 0.034;
   const indScale = Math.max(sheet.width, sheet.height) * 0.014;
@@ -121,8 +124,12 @@ function PlanSheetSVG({
       <svg
         ref={svgRef}
         viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
-        className="block h-auto w-full"
-        style={{ touchAction: "none", cursor: zoomed ? "grab" : undefined }}
+        className={fit ? "mx-auto block" : "block h-auto w-full"}
+        style={{
+          touchAction: "none",
+          cursor: zoomed ? "grab" : undefined,
+          ...(fit ? { maxHeight: "68vh", width: "auto", maxWidth: "100%" } : null),
+        }}
         role="group"
         aria-label={`${sheet.label} plan`}
         onPointerDown={onDown}
@@ -319,6 +326,8 @@ export function PlanPanel({
   authorMode,
   onCanvasClick,
   className,
+  expanded,
+  onToggleExpand,
 }: {
   plan: Plan;
   activeSheetId: string;
@@ -330,6 +339,9 @@ export function PlanPanel({
   authorMode?: boolean;
   onCanvasClick?: (x: number, y: number) => void;
   className?: string;
+  /** Pop-out: the plan is a hero feature — let it take the stage. */
+  expanded?: boolean;
+  onToggleExpand?: () => void;
 }) {
   const sheet =
     plan.sheets.find((s) => s.id === activeSheetId) ?? plan.sheets[0];
@@ -358,14 +370,27 @@ export function PlanPanel({
             </button>
           ))}
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close plan"
-          className="font-sans text-[clamp(0.75rem,0.8cqw,1rem)] text-paper/60 transition-colors hover:text-champagne"
-        >
-          ✕
-        </button>
+        <div className="flex items-center gap-2.5">
+          {onToggleExpand && (
+            <button
+              type="button"
+              onClick={onToggleExpand}
+              aria-label={expanded ? "Shrink plan" : "Expand plan"}
+              aria-pressed={expanded}
+              className="font-sans text-[clamp(0.75rem,0.8cqw,1rem)] text-paper/60 transition-colors hover:text-champagne"
+            >
+              {expanded ? "⤡" : "⤢"}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close plan"
+            className="font-sans text-[clamp(0.75rem,0.8cqw,1rem)] text-paper/60 transition-colors hover:text-champagne"
+          >
+            ✕
+          </button>
+        </div>
       </div>
       <div className="border-t border-champagne/25 p-2">
         <PlanSheetSVG
@@ -375,6 +400,7 @@ export function PlanPanel({
           indicatorRef={indicatorRef}
           authorMode={authorMode}
           onCanvasClick={onCanvasClick}
+          fit={expanded}
         />
       </div>
       <p className="px-3 pb-2 font-sans text-[clamp(0.5625rem,0.65cqw,0.8125rem)] uppercase tracking-[0.14em] text-paper/45">
