@@ -2034,12 +2034,15 @@ export function TourViewer({
         <div
           className={
             planExpanded
-              ? "absolute inset-0 z-30 flex items-center justify-center bg-ink/55 p-[clamp(0.75rem,3cqw,2.5rem)] backdrop-blur-[2px]"
+              ? "absolute inset-0 z-30 flex items-stretch justify-center bg-ink/55 p-[clamp(0.5rem,1.5cqw,1.25rem)] backdrop-blur-[2px]"
               : "absolute bottom-[clamp(4.5rem,6cqw,7rem)] right-4"
           }
           onClick={planExpanded ? () => setPlanExpanded(false) : undefined}
         >
-          <div onClick={planExpanded ? (e) => e.stopPropagation() : undefined}>
+          <div
+            className={planExpanded ? "h-full w-full" : undefined}
+            onClick={planExpanded ? (e) => e.stopPropagation() : undefined}
+          >
             <PlanPanel
               plan={plan}
               activeSheetId={activeSheetId}
@@ -2061,7 +2064,6 @@ export function TourViewer({
               onCanvasClick={author ? recordPathMark : undefined}
               expanded={planExpanded}
               onToggleExpand={() => setPlanExpanded((v) => !v)}
-              className={planExpanded ? "w-[min(94cqw,72rem)]" : undefined}
             />
           </div>
         </div>

@@ -120,15 +120,15 @@ function PlanSheetSVG({
   const zoomed = view.w < sheet.width - 0.5;
 
   return (
-    <div className="relative">
+    <div className={fit ? "relative h-full min-h-0" : "relative"}>
       <svg
         ref={svgRef}
         viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
-        className={fit ? "mx-auto block" : "block h-auto w-full"}
+        className={fit ? "mx-auto block h-full w-full" : "block h-auto w-full"}
+        preserveAspectRatio={fit ? "xMidYMid meet" : undefined}
         style={{
           touchAction: "none",
           cursor: zoomed ? "grab" : undefined,
-          ...(fit ? { maxHeight: "68vh", width: "auto", maxWidth: "100%" } : null),
         }}
         role="group"
         aria-label={`${sheet.label} plan`}
@@ -348,7 +348,9 @@ export function PlanPanel({
   return (
     <div
       className={cn(
-        "w-[clamp(14rem,30cqw,26rem)] overflow-hidden rounded border border-champagne/40 bg-ink/85 backdrop-blur",
+        expanded
+          ? "flex h-full w-full flex-col overflow-hidden rounded border border-champagne/40 bg-ink/85 backdrop-blur"
+          : "w-[clamp(14rem,30cqw,26rem)] overflow-hidden rounded border border-champagne/40 bg-ink/85 backdrop-blur",
         className,
       )}
     >
@@ -392,7 +394,7 @@ export function PlanPanel({
           </button>
         </div>
       </div>
-      <div className="border-t border-champagne/25 p-2">
+      <div className={cn("border-t border-champagne/25 p-2", expanded && "min-h-0 flex-1")}>
         <PlanSheetSVG
           sheet={sheet}
           activeZoneId={activeZoneId}
