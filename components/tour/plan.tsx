@@ -47,17 +47,29 @@ function PlanSheetSVG({
   const indScale = Math.max(sheet.width, sheet.height) * 0.014;
   const hasFlightPath = !!(sheet.paths && Object.keys(sheet.paths).length);
 
-  // ----- zoom / pan (viewBox-driven, so the click→plan mapping stays exact) -----
-  const full = { x: 0, y: 0, w: sheet.width, h: sheet.height };
+  // ----- the WHOLE plan: sheet rect ∪ visible layers (a site plansheet can extend
+  // well past the sheet rect — pool to the north, wings past the plan crop) -----
+  const full = (() => {
+    let x0 = 0, y0 = 0, x1 = sheet.width, y1 = sheet.height;
+    for (const L of sheet.layers ?? []) {
+      if (L.visible === false) continue;
+      const lw = L.width ?? sheet.width, lh = L.height ?? sheet.height;
+      const lx = L.x ?? 0, ly = L.y ?? 0;
+      x0 = Math.min(x0, lx); y0 = Math.min(y0, ly);
+      x1 = Math.max(x1, lx + lw); y1 = Math.max(y1, ly + lh);
+    }
+    return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  })();
   const [view, setView] = useState(full);
   const svgRef = useRef<SVGSVGElement>(null);
   const pan = useRef<{ cx: number; cy: number; vx: number; vy: number; vw: number; vh: number } | null>(null);
   const didPan = useRef(false);
 
-  // reset the view whenever the sheet changes
+  // reset the view whenever the sheet (or its extents) change
   useEffect(() => {
-    setView({ x: 0, y: 0, w: sheet.width, h: sheet.height });
-  }, [sheet.id, sheet.width, sheet.height]);
+    setView(full);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sheet.id, full.x, full.y, full.w, full.h]);
 
   const zoomAt = useCallback(
     (factor: number, ox: number, oy: number) => {
@@ -65,19 +77,18 @@ function PlanSheetSVG({
       if (!el) return;
       const rect = el.getBoundingClientRect();
       setView((v) => {
-        const fw = sheet.width, fh = sheet.height;
         const planX = v.x + (ox / rect.width) * v.w;
         const planY = v.y + (oy / rect.height) * v.h;
-        let nw = clamp(v.w * factor, fw * 0.06, fw);
-        let nh = clamp(v.h * factor, fh * 0.06, fh);
-        // keep aspect locked to the sheet
-        nh = nw * (fh / fw);
-        let nx = clamp(planX - (ox / rect.width) * nw, 0, fw - nw);
-        let ny = clamp(planY - (oy / rect.height) * nh, 0, fh - nh);
+        let nw = clamp(v.w * factor, full.w * 0.06, full.w);
+        let nh = clamp(v.h * factor, full.h * 0.06, full.h);
+        // keep aspect locked to the full extent
+        nh = nw * (full.h / full.w);
+        let nx = clamp(planX - (ox / rect.width) * nw, full.x, full.x + full.w - nw);
+        let ny = clamp(planY - (oy / rect.height) * nh, full.y, full.y + full.h - nh);
         return { x: nx, y: ny, w: nw, h: nh };
       });
     },
-    [sheet.width, sheet.height],
+    [full.x, full.y, full.w, full.h],
   );
 
   // non-passive wheel so we can preventDefault the page scroll
@@ -95,7 +106,7 @@ function PlanSheetSVG({
 
   const onDown = (e: React.PointerEvent) => {
     didPan.current = false;
-    if (view.w >= sheet.width - 0.5) return; // not zoomed → let taps fall straight through to jump
+    if (view.w >= full.w - 0.5) return; // not zoomed → let taps fall straight through to jump
     pan.current = { cx: e.clientX, cy: e.clientY, vx: view.x, vy: view.y, vw: view.w, vh: view.h };
     (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
   };
@@ -109,15 +120,15 @@ function PlanSheetSVG({
     const dy = (e.clientY - p.cy) * (p.vh / rect.height);
     setView((v) => ({
       ...v,
-      x: clamp(p.vx - dx, 0, sheet.width - v.w),
-      y: clamp(p.vy - dy, 0, sheet.height - v.h),
+      x: clamp(p.vx - dx, full.x, full.x + full.w - v.w),
+      y: clamp(p.vy - dy, full.y, full.y + full.h - v.h),
     }));
   };
   const onUp = () => {
     pan.current = null;
   };
 
-  const zoomed = view.w < sheet.width - 0.5;
+  const zoomed = view.w < full.w - 0.5;
 
   return (
     <div className={fit ? "relative h-full min-h-0" : "relative"}>
@@ -304,7 +315,7 @@ function PlanSheetSVG({
           <button
             type="button"
             aria-label="Reset zoom"
-            onClick={() => setView({ x: 0, y: 0, w: sheet.width, h: sheet.height })}
+            onClick={() => setView(full)}
             className="flex h-6 w-6 items-center justify-center rounded border border-champagne/50 bg-ink/80 text-[0.7rem] leading-none text-paper/90 backdrop-blur transition-colors hover:border-champagne hover:text-champagne"
           >
             ⤢
