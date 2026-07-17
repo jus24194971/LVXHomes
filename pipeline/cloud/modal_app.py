@@ -388,6 +388,10 @@ def process(job: dict) -> dict:
     video_key = job.get("video_key") or job.get("r2_key")
     still_keys = job.get("still_keys") or []
     ceiling_ft = float(job.get("ceiling_ft", 9.0))
+    # v2 property pipeline (the Castilla-proven chain): nadir passes + cine + hero
+    # stills uploaded per the pilot guide -> fully automatic Phase A.
+    if job.get("pipeline") == "v2" or job.get("nadir_keys"):
+        return process_property.remote(job)
     # New capture workflow — dedicated stills + a flythrough → the localized, georeferenced
     # floorplan chain (still_layout → VSLAM → localize → fuse → deliver). It delivers itself.
     if still_keys:
@@ -411,6 +415,51 @@ def process(job: dict) -> dict:
     return payload
 
 
+@app.function(secrets=[cb_secret], timeout=14400)
+def process_property(job: dict) -> dict:
+    """PHASE-A property pipeline — the Castilla-proven chain, fully automatic from a
+    pilot-guide upload (docs/PILOT-GUIDE.md). No human input required:
+      nadir videos  -> VSLAM (parallel, GPU) -> 4K proxy -> hole-filled true-ortho
+                       (fans dropped, sparse-edge rooms un-clipped, oblique fill) + meta
+      cine video    -> tour mezzanine at tours/<slug>/flight.mp4
+      hero stills   -> web panos at tours/<slug>/pano-<short8>.jpg
+    PHASE B is deliberately human-gated: the laser walls entered in /studio/plan are the
+    metric spine (the ONLY scale that never lies — drone EKF GPS was 30% off on Castilla),
+    then registration -> plansheet -> tour/plan docs publish. The pilot never sees the middle."""
+    slug = job["slug"]
+    ceiling_ft = float(job.get("ceiling_ft", 9.0))
+    nadirs = job.get("nadir_keys") or []
+    cine = job.get("video_key") or ""
+    stills_prefix = job.get("stills_prefix") or f"projects/{slug}/still/"
+    out: dict = {"slug": slug, "status": "phase-a-ready", "orthos": [], "steps": []}
+    try:
+        # VSLAM every nadir pass in parallel, then chain each one's ortho stack.
+        calls = [(f"{slug}-nadir{i}", run_vslam.spawn(k, f"{slug}-nadir{i}"))
+                 for i, k in enumerate(nadirs, 1)]
+        for s, c in calls:
+            c.get()
+            make_proxy.remote(s)
+            r = make_trueortho.remote(s, ceiling_ft=ceiling_ft, pxm=100.0,
+                                      max_off_deg=40.0, n_frames=3000, fov_pow=12.0,
+                                      ceil_cut=0.62, bounds_pctl=0.1, pad_ft=4.0,
+                                      fill_off_deg=65.0)
+            emit_ortho_meta.remote(s, ceiling_ft=ceiling_ft, bounds_pctl=0.1, pad_ft=4.0)
+            out["orthos"].append({"slug": s, "ortho": r.get("ortho"), "cov_pct": r.get("cov_pct")})
+            out["steps"].append(f"ortho:{s}")
+        if cine:
+            make_mezzanine.remote(cine, f"tours/{slug}/flight.mp4")
+            out["steps"].append("mezzanine")
+        pp = pano_prep.remote(stills_prefix, f"tours/{slug}/")
+        out["panos"] = pp.get("n", 0)
+        out["steps"].append(f"panos:{out['panos']}")
+        out["next"] = ("Phase B: lase 2-3 wall spans + a ceiling per key room in /studio/plan, "
+                       "then generate the plansheet + publish the tour docs.")
+    except Exception as e:  # noqa: BLE001 — report, never strand the upload silently
+        out = {"slug": slug, "status": "failed", "error": str(e), "steps": out.get("steps", [])}
+    _notify(out)
+    return out
+
+
 @app.function(secrets=[cb_secret], image=web_image)
 @modal.fastapi_endpoint(method="POST")          # older Modal: @modal.web_endpoint
 def submit(job: dict):
@@ -423,8 +472,8 @@ def submit(job: dict):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     if not job.get("slug"):
         return JSONResponse({"error": "need slug"}, status_code=400)
-    if not (job.get("r2_key") or job.get("video_key") or job.get("still_keys")):
-        return JSONResponse({"error": "need a video or stills to process"}, status_code=400)
+    if not (job.get("r2_key") or job.get("video_key") or job.get("still_keys") or job.get("nadir_keys")):
+        return JSONResponse({"error": "need a video, nadir passes, or stills to process"}, status_code=400)
     process.spawn(job)
     return {"accepted": True, "slug": job["slug"]}
 
@@ -3494,7 +3543,8 @@ def make_furnish(slug: str, nadir_name: str = "nadir_hires.mp4", base_key: str =
               memory=10240)
 def make_trueortho(slug: str, ceiling_ft: float = 9.0, pxm: float = 100.0,
                    max_off_deg: float = 32.0, n_frames: int = 900, fov_pow: float = 12.0,
-                   ceil_cut: float = 0.9, bounds_pctl: float = 1.0, pad_ft: float = 0.0) -> dict:
+                   ceil_cut: float = 0.9, bounds_pctl: float = 1.0, pad_ft: float = 0.0,
+                   fill_off_deg: float = 0.0) -> dict:
     """TRUE-ORTHO base from the 360's BOTTOM HEMISPHERE (Justin's dewarp insight, done per-ray):
     every cell samples only NEAR-VERTICAL rays (<=max_off_deg off straight-down) from the 4K
     equirect, projected at the cell's OWN surface height from the dense cloud's DSM — no flat-floor
@@ -3566,6 +3616,13 @@ def make_trueortho(slug: str, ceiling_ft: float = 9.0, pxm: float = 100.0,
     Cm = T[:, 1:4] - c
     okp = np.isfinite(Cm).all(1) & np.isfinite(Rm.reshape(len(T), -1)).all(1)
     cosmax = np.cos(np.radians(max_off_deg))
+    # HOLE-FILL tier (fill_off_deg > max_off_deg): oblique rays projected at the same
+    # DSM height may ALSO paint cells, but at a weight tier that can never outbid a
+    # strict near-vertical sample — strict wins everywhere it exists; obliques only
+    # resolve the never-seen-near-vertical cells (floor strips along walls/windows).
+    dofill = fill_off_deg > max_off_deg
+    cosfill = np.cos(np.radians(fill_off_deg)) if dofill else cosmax
+    reach_deg = fill_off_deg if dofill else max_off_deg
     yflip = 1; lonsign = 1
 
     best = np.zeros(H * W, np.float32)
@@ -3580,7 +3637,7 @@ def make_trueortho(slug: str, ceiling_ft: float = 9.0, pxm: float = 100.0,
         if hcam < (1.5 / ceiling_ft) * room:
             continue
         Ce1 = float(C @ e1); Ce2 = float(C @ e2)
-        fw = hcam * np.tan(np.radians(max_off_deg)) * 1.15
+        fw = hcam * np.tan(np.radians(reach_deg)) * 1.15
         a0 = int(np.clip((Ce1 - fw - lo1) / span1 * (W - 1), 0, W - 1))
         a1 = int(np.clip((Ce1 + fw - lo1) / span1 * (W - 1) + 1, 0, W))
         b0 = int(np.clip((Ce2 - fw - lo2) / span2 * (H - 1), 0, H - 1))
@@ -3596,10 +3653,13 @@ def make_trueortho(slug: str, ceiling_ft: float = 9.0, pxm: float = 100.0,
         rays = (pl1 - Ce1)[:, None] * e1 + (pl2 - Ce2)[:, None] * e2 + (zc - hcam)[:, None] * up
         dist = np.linalg.norm(rays, axis=1) + 1e-9
         vert = -(rays @ up) / dist                          # 1 = straight down
-        sel = (vert > cosmax) & ((hcam - zc) > 0.1 * room)
+        sel = (vert > cosfill) & ((hcam - zc) > 0.1 * room)
         if not sel.any():
             continue
+        # two weight tiers: strict near-vertical rays live in [1, 2] and always beat
+        # oblique fill rays, which live in (0, ~0.001] and only claim empty cells.
         w = (vert ** fov_pow).astype(np.float32)
+        w = np.where(vert > cosmax, w + 1.0, w * 1e-3).astype(np.float32)
         cand = sel & (w > best[gidx])
         if not cand.any():
             continue
@@ -3644,13 +3704,16 @@ def make_trueortho(slug: str, ceiling_ft: float = 9.0, pxm: float = 100.0,
 
 @app.local_entrypoint()
 def trueortho(slug: str, ceiling_ft: float = 8.5, pxm: float = 100.0, max_off_deg: float = 32.0,
-              n_frames: int = 900, ceil_cut: float = 0.9, bounds_pctl: float = 1.0, pad_ft: float = 0.0):
+              n_frames: int = 900, ceil_cut: float = 0.9, bounds_pctl: float = 1.0, pad_ft: float = 0.0,
+              fill_off_deg: float = 0.0):
     """True-ortho base from the 360 bottom hemisphere (per-ray dewarp at DSM height):
         modal run modal_app.py::trueortho --slug scottsdale-nadir --ceiling-ft 8.5
         --ceil-cut 0.62 drops ceiling fans; --n-frames 3000 lifts coverage;
-        --bounds-pctl 0.1 --pad-ft 4 un-clips sparse edge rooms (music room)."""
+        --bounds-pctl 0.1 --pad-ft 4 un-clips sparse edge rooms (music room);
+        --fill-off-deg 65 lets obliques resolve wall-adjacent holes (strict rays still win)."""
     print(make_trueortho.remote(slug, ceiling_ft=ceiling_ft, pxm=pxm, max_off_deg=max_off_deg,
-                                n_frames=n_frames, ceil_cut=ceil_cut, bounds_pctl=bounds_pctl, pad_ft=pad_ft))
+                                n_frames=n_frames, ceil_cut=ceil_cut, bounds_pctl=bounds_pctl, pad_ft=pad_ft,
+                                fill_off_deg=fill_off_deg))
 
 
 @app.local_entrypoint()
