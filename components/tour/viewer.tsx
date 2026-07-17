@@ -1422,6 +1422,12 @@ export function TourViewer({
     // Both gesture-gated; fire synchronously so mobile honors the activation.
     const playP = video.play();
     if (caps.isMobile) enterImmersive();
+    // If immersive doesn't take (blocked API, exited overlay), make sure the
+    // player — controls included — is actually centered in the viewport:
+    // on landscape phones the page prose pushes it below the fold.
+    requestAnimationFrame(() =>
+      mountRef.current?.parentElement?.scrollIntoView({ block: "center" }),
+    );
 
     playP.then(
       () => {
@@ -2002,7 +2008,9 @@ export function TourViewer({
               </button>
             )}
           </div>
-          <div className="flex items-center gap-3">
+          {/* wrap-safe: an extra button (VR on phones) or bigger cq text must never
+              push Fullscreen — always rightmost — off the edge */}
+          <div className="flex min-w-0 flex-wrap items-center justify-end gap-2 gap-y-1 sm:gap-3">
             {plan && (
               <button
                 type="button"
