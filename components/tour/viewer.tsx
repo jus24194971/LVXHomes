@@ -674,9 +674,18 @@ export function TourViewer({
     document.addEventListener(
       "fullscreenchange",
       () => {
-        setFsActive(Boolean(document.fullscreenElement));
+        const on = Boolean(document.fullscreenElement);
+        setFsActive(on);
         applySize();
         requestAnimationFrame(applySize);
+        if (!on) {
+          // Accidental exit (ESC / back-gesture / swipe): make sure the player
+          // and its controls are actually on screen and visible again.
+          setControlsVisible(true);
+          requestAnimationFrame(() =>
+            mount.parentElement?.scrollIntoView({ block: "center" }),
+          );
+        }
       },
       { signal },
     );
@@ -1371,17 +1380,21 @@ export function TourViewer({
       document.fullscreenEnabled &&
       typeof host.requestFullscreen === "function";
     if (useApi) {
-      host.requestFullscreen().then(
-        () => {
-          // Force landscape for the immersive flight. Android/Chrome honor this;
-          // iOS has no lock and falls back to the rotate nudge.
-          const so = screen.orientation as unknown as {
-            lock?: (o: string) => Promise<void>;
-          };
-          so?.lock?.("landscape").catch(() => {});
-        },
-        () => setPseudoFs(true), // API rejected → fall back to the overlay
-      );
+      try {
+        host.requestFullscreen().then(
+          () => {
+            // Force landscape for the immersive flight. Android/Chrome honor this;
+            // iOS has no lock and falls back to the rotate nudge.
+            const so = screen.orientation as unknown as {
+              lock?: (o: string) => Promise<void>;
+            };
+            so?.lock?.("landscape").catch(() => {});
+          },
+          () => setPseudoFs(true), // API rejected → fall back to the overlay
+        );
+      } catch {
+        setPseudoFs(true); // some webviews throw synchronously
+      }
     } else if (caps.isMobile) {
       setPseudoFs(true);
     }
@@ -1480,7 +1493,13 @@ export function TourViewer({
     const host = mountRef.current?.parentElement;
     if (!host) return;
     if (!caps.isIOS && document.fullscreenEnabled && host.requestFullscreen) {
-      void host.requestFullscreen();
+      // In-app webviews and permission-restricted contexts reject (or throw)
+      // — NEVER leave the user with a dead button: fall back to the overlay.
+      try {
+        host.requestFullscreen().catch(() => setPseudoFs(true));
+      } catch {
+        setPseudoFs(true);
+      }
     } else {
       setPseudoFs(true);
     }
@@ -1918,7 +1937,8 @@ export function TourViewer({
               hideTimerRef.current = window.setTimeout(() => setControlsVisible(false), 4000);
           }}
           className={cn(
-            "absolute inset-x-0 bottom-0 flex flex-col gap-2.5 p-4 transition-opacity duration-300",
+            // pb: keep the bar clear of the iPhone home indicator in fullscreen
+            "absolute inset-x-0 bottom-0 flex flex-col gap-2.5 px-4 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] transition-opacity duration-300",
             controlsVisible || author || pano ? "opacity-100" : "pointer-events-none opacity-0",
           )}
         >

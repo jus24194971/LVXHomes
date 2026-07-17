@@ -56,10 +56,12 @@ export default async function TourPage({
         </p>
 
         <div className="mt-10 overflow-hidden border border-paper/15">
+          {/* max-h keeps the whole player (controls included) inside the viewport —
+              portrait 4:5 taller than the screen buried the control bar below the fold. */}
           <TourViewer
             tour={tour}
             plan={await getPlanLive(tour.slug)}
-            className="aspect-[4/5] w-full sm:aspect-video"
+            className="aspect-[4/5] max-h-[calc(100svh-7rem)] w-full sm:aspect-video"
           />
         </div>
 
