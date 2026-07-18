@@ -695,9 +695,14 @@ def qc_property(slug: str, job: dict = None) -> dict:  # noqa: C901 — QC is a 
                       for t in np.arange(t0, t1 + 1, 2.0)]
                 far = h.get("fadeFar", 30)
                 if ds and min(ds) > far:
+                    # Player-visibility only: the anchor itself may be legitimately placed
+                    # via another flight (heroes are often shot outside the cine path —
+                    # e.g. Castilla's master closet was flown in nadir1, not the cine).
                     s4["flags"].append(
-                        f"ring {h.get('id')} ({h.get('label')}) NEVER visible: min path distance "
-                        f"{min(ds):.1f}u > fadeFar {far} during window {t0}-{t1}")
+                        f"ring {h.get('id')} ({h.get('label')}) never fires in the PLAYER: min "
+                        f"tour-path distance {min(ds):.1f}u > fadeFar {far} during {t0}-{t1} — "
+                        "widen fadeFar/window; anchor position itself may be valid via another "
+                        "flight (cross-check nadir coverage before moving it)")
             # path-vs-wall crossings (adhere-to-walls rule): each = opening or model error
             def seg_x(p1, p2, p3, p4):
                 d1 = (p2[0] - p1[0], p2[1] - p1[1]); d2 = (p4[0] - p3[0], p4[1] - p3[1])
