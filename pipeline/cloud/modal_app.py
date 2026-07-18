@@ -452,6 +452,8 @@ def process_property(job: dict) -> dict:
         pp = pano_prep.remote(stills_prefix, f"tours/{slug}/")
         out["panos"] = pp.get("n", 0)
         out["steps"].append(f"panos:{out['panos']}")
+        qc_property.spawn(slug, job)          # unattended QC scorecard -> projects/<slug>/qc/
+        out["steps"].append("qc:spawned")
         out["next"] = ("Phase B: lase 2-3 wall spans + a ceiling per key room in /studio/plan, "
                        "then generate the plansheet + publish the tour docs.")
     except Exception as e:  # noqa: BLE001 — report, never strand the upload silently
@@ -501,6 +503,315 @@ def selftest() -> dict:
     }
     print(out)
     return out
+
+
+# ====================== QC — automatic capture validation (offloaded) ======================
+# Codified from the 2026-07-18 Castilla knowledge audit. Runs unattended on every upload
+# (spawned at the tail of process_property) and on demand after Phase B (qcrun with docs).
+# Tier 1 is deterministic math; tier 2 (perception) calls the Claude API from inside the
+# function when the anthropic-api-key secret is real — pilots only ever see the scorecard.
+qc_secret = modal.Secret.from_name("anthropic-api-key")
+
+
+def _qc_parse_srt(text: str) -> list:
+    """DJI SRT telemetry -> 1 Hz track [{t,lat,lon,alt}]. Format proven on Castilla:
+    per-frame blocks with `[latitude: X] [longitude: Y] [rel_alt: A abs_alt: B]`."""
+    import re
+    pat = re.compile(r"\[latitude: ([\d.\-]+)\].*?\[longitude: ([\d.\-]+)\].*?\[rel_alt: ([\d.\-]+)")
+    tpat = re.compile(r"(\d+):(\d+):(\d+),(\d+) -->")
+    track, last_s = [], -1
+    t = 0.0
+    for block in text.split("\n\n"):
+        m = tpat.search(block)
+        g = pat.search(block)
+        if not m or not g:
+            continue
+        t = int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3]) + int(m[4]) / 1000.0
+        if int(t) == last_s:
+            continue
+        last_s = int(t)
+        track.append({"t": int(t), "lat": float(g[1]), "lon": float(g[2]), "alt": float(g[3])})
+    return track
+
+
+def _qc_gps_segments(track: list) -> dict:
+    """Outdoor-live vs indoor-degraded segmentation. Indoor GPS repeats/freezes; outdoor
+    coordinates step every sample. Live = >=60% unique coords in a 10 s window."""
+    import numpy as np
+    if len(track) < 12:
+        return {"outdoor": [], "outdoor_frac": 0.0}
+    coords = [(p["lat"], p["lon"]) for p in track]
+    live = []
+    for i in range(len(coords)):
+        w = coords[max(0, i - 5):i + 5]
+        live.append(len(set(w)) / max(1, len(w)) >= 0.6)
+    segs, s = [], None
+    for i, v in enumerate(live):
+        if v and s is None:
+            s = i
+        if (not v or i == len(live) - 1) and s is not None:
+            if i - s >= 5:
+                segs.append([track[s]["t"], track[i]["t"]])
+            s = None if not v else s
+            if not v:
+                s = None
+    return {"outdoor": segs, "outdoor_frac": float(np.mean(live))}
+
+
+@app.function(image=ortho_image, secrets=[r2_secret, qc_secret], timeout=1800)
+def qc_property(slug: str, job: dict = None) -> dict:  # noqa: C901 — QC is a checklist
+    """Capture-validation report -> projects/<slug>/qc/report.json + qc_map.png in R2.
+    Every section fails soft; absence of data is a finding, not an exception."""
+    import base64
+    import io  # noqa: F401
+    import json
+    import urllib.request
+    import numpy as np
+    import cv2
+
+    job = job or {}
+    s3 = _r2()
+    rep: dict = {"slug": slug, "sections": {}}
+
+    def _get(key, binary=True):
+        try:
+            b = s3.get_object(Bucket=R2_BUCKET, Key=key)["Body"].read()
+            return b if binary else b.decode("utf-8", "replace")
+        except Exception:
+            return None
+
+    # ---- S1: telemetry / GPS truth ------------------------------------------------
+    try:
+        srt_keys = job.get("srt_keys") or []
+        s1 = {"files": []}
+        for k in srt_keys:
+            txt = _get(k, binary=False)
+            if not txt:
+                s1["files"].append({"key": k, "error": "missing"})
+                continue
+            tr = _qc_parse_srt(txt)
+            seg = _qc_gps_segments(tr)
+            s3.put_object(Bucket=R2_BUCKET, Key=f"projects/{slug}/qc/gps_{k.rsplit('/',1)[-1]}.json",
+                          Body=json.dumps(tr).encode(), ContentType="application/json")
+            lats = [p["lat"] for p in tr] or [0]
+            lons = [p["lon"] for p in tr] or [0]
+            s1["files"].append({"key": k, "samples": len(tr),
+                                "duration_s": tr[-1]["t"] if tr else 0,
+                                "bbox": [min(lats), min(lons), max(lats), max(lons)],
+                                **seg})
+        s1["verdict"] = ("no-srt" if not srt_keys else
+                         "ok" if any(f.get("outdoor") for f in s1["files"]) else "no-outdoor-lock")
+        rep["sections"]["telemetry"] = s1
+    except Exception as e:  # noqa: BLE001
+        rep["sections"]["telemetry"] = {"error": str(e)[:300]}
+
+    # ---- S2: ortho coverage + unknown blobs ---------------------------------------
+    blobs, base_img, base_key = [], None, None
+    try:
+        s2 = {"orthos": []}
+        listed = s3.list_objects_v2(Bucket=R2_BUCKET, Prefix="ortho/", MaxKeys=1000)
+        keys = [o["Key"] for o in listed.get("Contents", []) if o["Key"].startswith(f"ortho/{slug}")]
+        for k in [k for k in keys if "trueortho" in k and k.endswith(".png")
+                  and "_gap" not in k and "_height" not in k][:4]:
+            raw = _get(k)
+            if raw is None:
+                continue
+            img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_UNCHANGED)
+            if img is None:
+                continue
+            valid = (img[..., 3] > 0) if img.ndim == 3 and img.shape[2] == 4 else (img.max(axis=2) > 8 if img.ndim == 3 else img > 8)
+            v8 = valid.astype(np.uint8)
+            foot = cv2.morphologyEx(v8, cv2.MORPH_CLOSE, np.ones((41, 41), np.uint8))
+            n, lab, st, _ = cv2.connectedComponentsWithStats(foot)
+            if n > 1:
+                big = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+                foot = (lab == big).astype(np.uint8)
+            cov = float(v8[foot > 0].mean()) if foot.any() else 0.0
+            holes = ((foot > 0) & (v8 == 0)).astype(np.uint8)
+            hn, hl, hs, _ = cv2.connectedComponentsWithStats(holes)
+            hb = [[int(hs[i, 0]), int(hs[i, 1]), int(hs[i, 2]), int(hs[i, 3]), int(hs[i, 4])]
+                  for i in range(1, hn) if hs[i, cv2.CC_STAT_AREA] > 400]
+            hb.sort(key=lambda b: -b[4])
+            s2["orthos"].append({"key": k, "coverage": round(cov, 4), "holes_gt_400px": len(hb)})
+            if base_img is None:
+                base_img, base_key, blobs = img, k, hb[:12]
+        s2["verdict"] = "ok" if s2["orthos"] and all(o["coverage"] > 0.75 for o in s2["orthos"]) else \
+                        ("low-coverage" if s2["orthos"] else "no-orthos")
+        rep["sections"]["coverage"] = s2
+    except Exception as e:  # noqa: BLE001
+        rep["sections"]["coverage"] = {"error": str(e)[:300]}
+
+    # ---- S3: wall evidence --------------------------------------------------------
+    try:
+        s3sec = {}
+        for k in [f"ortho/{slug}-nadir{i}_wallband_occ.png" for i in (1, 2)] + \
+                 [f"ortho/{slug}_wallband_occ.png"]:
+            raw = _get(k)
+            if raw is None:
+                continue
+            wb = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
+            if wb is None:
+                continue
+            occ = (wb > 45).astype(np.uint8)
+            n, _, st, _ = cv2.connectedComponentsWithStats(occ)
+            s3sec[k] = {"occ_frac": round(float(occ.mean()), 4),
+                        "components_gt_1sqft": int(((st[1:, cv2.CC_STAT_AREA]) > 300).sum())}
+        s3sec["verdict"] = "ok" if s3sec else "no-wallband (splat stage not run)"
+        rep["sections"]["walls"] = s3sec
+    except Exception as e:  # noqa: BLE001
+        rep["sections"]["walls"] = {"error": str(e)[:300]}
+
+    # ---- S4: doc lint + path topology (Phase-B docs, when provided) ---------------
+    path_pts = []
+    try:
+        plan = job.get("plan_doc") or {}
+        tour = job.get("tour_doc") or {}
+        if plan or tour:
+            s4 = {"flags": []}
+            sheet = (plan.get("sheets") or [{}])[0]
+            walls = sheet.get("walls", [])
+            zones = sheet.get("zones", [])
+            paths = ((sheet.get("paths") or {}).get("flight")
+                     or (plan.get("paths") or {}).get("flight") or [])
+            path_pts = [(float(p["t"]), float(p["x"]), float(p["y"])) for p in paths if "t" in p]
+            path_pts.sort()
+            panos = {p["id"]: p.get("label", "") for p in tour.get("panos", [])}
+            hss = (tour.get("chapters") or [{}])[0].get("hotspots", [])
+            zp = {z.get("panoId") for z in zones if z.get("panoId")}
+            for pid, lbl in panos.items():
+                if pid not in zp:
+                    s4["flags"].append(f"pano {pid} ({lbl}) has no plan zone — unreachable from plan view")
+            def pat(t):
+                ts = [p[0] for p in path_pts]
+                x = float(np.interp(t, ts, [p[1] for p in path_pts]))
+                y = float(np.interp(t, ts, [p[2] for p in path_pts]))
+                return x, y
+            for h in hss:
+                a = h.get("anchor") or {}
+                t0, t1 = h.get("start"), h.get("end")
+                if not a or t0 is None or path_pts == []:
+                    continue
+                ds = [np.hypot(pat(t)[0] - a["x"], pat(t)[1] - a["y"])
+                      for t in np.arange(t0, t1 + 1, 2.0)]
+                far = h.get("fadeFar", 30)
+                if ds and min(ds) > far:
+                    s4["flags"].append(
+                        f"ring {h.get('id')} ({h.get('label')}) NEVER visible: min path distance "
+                        f"{min(ds):.1f}u > fadeFar {far} during window {t0}-{t1}")
+            # path-vs-wall crossings (adhere-to-walls rule): each = opening or model error
+            def seg_x(p1, p2, p3, p4):
+                d1 = (p2[0] - p1[0], p2[1] - p1[1]); d2 = (p4[0] - p3[0], p4[1] - p3[1])
+                den = d1[0] * d2[1] - d1[1] * d2[0]
+                if abs(den) < 1e-9:
+                    return None
+                s = ((p3[0] - p1[0]) * d2[1] - (p3[1] - p1[1]) * d2[0]) / den
+                u = ((p3[0] - p1[0]) * d1[1] - (p3[1] - p1[1]) * d1[0]) / den
+                if 0 <= s <= 1 and 0 <= u <= 1:
+                    return (p1[0] + s * d1[0], p1[1] + s * d1[1])
+                return None
+            crossings = []
+            for i in range(len(path_pts) - 1):
+                p1 = path_pts[i][1:]; p2 = path_pts[i + 1][1:]
+                for w in walls:
+                    xpt = seg_x(p1, p2, (w["a"]["x"], w["a"]["y"]) if isinstance(w.get("a"), dict)
+                                else tuple(w["a"]), (w["b"]["x"], w["b"]["y"]) if isinstance(w.get("b"), dict)
+                                else tuple(w["b"]))
+                    if xpt:
+                        crossings.append({"wall": w.get("id"), "x": round(xpt[0], 1),
+                                          "y": round(xpt[1], 1),
+                                          "t": round(path_pts[i][0], 0)})
+            s4["path_wall_crossings"] = crossings
+            if crossings:
+                s4["flags"].append(f"{len(crossings)} path-vs-laser-wall crossings — each is a real "
+                                   "opening or a wall/path placement error (drone adheres to walls)")
+            s4["verdict"] = "clean" if not s4["flags"] else f"{len(s4['flags'])} flags"
+            rep["sections"]["doc_lint"] = s4
+        else:
+            rep["sections"]["doc_lint"] = {"verdict": "skipped (no Phase-B docs supplied)"}
+    except Exception as e:  # noqa: BLE001
+        rep["sections"]["doc_lint"] = {"error": str(e)[:300]}
+
+    # ---- S5: handedness invariant -------------------------------------------------
+    rep["sections"]["handedness"] = {
+        "doctrine": "splat free-camera raster is true-handed WITHOUT flip; yaw table "
+                    "[267,177,87,357]=N,E,S,W (proven 2026-07-18, chiral anchors)",
+        "verdict": "doctrine-pinned (automated chiral check = v2 TODO)"}
+
+    # ---- S6: perception (Claude API) ----------------------------------------------
+    try:
+        akey = os.environ.get("ANTHROPIC_API_KEY", "")
+        if akey and akey != "PLACEHOLDER" and blobs and base_img is not None:
+            imgs = []
+            for (x, y, w, h, _a) in blobs[:6]:
+                pad = 80
+                crop = base_img[max(0, y - pad):y + h + pad, max(0, x - pad):x + w + pad]
+                if crop.ndim == 3 and crop.shape[2] == 4:
+                    crop = cv2.cvtColor(crop, cv2.COLOR_BGRA2BGR)
+                ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if ok:
+                    imgs.append(base64.b64encode(buf.tobytes()).decode())
+            content = [{"type": "text", "text":
+                        "These are top-down drone-ortho crops of a house interior, each centered on an "
+                        "unresolved hole/blob. For each numbered image reply one line: N: <what the dark/"
+                        "missing area most likely is (furniture shadow, tall furniture parallax, skylight "
+                        "blowout, unscanned floor, etc)> or N: UNKNOWN."}]
+            for i, b in enumerate(imgs):
+                content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}})
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=json.dumps({"model": "claude-sonnet-5", "max_tokens": 900,
+                                 "messages": [{"role": "user", "content": content}]}).encode(),
+                headers={"x-api-key": akey, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                out = json.loads(r.read())
+            rep["sections"]["perception"] = {
+                "n_crops": len(imgs),
+                "identifications": "".join(c.get("text", "") for c in out.get("content", []))}
+        else:
+            rep["sections"]["perception"] = {
+                "verdict": "skipped (" + ("no API key" if not akey or akey == "PLACEHOLDER"
+                                          else "no unknown blobs") + ")"}
+    except Exception as e:  # noqa: BLE001
+        rep["sections"]["perception"] = {"error": str(e)[:300]}
+
+    # ---- QC map + report ----------------------------------------------------------
+    try:
+        if base_img is not None:
+            vis = base_img[..., :3].copy() if base_img.ndim == 3 else cv2.cvtColor(base_img, cv2.COLOR_GRAY2BGR)
+            for (x, y, w, h, _a) in blobs:
+                cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 200, 255), 3)
+            sc = 1600.0 / max(vis.shape[:2])
+            vis = cv2.resize(vis, None, fx=sc, fy=sc)
+            ok, buf = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 88])
+            if ok:
+                s3.put_object(Bucket=R2_BUCKET, Key=f"projects/{slug}/qc/qc_map.jpg",
+                              Body=buf.tobytes(), ContentType="image/jpeg")
+                rep["map_key"] = f"projects/{slug}/qc/qc_map.jpg"
+    except Exception as e:  # noqa: BLE001
+        rep["map_error"] = str(e)[:200]
+    verdicts = {k: v.get("verdict", "n/a") if isinstance(v, dict) else "n/a"
+                for k, v in rep["sections"].items()}
+    rep["scorecard"] = verdicts
+    s3.put_object(Bucket=R2_BUCKET, Key=f"projects/{slug}/qc/report.json",
+                  Body=json.dumps(rep, indent=1).encode(), ContentType="application/json")
+    rep["report_key"] = f"projects/{slug}/qc/report.json"
+    print(json.dumps(verdicts, indent=1))
+    return rep
+
+
+@app.local_entrypoint()
+def qcrun(slug: str, srt_keys: str = "", plan_doc: str = "", tour_doc: str = ""):
+    """On-demand QC: modal run modal_app.py::qcrun --slug tucson-castilla
+    --srt-keys projects/x/qc/0045.srt,projects/x/qc/0046.srt --plan-doc plan.json --tour-doc tour.json"""
+    import json as _j
+    job: dict = {"srt_keys": [k for k in srt_keys.split(",") if k]}
+    if plan_doc:
+        job["plan_doc"] = _j.load(open(plan_doc, encoding="utf-8"))
+    if tour_doc:
+        job["tour_doc"] = _j.load(open(tour_doc, encoding="utf-8"))
+    r = qc_property.remote(slug, job)
+    print(_j.dumps(r, indent=1)[:6000])
 
 
 # ---------------------------------------------------------------------------
@@ -3539,7 +3850,7 @@ def make_furnish(slug: str, nadir_name: str = "nadir_hires.mp4", base_key: str =
     return {"composed": key, "px": [int(W), int(H)], "furniture": int(pasted)}
 
 
-@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=3600,
+@app.function(image=ortho_image, secrets=[r2_secret], volumes={"/scratch": vol}, timeout=7200,
               memory=10240)
 def make_trueortho(slug: str, ceiling_ft: float = 9.0, pxm: float = 100.0,
                    max_off_deg: float = 32.0, n_frames: int = 900, fov_pow: float = 12.0,
@@ -3656,6 +3967,15 @@ def make_trueortho(slug: str, ceiling_ft: float = 9.0, pxm: float = 100.0,
         sel = (vert > cosfill) & ((hcam - zc) > 0.1 * room)
         if not sel.any():
             continue
+        if dofill:
+            # Bound the march work: obliques only on every 5th frame, and only for
+            # VIRGIN cells (first unblocked oblique claims — beauty fill, not metrology;
+            # strict rays still recompete everywhere on every frame).
+            obm = vert <= cosmax
+            if (i // step) % 5:
+                sel &= ~obm
+            else:
+                sel &= (~obm) | (best[gidx] == 0)
         # two weight tiers: strict near-vertical rays live in [1, 2] and always beat
         # oblique fill rays, which live in (0, ~0.001] and only claim empty cells.
         w = (vert ** fov_pow).astype(np.float32)
@@ -3663,6 +3983,28 @@ def make_trueortho(slug: str, ceiling_ft: float = 9.0, pxm: float = 100.0,
         cand = sel & (w > best[gidx])
         if not cand.any():
             continue
+        # OCCLUSION MARCH for oblique winners: over-include by angle, then let the
+        # GEOMETRY cut — a ray must clear the DSM (walls, tall furniture) along its
+        # whole path or it cannot paint the cell. Walls are the scissors, not the cone.
+        if dofill:
+            ob = cand & (vert <= cosmax)
+            if ob.any():
+                # march in constant-memory chunks — at wide angles a frame's candidate
+                # window can span millions of cells and the (n x samples) grids OOM.
+                oi_all = np.where(ob)[0]
+                tsm = np.linspace(0.08, 0.92, 12, dtype=np.float32)[None, :]
+                for s0 in range(0, len(oi_all), 200_000):
+                    oi = oi_all[s0:s0 + 200_000]
+                    sx = (Ce1 + (pl1[oi, None] - Ce1) * tsm).astype(np.float32)
+                    sy = (Ce2 + (pl2[oi, None] - Ce2) * tsm).astype(np.float32)
+                    sz = (hcam + (zc[oi, None] - hcam) * tsm).astype(np.float32)
+                    gx = np.clip(((sx - lo1) / span1 * (W - 1)), 0, W - 1).astype(np.int32)
+                    gy = np.clip(((sy - lo2) / span2 * (H - 1)), 0, H - 1).astype(np.int32)
+                    surf = zsurf[(gy.astype(np.int64) * W + gx).ravel()].reshape(len(oi), -1)
+                    blocked = (sz < surf - 0.03 * room).any(axis=1)
+                    cand[oi[blocked]] = False
+                if not cand.any():
+                    continue
         cap.set(cv2.CAP_PROP_POS_MSEC, float(ts[i]) * 1000.0)
         ok2, fr = cap.read()
         if not ok2:
@@ -5030,6 +5372,14 @@ def render_splat(slug: str, out_w: int = 2266, ceil_cut: float = 0.8, floor_cut:
             dt = cv2.distanceTransform((lab == i).astype(np.uint8), cv2.DIST_L2, 3)
             if float(dt.max()) > 0.75 * px_ft:                # fatter than ~1.5 ft -> not a wall
                 ev[lab == i] = 0
+        # export the raw wall evidence (occupancy + cleaned mask) — the blind-floorplan
+        # vectorizer consumes these, not the fitted strokes
+        _s3w = _r2()
+        cv2.imwrite("/tmp/wev.png", ev * 255)
+        _s3w.upload_file("/tmp/wev.png", R2_BUCKET, f"ortho/{slug}_wallband_mask.png")
+        cv2.imwrite("/tmp/wocc.png", (np.clip(wocc, 0, 1) * 255).astype(np.uint8))
+        _s3w.upload_file("/tmp/wocc.png", R2_BUCKET, f"ortho/{slug}_wallband_occ.png")
+        print(f"[render] wall evidence -> ortho/{slug}_wallband_mask.png + _occ.png")
         ug = (fx * (p1g - mid1) + (out_w - 1) / 2.0).round().long().clamp(0, out_w - 1)
         vg = ((Ht - 1) / 2.0 - fy * (p2g - mid2)).round().long().clamp(0, Ht - 1)
         stroke = np.zeros((Ht, out_w), np.uint8)
@@ -5954,6 +6304,87 @@ def splattrain(slug: str, iters: int = 20000, init_pts: int = 500000, sh_degree:
         modal run modal_app.py::splattrain --slug scottsdale-nadir"""
     print(train_splat.remote(slug, iters=iters, init_pts=init_pts, sh_degree=sh_degree,
                              pose_opt=pose_opt, still_start=still_start))
+
+
+@app.function(image=gsplat_image, gpu="A10G", secrets=[r2_secret], volumes={"/scratch": vol},
+              timeout=1800, memory=16384)
+def splat_views(slug: str, stations_json: str, fov_deg: float = 95.0, out_w: int = 1280,
+                out_h: int = 880, h_ft: float = 4.7) -> dict:
+    """FREE CAMERA inside the trained splat — the pipeline's own eyes. Stations come
+    from the PLAN (sheet coords inverted through the registration), so the floorplan
+    literally places the cameras. Renders 4 yaw views per station ->
+    ortho/<slug>_view_<label>_<yaw>.jpg. Note: the reconstruction is mirrored vs
+    reality (delivery flips; analysis views are labeled, not flipped)."""
+    import json
+    import numpy as np
+    import cv2
+    import torch
+    from gsplat import rasterization, spherical_harmonics
+
+    sd = f"/scratch/{slug}"; spd = f"{sd}/splat"
+    meta = json.load(open(f"{spd}/cameras.json"))
+    ck = torch.load(f"{spd}/ckpt.pt", map_location="cuda", weights_only=False)
+    up = np.array(meta["up"]); e1 = np.array(meta["e1"]); e2 = np.array(meta["e2"])
+    floor, room, fpu = meta["floor"], meta["room"], meta["fpu"]
+    shdeg = int(ck["sh_degree"])
+    upT = torch.tensor(up, dtype=torch.float32, device="cuda")
+    mall = ck["means"].cuda(); h = mall @ upT
+    sall = torch.exp(ck["scales"].cuda()); qall = ck["quats"].cuda()
+    opaall = torch.sigmoid(ck["opacities"].cuda())
+    shall = torch.cat([ck["sh0"].cuda(), ck["shN"].cuda()], 1)
+    needle = ((sall.max(1).values > 4.0 * sall.median(1).values)
+              & (sall.max(1).values > 0.05 * room))
+    band = ((opaall > 0.3) & (sall.max(1).values < 0.25 * room) & ~needle
+            & (h < floor + 1.05 * room) & (h > floor - 0.3 * room))
+    idx = band
+
+    def shade(campos):
+        m = mall[idx]
+        dirs = m - torch.tensor(campos, dtype=torch.float32, device="cuda")
+        dirs = dirs / dirs.norm(dim=1, keepdim=True).clamp(min=1e-9)
+        return torch.clamp(spherical_harmonics(shdeg, dirs, shall[idx]) + 0.5, 0.0, 1.0)
+
+    fx = 0.5 * out_w / np.tan(np.radians(fov_deg) / 2)
+    K = [[fx, 0, out_w / 2.0], [0, fx, out_h / 2.0], [0, 0, 1]]
+    s3 = _r2(); outkeys = []
+    for st in json.loads(stations_json):
+        c1, c2 = float(st["c1"]), float(st["c2"])
+        campos = c1 * e1 + c2 * e2 + (floor + (st.get("h_ft", h_ft) / fpu)) * up
+        for yaw in st.get("yaws", [0, 90, 180, 270]):
+            th = np.radians(yaw)
+            f0 = np.cos(th) * e1 + np.sin(th) * e2
+            f0 = f0 / np.linalg.norm(f0)
+            r = np.cross(f0, up); r /= np.linalg.norm(r)
+            d = np.cross(f0, r); d /= np.linalg.norm(d)
+            R = np.stack([r, d, f0])                       # rows: right, down, forward
+            vm = np.eye(4); vm[:3, :3] = R; vm[:3, 3] = -R @ campos
+            renders, _, _ = rasterization(
+                means=mall[idx], quats=qall[idx], scales=sall[idx], opacities=opaall[idx],
+                colors=shade(campos),
+                viewmats=torch.tensor(vm, dtype=torch.float32, device="cuda")[None],
+                Ks=torch.tensor(K, dtype=torch.float32, device="cuda")[None],
+                width=out_w, height=out_h, packed=False, camera_model="pinhole")
+            im = (renders[0].clamp(0, 1) * 255).byte().cpu().numpy()
+            bgr = cv2.cvtColor(im, cv2.COLOR_RGB2BGR)
+            # NO flip: the mirror-handed cloud and the cross-product camera basis
+            # cancel — the raw raster is already true-handed (proven 2026-07-18 by
+            # chiral anchors: mantel clock, bar sink/wine-fridge, fireplace/TV).
+            # Adding flip(1) here is what re-mirrored v1. Yaw table [267,177,87,357]
+            # = plan N,E,S,W (reversed spin = left-handed world's signature).
+            cv2.putText(bgr, f"{st['label']} yaw{yaw} (true-hand-v2)", (14, 34),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.imwrite("/tmp/v.jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            k = f"ortho/{slug}_view_{st['label']}_{yaw}.jpg"
+            s3.upload_file("/tmp/v.jpg", R2_BUCKET, k); outkeys.append(k)
+            print(f"[view] {st['label']} yaw{yaw} -> {k}")
+    return {"views": outkeys, "n": len(outkeys)}
+
+
+@app.local_entrypoint()
+def splatviews(slug: str, stations_json: str, fov_deg: float = 95.0):
+    """modal run modal_app.py::splatviews --slug tucson-castilla-nadir1 --stations-json '[{...}]'"""
+    import json as _j
+    print(_j.dumps(splat_views.remote(slug, stations_json, fov_deg=fov_deg), indent=1))
 
 
 @app.local_entrypoint()
