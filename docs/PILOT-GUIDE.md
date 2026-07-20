@@ -77,7 +77,9 @@ tighter verification; the minimum above is enough to dimension the whole propert
 
 - [ ] SRT test clip verified on THIS camera TODAY
 - [ ] Stabilization ON, full sphere, max res
-- [ ] Every interior door open; screen doors cleared; blinds up (light matters)
+- [ ] Every interior door open to its MAX state (they won't all lie flat — that's fine; just don't leave one closed by accident)
+- [ ] Excluded areas list written down (garage, storage, anything the owner wants OUT) — enter it at upload so the system knows "skipped on purpose" from "missed"
+- [ ] Blinds up; screen doors cleared (light matters)
 - [ ] Doorway texture both sides of the main threshold
 - [ ] Nadir: every room, wall-hugs, wing overlap room flown in both passes
 - [ ] Cine: one continuous take, 2–3 s pause per room, slow thresholds

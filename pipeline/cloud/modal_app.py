@@ -571,7 +571,15 @@ def qc_property(slug: str, job: dict = None) -> dict:  # noqa: C901 — QC is a 
 
     job = job or {}
     s3 = _r2()
-    rep: dict = {"slug": slug, "sections": {}}
+    # Capture-scope doctrine (Justin, 2026-07-19): areas can be CAPTURED, EXCLUDED BY
+    # DESIGN (owner scope — garage, storage), or OCCLUDED BY PHYSICS (max-state doors
+    # that don't fold flat). Only missed-by-error is a QC failure. Excluded areas must
+    # never be scored as gaps — but fabricated fill inside them IS a defect.
+    excluded = [str(a) for a in (job.get("excluded_areas") or [])]
+    rep: dict = {"slug": slug, "sections": {},
+                 "scope": {"excluded_areas": excluded,
+                           "note": "excluded areas are by-design, not gaps; they must "
+                                   "render honestly blank (no fabricated fill)"}}
 
     def _get(key, binary=True):
         try:
