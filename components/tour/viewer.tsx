@@ -11,7 +11,7 @@ import {
   saveDoc,
   type RevisionMeta,
 } from "@/lib/author-client";
-import { TourTutorial } from "@/components/tour/tour-tutorial";
+import { TourTutorial, type TourPlatform } from "@/components/tour/tour-tutorial";
 import { PlanPanel } from "@/components/tour/plan";
 import { centroidOf, closestApproachNearT } from "@/lib/plan-geometry";
 import { cn } from "@/lib/utils";
@@ -136,6 +136,10 @@ export function TourViewer({
 
   const [started, setStarted] = useState(false);
   const [isMobileUi, setIsMobileUi] = useState(false);
+  const [tutorialPlatform, setTutorialPlatform] = useState<TourPlatform>({
+    os: "desktop",
+    browser: "other",
+  });
   const [showTutorial, setShowTutorial] = useState(false);
   const [loading, setLoading] = useState(false);
   const [playing, setPlaying] = useState(false);
@@ -284,6 +288,13 @@ export function TourViewer({
       hasOrientation &&
       typeof (DeviceOrientationEvent as unknown as { requestPermission?: unknown })
         .requestPermission === "function";
+    // In-app webviews (Instagram/FB/TikTok/Snap/Google app) restrict motion +
+    // fullscreen — the tutorial tells those visitors to pop out to a browser.
+    const inApp = /(FBAN|FBAV|Instagram|TikTok|Snapchat|Line\/|GSA\/)/.test(ua);
+    setTutorialPlatform({
+      os: isIOS ? "ios" : isAndroid ? "android" : "desktop",
+      browser: inApp ? "inapp" : browser,
+    });
     capsRef.current = {
       isIOS,
       isAndroid,
@@ -1877,7 +1888,7 @@ export function TourViewer({
       {/* Pre-flight cover */}
       {!started && showTutorial && !failed && (
         <TourTutorial
-          isMobile={isMobileUi}
+          platform={tutorialPlatform}
           hasMotion={motionAvail}
           onBegin={() => {
             try {

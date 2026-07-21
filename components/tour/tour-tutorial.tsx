@@ -20,6 +20,9 @@ const CSS = `
 @keyframes lvxRipple{0%{opacity:.5;transform:translate(-50%,-50%) scale(.5)}100%{opacity:0;transform:translate(-50%,-50%) scale(2)}}
 @keyframes lvxBar{0%,100%{opacity:.3}50%{opacity:1}}
 @keyframes lvxScroll{0%,100%{transform:translateY(0);opacity:.35}50%{transform:translateY(0.4em);opacity:1}}
+@keyframes lvxPinchA{0%,100%{transform:translate(-0.3em,0.3em)}50%{transform:translate(-0.8em,0.8em)}}
+@keyframes lvxPinchB{0%,100%{transform:translate(0.3em,-0.3em)}50%{transform:translate(0.8em,-0.8em)}}
+@keyframes lvxCorners{0%,100%{transform:scale(1);opacity:.5}50%{transform:scale(1.18);opacity:1}}
 `;
 
 function Chevron({ className }: { className?: string }) {
@@ -139,40 +142,141 @@ function MiniMap() {
   );
 }
 
+function Pinch() {
+  return (
+    <span className="relative flex h-[2em] w-[2em] items-center justify-center">
+      <span
+        className="absolute h-[0.55em] w-[0.55em] rounded-full border border-champagne bg-champagne/30"
+        style={{ animation: "lvxPinchA 1.4s ease-in-out infinite" }}
+      />
+      <span
+        className="absolute h-[0.55em] w-[0.55em] rounded-full border border-champagne bg-champagne/30"
+        style={{ animation: "lvxPinchB 1.4s ease-in-out infinite" }}
+      />
+    </span>
+  );
+}
+
+function ExitTap() {
+  return (
+    <>
+      <span className="absolute inset-[18%] rounded-lg border border-paper/40" />
+      <span className="absolute right-[22%] top-[24%] flex h-[0.9em] w-[0.9em] items-center justify-center rounded-full border border-champagne text-[0.55em] font-semibold text-champagne"
+        style={{ animation: "lvxRing 1.6s ease-in-out infinite" }}>
+        ✕
+      </span>
+    </>
+  );
+}
+
+function Corners() {
+  return (
+    <span
+      className="relative h-[1.9em] w-[2.7em]"
+      style={{ animation: "lvxCorners 1.6s ease-in-out infinite" }}
+    >
+      {[
+        "left-0 top-0 border-l-2 border-t-2",
+        "right-0 top-0 border-r-2 border-t-2",
+        "left-0 bottom-0 border-l-2 border-b-2",
+        "right-0 bottom-0 border-r-2 border-b-2",
+      ].map((c) => (
+        <span key={c} className={`absolute h-[0.55em] w-[0.55em] border-champagne ${c}`} />
+      ))}
+    </span>
+  );
+}
+
+function InApp() {
+  return (
+    <span className="relative flex h-[1.8em] w-[2.6em] items-center justify-center rounded-lg border border-paper/40">
+      <span className="absolute right-[8%] top-[10%] text-[0.6em] tracking-widest text-champagne"
+        style={{ animation: "lvxBar 1.4s ease-in-out infinite" }}>
+        •••
+      </span>
+      <span className="text-[0.5em] uppercase tracking-[0.15em] text-paper/60">browser</span>
+    </span>
+  );
+}
+
 type Step = { key: string; label: string; sub: string; graphic: ReactNode };
 
-function buildSteps(isMobile: boolean, hasMotion: boolean): Step[] {
-  if (isMobile) {
-    const steps: Step[] = [
-      { key: "look", label: "Swipe to look", sub: "Drag any direction — all the way around.", graphic: <Look /> },
-      { key: "ring", label: "Tap a gold ring", sub: "Step inside that room in full 360°.", graphic: <Ring /> },
-      { key: "controls", label: "Tap to show controls", sub: "Reveal play, the scrub bar, and the map.", graphic: <Controls /> },
+export type TourPlatform = {
+  os: "ios" | "android" | "desktop";
+  browser: "safari" | "chrome" | "firefox" | "edge" | "samsung" | "inapp" | "other";
+};
+
+/** Device- AND browser-specific flight instructions. The gestures differ per
+ *  platform (scroll vs pinch, Esc vs ✕, motion permission vs instant), so the
+ *  coach says exactly what THIS visitor's device will do. */
+function buildSteps(p: TourPlatform, hasMotion: boolean): Step[] {
+  if (p.os === "desktop") {
+    return [
+      { key: "look", label: "Drag to look", sub: "Click and drag anywhere in the view.", graphic: <Look /> },
+      { key: "zoom", label: "Scroll to zoom", sub: p.browser === "safari" ? "Or pinch on the trackpad." : "Or pinch on a trackpad.", graphic: <Zoom /> },
+      { key: "ring", label: "Click a gold ring", sub: "Step inside that room in full 360°.", graphic: <Ring /> },
+      { key: "map", label: "Open the map", sub: "Jump straight to any room.", graphic: <MiniMap /> },
+      { key: "fs", label: "Go fullscreen", sub: "The ⛶ button in the controls — Esc returns.", graphic: <Corners /> },
     ];
-    if (hasMotion) {
-      steps.push({ key: "vr", label: "Tap “VR” for motion", sub: "Then look just by moving your phone.", graphic: <Vr /> });
-    }
-    return steps;
   }
-  return [
-    { key: "look", label: "Drag to look", sub: "Click and drag anywhere in the view.", graphic: <Look /> },
-    { key: "zoom", label: "Scroll to zoom", sub: "Or pinch on a trackpad.", graphic: <Zoom /> },
-    { key: "ring", label: "Click a gold ring", sub: "Step inside that room in full 360°.", graphic: <Ring /> },
-    { key: "map", label: "Open the map", sub: "Jump straight to any room.", graphic: <MiniMap /> },
-  ];
+  const steps: Step[] = [];
+  if (p.browser === "inapp") {
+    steps.push({
+      key: "inapp",
+      label: "Best outside the app",
+      sub: "Tap ••• and “Open in browser” — motion and fullscreen work best there.",
+      graphic: <InApp />,
+    });
+  }
+  steps.push(
+    { key: "look", label: "Swipe to look", sub: "Drag any direction — all the way around.", graphic: <Look /> },
+    { key: "pinch", label: "Pinch to zoom", sub: "Two fingers — spread apart to zoom in.", graphic: <Pinch /> },
+    { key: "ring", label: "Tap a gold ring", sub: "Step inside that room in full 360°.", graphic: <Ring /> },
+  );
+  if (p.os === "ios") {
+    steps.push({
+      key: "exit",
+      label: "✕ returns to the page",
+      sub:
+        p.browser === "chrome"
+          ? "The tour fills your Chrome tab. Tap once for controls; ✕ (top right) brings the page back."
+          : "The tour fills your screen. Tap once for controls; ✕ (top right) brings the page back.",
+      graphic: <ExitTap />,
+    });
+  } else {
+    steps.push({
+      key: "exit",
+      label: "Fullscreen flight",
+      sub: "Rotate for the widest view. Tap once for controls; ✕ or Back exits.",
+      graphic: <ExitTap />,
+    });
+  }
+  if (hasMotion) {
+    steps.push({
+      key: "vr",
+      label: "Tap “VR” for motion",
+      sub:
+        p.os === "ios"
+          ? "Allow motion access when asked — then look just by moving your phone."
+          : "No permission needed — look just by moving your phone.",
+      graphic: <Vr />,
+    });
+  }
+  return steps;
 }
 
 export function TourTutorial({
-  isMobile,
+  platform,
   hasMotion,
   onBegin,
   onSkip,
 }: {
-  isMobile: boolean;
+  platform: TourPlatform;
   hasMotion: boolean;
   onBegin: () => void;
   onSkip: () => void;
 }) {
-  const steps = buildSteps(isMobile, hasMotion);
+  const steps = buildSteps(platform, hasMotion);
   const [i, setI] = useState(0);
 
   useEffect(() => {
