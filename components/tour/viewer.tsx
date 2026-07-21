@@ -1106,16 +1106,63 @@ export function TourViewer({
 
   // CSS pseudo-fullscreen (iOS): lock body scroll and allow Esc to exit while
   // the overlay is up. The real Fullscreen API handles both itself.
+  //
+  // CONTAINING-BLOCK TRAP (proven on iPhone Chrome, 2026-07-21 screen recording):
+  // any ancestor with a transform / filter / backdrop-filter / perspective /
+  // will-change / contain becomes the containing block for position:fixed, so
+  // the "fullscreen" overlay stays INSIDE the page card — rotate nudge showing,
+  // page chrome still visible, player card-sized. iOS has no real fullscreen
+  // API so it ALWAYS rides this path. While the overlay is up, neutralize every
+  // ancestor that would contain us; restore their inline styles on exit.
   useEffect(() => {
     if (!pseudoFs) return;
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
+    const PROPS = ["transform", "filter", "backdrop-filter", "perspective", "will-change", "contain"];
+    const patched: Array<{ el: HTMLElement; saved: Array<[string, string, string]> }> = [];
+    const seen = new Set<HTMLElement>();
+    const sweep = () => {
+      let node: HTMLElement | null = mountRef.current?.parentElement?.parentElement ?? null;
+      while (node && node !== document.body) {
+        if (!seen.has(node)) {
+          const cs = getComputedStyle(node);
+          const traps =
+            cs.getPropertyValue("transform") !== "none" ||
+            cs.getPropertyValue("filter") !== "none" ||
+            !["", "none"].includes(cs.getPropertyValue("backdrop-filter")) ||
+            cs.getPropertyValue("perspective") !== "none" ||
+            /transform|filter|perspective/.test(cs.getPropertyValue("will-change")) ||
+            /layout|paint|strict|content/.test(cs.getPropertyValue("contain"));
+          if (traps) {
+            seen.add(node);
+            patched.push({
+              el: node,
+              saved: PROPS.map((p) => [p, node!.style.getPropertyValue(p), node!.style.getPropertyPriority(p)]),
+            });
+            for (const p of PROPS)
+              node.style.setProperty(p, p === "will-change" ? "auto" : "none", "important");
+          }
+        }
+        node = node.parentElement;
+      }
+    };
+    // Reveal animations can still be mid-flight at the Begin tap and settle
+    // AFTER we enter the overlay — sweep again once they've had time to land.
+    sweep();
+    const t1 = window.setTimeout(sweep, 400);
+    const t2 = window.setTimeout(sweep, 1200);
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setPseudoFs(false);
     };
     window.addEventListener("keydown", onKey);
     return () => {
       document.body.style.overflow = prevOverflow;
+      window.clearTimeout(t1);
+      window.clearTimeout(t2);
+      for (const { el, saved } of patched)
+        for (const [p, v, prio] of saved)
+          if (v) el.style.setProperty(p, v, prio);
+          else el.style.removeProperty(p);
       window.removeEventListener("keydown", onKey);
     };
   }, [pseudoFs]);
