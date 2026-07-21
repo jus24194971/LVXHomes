@@ -176,6 +176,11 @@ export function TourViewer({
   const [chapterIdx, setChapterIdx] = useState(0);
 
   const startedRef = useRef(false);
+  // Mobile two-state player: embedded = PASSIVE (touches scroll the page),
+  // immersive = CAPTURED (touches steer the camera). These bridge that state
+  // into the engine's pointer handlers, which are attached once per tour.
+  const immersiveRef = useRef(false);
+  const canvasElRef = useRef<HTMLElement | null>(null);
   const motionOnRef = useRef(false);
   const panoRef = useRef<TourPano | null>(null);
   /** The flight's look direction when you stepped into a pano — restored on resume. */
@@ -511,12 +516,17 @@ export function TourViewer({
 
     // ---------- pointer controls ----------
     const el = renderer.domElement;
-    el.style.touchAction = "none";
+    canvasElRef.current = el;
+    // Mobile starts passive: pan-y lets one-finger drags scroll the PAGE until
+    // the viewer goes immersive (the capture-policy effect flips this live).
+    el.style.touchAction = capsRef.current.isMobile ? "pan-y" : "none";
     const DRAG_SPEED = 0.18;
 
     el.addEventListener(
       "pointerdown",
       (e) => {
+        // Embedded on a phone: never capture — the page owns the gesture.
+        if (capsRef.current.isMobile && !immersiveRef.current) return;
         try {
           el.setPointerCapture(e.pointerId);
         } catch {
@@ -1098,6 +1108,17 @@ export function TourViewer({
       window.removeEventListener("keydown", onKey);
     };
   }, [pseudoFs]);
+
+  // Mobile capture policy: the camera only ever owns touches while immersive
+  // (real fullscreen or the iOS overlay). Embedded, the canvas passes vertical
+  // pans to the page so the visitor is never trapped inside the player.
+  useEffect(() => {
+    immersiveRef.current = fsActive || pseudoFs;
+    const el = canvasElRef.current;
+    if (el)
+      el.style.touchAction =
+        capsRef.current.isMobile && !(fsActive || pseudoFs) ? "pan-y" : "none";
+  }, [fsActive, pseudoFs]);
 
   // Track portrait/landscape for the immersive flight's rotate nudge.
   useEffect(() => {
@@ -1709,6 +1730,36 @@ export function TourViewer({
           fading ? "scale-[1.06] blur-[1.5px]" : "scale-100 blur-0",
         )}
       />
+
+      {/* Mobile two-state affordances: embedded is passive — a whole-surface tap
+          re-enters immersive; immersive gets a persistent exit that never
+          auto-hides with the rest of the chrome. */}
+      {started && isMobileUi && !fsActive && !pseudoFs && (
+        <button
+          type="button"
+          onClick={enterImmersive}
+          aria-label="Enter the immersive tour"
+          className="absolute inset-0 z-20 flex items-end justify-center bg-transparent pb-14"
+          style={{ touchAction: "pan-y" }}
+        >
+          <span className="pointer-events-none rounded-full border border-champagne/60 bg-ink/70 px-4 py-2 text-sm tracking-wide text-champagne backdrop-blur">
+            Tap to explore the tour
+          </span>
+        </button>
+      )}
+      {started && isMobileUi && (fsActive || pseudoFs) && (
+        <button
+          type="button"
+          onClick={exitImmersive}
+          aria-label="Exit the tour"
+          className="absolute right-3 z-30 rounded-full border border-white/40 bg-ink/70 p-2.5 text-white shadow-lg backdrop-blur"
+          style={{ top: "max(0.75rem, env(safe-area-inset-top))" }}
+        >
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <path d="M6 6l12 12M18 6L6 18" />
+          </svg>
+        </button>
+      )}
 
       {/* Hotspots — projected into the world each frame (all chapters; only
           the active chapter's are made visible by the render loop) */}
