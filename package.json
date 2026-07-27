@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@cloudflare/stream-react": "^1.9.3",
+    "@mkkellogg/gaussian-splats-3d": "^0.4.7",
     "@opennextjs/cloudflare": "^1.19.11",
     "aws4fetch": "^1.0.20",
     "hls.js": "^1.6.16",

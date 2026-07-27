@@ -6393,6 +6393,113 @@ def splat_views(slug: str, stations_json: str, fov_deg: float = 95.0, out_w: int
     return {"views": outkeys, "n": len(outkeys)}
 
 
+@app.function(image=gsplat_image, volumes={"/scratch": vol}, secrets=[r2_secret], timeout=1800)
+def export_dollhouse_splat(slug1: str, slug2: str, t_json: str, out_key: str,
+                           ceil_frac: float = 0.78, opa_min: float = 0.25) -> dict:
+    """Merge two trained splats into ONE true-handed, ceiling-cut web dollhouse
+    (.splat, antimatter15 layout: pos f32x3 | scale f32x3 | rgba u8x4 | quat u8x4).
+    t_json: the solved cloud2->cloud1 horizontal similarity + bases/floors
+    (dollhouse_T.json). Viewer frame: X=e1(mirrored for true hand), Y=up, Z=e2."""
+    import io
+    import json
+    import numpy as np
+    import torch
+
+    T = json.loads(t_json)
+    R2 = np.array(T["R2"]); t2 = np.array(T["t2"]); s = float(T["scale"])
+
+    def load(slug):
+        ck = torch.load(f"/scratch/{slug}/splat/ckpt.pt", map_location="cpu", weights_only=False)
+        m = ck["means"].numpy(); q = ck["quats"].numpy()
+        sc = np.exp(ck["scales"].numpy()); op = 1 / (1 + np.exp(-ck["opacities"].numpy()))
+        col = np.clip(0.2820947918 * ck["sh0"].numpy()[:, 0, :] + 0.5, 0, 1)
+        return m, q, sc, op, col
+
+    m1, q1, s1, o1, c1 = load(slug1)
+    m2, q2, s2, o2, c2 = load(slug2)
+    e11, e21, up1 = np.array(T["e1_1"]), np.array(T["e2_1"]), np.array(T["up_1"])
+    e12, e22, up2 = np.array(T["e1_2"]), np.array(T["e2_2"]), np.array(T["up_2"])
+    f1v, f2v = float(T["floor_1"]), float(T["floor_2"])
+
+    # cloud2 -> cloud1: horizontal similarity in e-coords + floor-aligned vertical
+    z2 = np.stack([m2 @ e12, m2 @ e22], 1)
+    h2 = m2 @ up2
+    z1 = z2 @ R2.T + t2
+    h1 = s * (h2 - f2v) + f1v
+    m2in1 = np.outer(z1[:, 0], e11) + np.outer(z1[:, 1], e21) + np.outer(h1, up1)
+    # rotation cloud2->cloud1 = B1 @ Rz(theta) @ B2^T (theta from R2; det +1 chain)
+    th = float(np.arctan2(R2[1, 0], R2[0, 0]))
+    Rz = np.array([[np.cos(th), -np.sin(th), 0], [np.sin(th), np.cos(th), 0], [0, 0, 1]])
+    B1 = np.stack([e11, e21, up1], 1); B2 = np.stack([e12, e22, up2], 1)
+    R3 = B1 @ Rz @ B2.T
+    if np.linalg.det(R3) < 0:            # covariance-safe det fix (right-mul sign flip)
+        R3 = R3 @ np.diag([1.0, 1.0, -1.0])
+
+    def quat_mul_R(Rm, quats):           # q' = quat(Rm) * q  (w,x,y,z layout)
+        w = np.sqrt(max(0.0, 1 + Rm[0, 0] + Rm[1, 1] + Rm[2, 2])) / 2
+        x = (Rm[2, 1] - Rm[1, 2]) / (4 * w + 1e-12)
+        y = (Rm[0, 2] - Rm[2, 0]) / (4 * w + 1e-12)
+        z = (Rm[1, 0] - Rm[0, 1]) / (4 * w + 1e-12)
+        a, b, c, d = w, x, y, z
+        qw, qx, qy, qz = quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
+        return np.stack([a * qw - b * qx - c * qy - d * qz,
+                         a * qx + b * qw + c * qz - d * qy,
+                         a * qy - b * qz + c * qw + d * qx,
+                         a * qz + b * qy - c * qx + d * qw], 1)
+
+    q2in1 = quat_mul_R(R3, q2)
+    s2in1 = s2 * s
+    means = np.vstack([m1, m2in1]); quats = np.vstack([q1, q2in1])
+    scales = np.vstack([s1, s2in1]); opas = np.concatenate([o1, o2])
+    cols = np.vstack([c1, c2])
+    src2 = np.zeros(len(means), bool); src2[len(m1):] = True
+
+    # ---- dollhouse filters: opacity, needle-drop, height band (ceiling off) ----
+    room = float(T["room_1"])
+    h = means @ up1
+    smax = scales.max(1); smed = np.median(scales, 1)
+    needle = (smax > 4 * smed) & (smax > 0.05 * room)
+    keep = (opas > opa_min) & ~needle & (h > f1v - 0.35 * room) & (h < f1v + ceil_frac * room)
+    means, quats, scales, opas, cols = means[keep], quats[keep], scales[keep], opas[keep], cols[keep]
+    print(f"merged {len(m1)}+{len(m2)} -> kept {len(means)} after dollhouse filters")
+
+    # ---- viewer frame: X=-e1 (true-hand mirror), Y=up, Z=e2; floor at y=0 ----
+    Rv = np.stack([-e11, up1, e21], 0)   # improper (det<0) BY DESIGN = the true-hand mirror
+    pos = means @ Rv.T
+    pos[:, 0] -= pos[:, 0].mean()
+    pos[:, 2] -= pos[:, 2].mean()
+    pos[:, 1] -= f1v
+    Rq = Rv if np.linalg.det(Rv) > 0 else Rv @ np.diag([1.0, 1.0, -1.0])
+    quats = quat_mul_R(Rq, quats)        # covariance-identical det+1 rep (D commutes with S^2)
+
+    # ---- .splat write, importance-sorted ----
+    imp = opas * scales.prod(1) ** (1 / 3)
+    order = np.argsort(-imp)
+    pos, scales, quats, opas, cols = pos[order], scales[order], quats[order], opas[order], cols[order]
+    n = len(pos)
+    buf = np.zeros(n, dtype=[("p", "<f4", 3), ("s", "<f4", 3), ("c", "u1", 4), ("q", "u1", 4)])
+    buf["p"] = pos.astype(np.float32)
+    buf["s"] = scales.astype(np.float32)
+    buf["c"][:, :3] = np.clip(cols * 255, 0, 255).astype(np.uint8)
+    buf["c"][:, 3] = np.clip(opas * 255, 0, 255).astype(np.uint8)
+    qn = quats / (np.linalg.norm(quats, axis=1, keepdims=True) + 1e-12)
+    buf["q"] = np.clip(qn * 128 + 128, 0, 255).astype(np.uint8)
+    raw = buf.tobytes()
+    s3 = _r2()
+    s3.put_object(Bucket=R2_BUCKET, Key=out_key, Body=raw,
+                  ContentType="application/octet-stream")
+    print(f"wrote {out_key}: {len(raw)/1e6:.1f} MB, {n} gaussians")
+    return {"key": out_key, "n": n, "mb": round(len(raw) / 1e6, 1)}
+
+
+@app.local_entrypoint()
+def dollhouse3d(slug1: str, slug2: str, t_file: str, out_key: str):
+    """Merged true-handed web dollhouse: modal run modal_app.py::dollhouse3d
+    --slug1 x-nadir1 --slug2 x-nadir2 --t-file dollhouse_T.json --out-key tours/x/dollhouse.splat"""
+    import json as _j
+    print(export_dollhouse_splat.remote(slug1, slug2, open(t_file, encoding="utf-8").read(), out_key))
+
+
 @app.local_entrypoint()
 def splatviews(slug: str, stations_json: str, fov_deg: float = 95.0):
     """modal run modal_app.py::splatviews --slug tucson-castilla-nadir1 --stations-json '[{...}]'"""

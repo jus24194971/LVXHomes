@@ -37,6 +37,13 @@ export default async function TourPage({
   const { slug } = await params;
   const tour = await getTourLive(slug);
   if (!tour) notFound();
+  // 3D dollhouse chip appears only when the merged splat has been published.
+  const dollhouse = await fetch(
+    `https://media.lvxhomes.com/tours/${slug}/dollhouse.splat`,
+    { method: "HEAD" },
+  )
+    .then((r) => r.ok)
+    .catch(() => false);
 
   return (
     <Section dark spacing="normal" className="min-h-dvh pt-24 sm:pt-28">
@@ -65,9 +72,19 @@ export default async function TourPage({
           />
         </div>
 
-        <p className="mt-6 font-sans text-xs uppercase tracking-[0.16em] text-paper/40">
-          An LVX original — filmed by hand, flown by you
-        </p>
+        <div className="mt-6 flex flex-wrap items-center justify-between gap-4">
+          <p className="font-sans text-xs uppercase tracking-[0.16em] text-paper/40">
+            An LVX original — filmed by hand, flown by you
+          </p>
+          {dollhouse && (
+            <a
+              href={`/tours/${slug}/dollhouse`}
+              className="rounded-full border border-champagne/50 px-4 py-1.5 font-sans text-xs uppercase tracking-[0.18em] text-champagne transition-colors hover:bg-champagne/10"
+            >
+              View the 3D Dollhouse
+            </a>
+          )}
+        </div>
       </Container>
     </Section>
   );
