@@ -6492,6 +6492,203 @@ def export_dollhouse_splat(slug1: str, slug2: str, t_json: str, out_key: str,
     return {"key": out_key, "n": n, "mb": round(len(raw) / 1e6, 1)}
 
 
+@app.function(image=gsplat_image, volumes={"/scratch": vol}, secrets=[r2_secret], timeout=1800)
+def export_dollhouse_v2(slug1: str, slug2: str, t_json: str, wallmask_key: str,
+                        out_key: str, ceil_frac: float = 0.78, wall_top: float = 0.64,
+                        opa_min: float = 0.25) -> dict:
+    """Dollhouse v2 — MATTERPORT-CLEAN WALLS. Same merge as export_dollhouse_splat,
+    then: delete the blurry splat wall band (trace-mask proximity), synthesize crisp
+    pancake-gaussian wall slabs from the validated trace linework (paint color
+    sampled from the deleted splats; paper-white cut tops so the top-down reads
+    like the plansheet)."""
+    import json
+    import numpy as np
+    import torch
+    import cv2
+
+    T = json.loads(t_json)
+    R2 = np.array(T["R2"]); t2 = np.array(T["t2"]); s = float(T["scale"])
+    C1i = np.array(T["C1_sheet_to_cloud"])
+    C1 = np.linalg.inv(C1i)
+    G = T["trace_georef"]; UPP, GX0, GY0 = G["UPP"], G["X0"], G["Y0"]
+
+    def load(slug):
+        ck = torch.load(f"/scratch/{slug}/splat/ckpt.pt", map_location="cpu", weights_only=False)
+        m = ck["means"].numpy(); q = ck["quats"].numpy()
+        sc = np.exp(ck["scales"].numpy()); op = 1 / (1 + np.exp(-ck["opacities"].numpy()))
+        col = np.clip(0.2820947918 * ck["sh0"].numpy()[:, 0, :] + 0.5, 0, 1)
+        return m, q, sc, op, col
+
+    m1, q1, s1, o1, c1 = load(slug1)
+    m2, q2, s2, o2, c2 = load(slug2)
+    e11, e21, up1 = np.array(T["e1_1"]), np.array(T["e2_1"]), np.array(T["up_1"])
+    e12, e22, up2 = np.array(T["e1_2"]), np.array(T["e2_2"]), np.array(T["up_2"])
+    f1v, f2v = float(T["floor_1"]), float(T["floor_2"])
+    z2 = np.stack([m2 @ e12, m2 @ e22], 1); h2 = m2 @ up2
+    z1b = z2 @ R2.T + t2; h1b = s * (h2 - f2v) + f1v
+    m2in1 = np.outer(z1b[:, 0], e11) + np.outer(z1b[:, 1], e21) + np.outer(h1b, up1)
+    th = float(np.arctan2(R2[1, 0], R2[0, 0]))
+    Rz = np.array([[np.cos(th), -np.sin(th), 0], [np.sin(th), np.cos(th), 0], [0, 0, 1]])
+    B1 = np.stack([e11, e21, up1], 1); B2 = np.stack([e12, e22, up2], 1)
+    R3 = B1 @ Rz @ B2.T
+    if np.linalg.det(R3) < 0:
+        R3 = R3 @ np.diag([1.0, 1.0, -1.0])
+
+    def rot_to_quat(Rm):
+        w = np.sqrt(max(0.0, 1 + Rm[0, 0] + Rm[1, 1] + Rm[2, 2])) / 2
+        return np.array([w, (Rm[2, 1] - Rm[1, 2]) / (4 * w + 1e-12),
+                         (Rm[0, 2] - Rm[2, 0]) / (4 * w + 1e-12),
+                         (Rm[1, 0] - Rm[0, 1]) / (4 * w + 1e-12)])
+
+    def quat_mul(qa, qb):
+        a, b, c, d = qa
+        qw, qx, qy, qz = qb[:, 0], qb[:, 1], qb[:, 2], qb[:, 3]
+        return np.stack([a * qw - b * qx - c * qy - d * qz,
+                         a * qx + b * qw + c * qz - d * qy,
+                         a * qy - b * qz + c * qw + d * qx,
+                         a * qz + b * qy - c * qx + d * qw], 1)
+
+    q2in1 = quat_mul(rot_to_quat(R3), q2)
+    means = np.vstack([m1, m2in1]); quats = np.vstack([q1, q2in1])
+    scales = np.vstack([s1, s2 * s]); opas = np.concatenate([o1, o2]); cols = np.vstack([c1, c2])
+    src2 = np.zeros(len(means), bool); src2[len(m1):] = True
+
+    room = float(T["room_1"]); h = means @ up1
+    smax = scales.max(1); smed = np.median(scales, 1)
+    needle = (smax > 4 * smed) & (smax > 0.05 * room)
+    keep = (opas > opa_min) & ~needle & (h > f1v - 0.35 * room) & (h < f1v + ceil_frac * room)
+    means, quats, scales, opas, cols = means[keep], quats[keep], scales[keep], opas[keep], cols[keep]
+    h = h[keep]; src2 = src2[keep]
+
+    # ---- OVERLAP DEDUP (the ghost-double fix): both flights reconstructed the
+    # kitchen/great overlap; sub-foot registration residual = floating twins.
+    # Doctrine: nadir1 (laser-anchored) WINS its footprint — nadir2 gaussians are
+    # dropped wherever nadir1's trueortho actually has reconstruction.
+    s3 = _r2()
+    try:
+        s3.download_file(R2_BUCKET, f"ortho/{slug1}_trueortho_v3.png", "/tmp/n1v3.png")
+        v3img = cv2.imread("/tmp/n1v3.png")
+        v1valid = (v3img.sum(2) > 45).astype(np.uint8)
+        v1valid = cv2.erode(cv2.morphologyEx(v1valid, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8)),
+                            np.ones((9, 9), np.uint8))
+    except Exception as e:  # noqa: BLE001
+        print("dedup mask unavailable:", e); v1valid = None
+    if v1valid is not None and "met1_lo1" in T:
+        # cloud1 e-units -> nadir1 v3 px (solved no-flip convention, 100 px/unit)
+        exu = means @ e11; eyu = means @ e21
+        pxv = ((exu - T["met1_lo1"]) * 100).astype(int)
+        pyv = ((eyu - T["met1_lo2"]) * 100).astype(int)
+        okb = (pxv >= 0) & (pxv < v1valid.shape[1]) & (pyv >= 0) & (pyv < v1valid.shape[0])
+        ghost = np.zeros(len(means), bool)
+        ghost[okb] = v1valid[pyv[okb], pxv[okb]] > 0
+        ghost &= src2
+        print(f"overlap dedup: dropping {int(ghost.sum())} nadir2 ghosts inside nadir1 footprint")
+        means, quats, scales, opas, cols = (means[~ghost], quats[~ghost], scales[~ghost],
+                                            opas[~ghost], cols[~ghost])
+        h = h[~ghost]; src2 = src2[~ghost]
+
+    # ---- wall mask (trace px) + proximity of every gaussian to a wall ----
+    s3 = _r2()
+    s3.download_file(R2_BUCKET, wallmask_key, "/tmp/wm.png")
+    wm = cv2.imread("/tmp/wm.png", 0)
+    wmb = (wm > 127).astype(np.uint8)
+    near = cv2.dilate(wmb, np.ones((11, 11), np.uint8))     # ±5px ≈ ±0.32u ≈ 0.27ft
+    ze = np.stack([means @ e11, means @ e21], 1)
+    sheet = ze @ C1[:2, :2].T + C1[:2, 2]
+    px = ((sheet[:, 0] - GX0) / UPP).astype(int); py = ((sheet[:, 1] - GY0) / UPP).astype(int)
+    inb = (px >= 0) & (px < wm.shape[1]) & (py >= 0) & (py < wm.shape[0])
+    onwall = np.zeros(len(means), bool)
+    onwall[inb] = near[py[inb], px[inb]] > 0
+    kill = onwall & (h > f1v + 0.12 * room)                  # keep floors/baseboards
+    print(f"deleting {int(kill.sum())} blurry wall gaussians")
+
+    # ---- paint colors: bin the DELETED wall gaussians (they ARE the paint) ----
+    BIN = 12
+    paint = {}
+    sel = kill & (h > f1v + 0.2 * room) & (h < f1v + 0.6 * room)
+    for i in np.where(sel)[0]:
+        key = (px[i] // BIN, py[i] // BIN)
+        paint.setdefault(key, []).append(cols[i])
+    paint = {k: np.mean(v, 0) for k, v in paint.items()}
+
+    def paint_at(cx, cy):
+        k0 = (cx // BIN, cy // BIN)
+        if k0 in paint: return paint[k0]
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                k = (k0[0] + dx, k0[1] + dy)
+                if k in paint: return paint[k]
+        return np.array([0.81, 0.79, 0.75])                  # warm neutral fallback
+
+    means, quats, scales, opas, cols = means[~kill], quats[~kill], scales[~kill], opas[~kill], cols[~kill]
+
+    # ---- synthesize crisp walls from the trace linework ----
+    ys, xs = np.where(wmb > 0)
+    sub = (xs % 3 == 0) & (ys % 3 == 0)
+    xs, ys = xs[sub], ys[sub]
+    gx = cv2.Sobel(wmb.astype(np.float32), cv2.CV_32F, 1, 0, ksize=5)
+    gy = cv2.Sobel(wmb.astype(np.float32), cv2.CV_32F, 0, 1, ksize=5)
+    sm, sq, ss, so, sc_ = [], [], [], [], []
+    C1i_lin = C1i[:2, :2]
+    ppu = 1.0 / UPP
+    for x, y in zip(xs, ys):
+        sx_ = GX0 + x * UPP; sy_ = GY0 + y * UPP
+        eu = C1i_lin @ np.array([sx_, sy_]) + C1i[:2, 2]
+        # wall tangent (perpendicular to mask gradient), sheet -> cloud direction
+        tx, ty = -gy[y, x], gx[y, x]
+        n = np.hypot(tx, ty)
+        tvec = (C1i_lin @ np.array([tx / n, ty / n])) if n > 1e-3 else (C1i_lin @ np.array([1.0, 0]))
+        tvec = tvec / (np.linalg.norm(tvec) + 1e-12)
+        t3 = e11 * tvec[0] + e21 * tvec[1]
+        n3 = np.cross(up1, t3); n3 /= np.linalg.norm(n3) + 1e-12
+        Rw = np.stack([t3, up1, n3], 1)
+        if np.linalg.det(Rw) < 0: Rw = Rw @ np.diag([1.0, 1.0, -1.0])
+        qw = rot_to_quat(Rw)
+        col = paint_at(x, y)
+        base = e11 * eu[0] + e21 * eu[1]
+        for hf in np.arange(0.05, wall_top, 0.085):
+            sm.append(base + up1 * (f1v + hf * room))
+            sq.append(qw); ss.append([0.115, 0.062 * room / 4.0, 0.024]); so.append(0.95); sc_.append(col)
+        # paper-white cut top (the plan-view line)
+        sm.append(base + up1 * (f1v + wall_top * room))
+        sq.append(qw); ss.append([0.115, 0.014, 0.05]); so.append(0.99)
+        sc_.append(np.array([0.955, 0.945, 0.92]))
+    sm = np.array(sm); sq = np.array(sq); ss = np.array(ss); so = np.array(so); sc_ = np.array(sc_)
+    print(f"synthesized {len(sm)} wall gaussians from {len(xs)} trace cells")
+    means = np.vstack([means, sm]); quats = np.vstack([quats, sq])
+    scales = np.vstack([scales, ss]); opas = np.concatenate([opas, so]); cols = np.vstack([cols, sc_])
+
+    # ---- viewer frame + export (same as v1) ----
+    Rv = np.stack([-e11, up1, e21], 0)
+    pos = means @ Rv.T
+    pos[:, 0] -= pos[:, 0].mean(); pos[:, 2] -= pos[:, 2].mean(); pos[:, 1] -= f1v
+    Rq = Rv if np.linalg.det(Rv) > 0 else Rv @ np.diag([1.0, 1.0, -1.0])
+    quats = quat_mul(rot_to_quat(Rq), quats)
+    imp = opas * scales.prod(1) ** (1 / 3)
+    order = np.argsort(-imp)
+    pos, scales, quats, opas, cols = pos[order], scales[order], quats[order], opas[order], cols[order]
+    n = len(pos)
+    buf = np.zeros(n, dtype=[("p", "<f4", 3), ("s", "<f4", 3), ("c", "u1", 4), ("q", "u1", 4)])
+    buf["p"] = pos.astype(np.float32); buf["s"] = scales.astype(np.float32)
+    buf["c"][:, :3] = np.clip(cols * 255, 0, 255).astype(np.uint8)
+    buf["c"][:, 3] = np.clip(opas * 255, 0, 255).astype(np.uint8)
+    qn = quats / (np.linalg.norm(quats, axis=1, keepdims=True) + 1e-12)
+    buf["q"] = np.clip(qn * 128 + 128, 0, 255).astype(np.uint8)
+    raw = buf.tobytes()
+    s3.put_object(Bucket=R2_BUCKET, Key=out_key, Body=raw, ContentType="application/octet-stream")
+    print(f"wrote {out_key}: {len(raw)/1e6:.1f} MB, {n} gaussians")
+    return {"key": out_key, "n": n, "mb": round(len(raw) / 1e6, 1)}
+
+
+@app.local_entrypoint()
+def dollhouse3dv2(slug1: str, slug2: str, t_file: str, wallmask_key: str, out_key: str):
+    """Clean-wall dollhouse: modal run modal_app.py::dollhouse3dv2 --slug1 x-nadir1
+    --slug2 x-nadir2 --t-file dollhouse_T.json --wallmask-key tours/x/wallmask.png
+    --out-key tours/x/dollhouse.splat"""
+    print(export_dollhouse_v2.remote(slug1, slug2, open(t_file, encoding="utf-8").read(),
+                                     wallmask_key, out_key))
+
+
 @app.local_entrypoint()
 def dollhouse3d(slug1: str, slug2: str, t_file: str, out_key: str):
     """Merged true-handed web dollhouse: modal run modal_app.py::dollhouse3d
