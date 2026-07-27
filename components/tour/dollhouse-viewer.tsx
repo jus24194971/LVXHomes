@@ -49,7 +49,7 @@ export function DollhouseViewer({ splatUrl }: { splatUrl: string }) {
         // structural linework (dollhouse-walls.json rides next to the splat).
         try {
           const wallsRes = await fetch(
-            splatUrl.replace(/dollhouse\.splat.*$/, "dollhouse-walls.json"),
+            splatUrl.replace("dollhouse.splat", "dollhouse-walls.json"),
           );
           if (wallsRes.ok) {
             const walls = (await wallsRes.json()) as {
