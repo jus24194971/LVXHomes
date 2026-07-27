@@ -6622,6 +6622,21 @@ def export_dollhouse_v2(slug1: str, slug2: str, t_json: str, wallmask_key: str,
 
     means, quats, scales, opas, cols = means[~kill], quats[~kill], scales[~kill], opas[~kill], cols[~kill]
 
+    # ---- DEFOG (floater pillars): bright-window fog + dark ceiling smears are
+    # FAT (big sigma), SOFT (low opacity) and LONELY (low local density) — real
+    # surfaces are small, opaque and dense. All three are measurable. ----
+    smax2 = scales.max(1)
+    vox = np.floor(means / 0.22).astype(np.int64)
+    key = vox[:, 0] * 73856093 ^ vox[:, 1] * 19349663 ^ vox[:, 2] * 83492791
+    _, inv_idx, counts = np.unique(key, return_inverse=True, return_counts=True)
+    neigh = counts[inv_idx]
+    fog = ((opas < 0.80) & (smax2 > 0.30)) | \
+          ((opas < 0.55) & (smax2 > 0.16)) | \
+          ((neigh < 5) & (smax2 > 0.14))
+    print(f"defog: dropping {int(fog.sum())} floater gaussians")
+    means, quats, scales, opas, cols = (means[~fog], quats[~fog], scales[~fog],
+                                        opas[~fog], cols[~fog])
+
     # ---- synthesize crisp walls from the trace linework ----
     ys, xs = np.where(wmb > 0)
     sub = (xs % 2 == 0) & (ys % 2 == 0)
