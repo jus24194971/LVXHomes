@@ -1063,9 +1063,14 @@ export function TourViewer({
           : null;
         if (inVideo && dispPose) {
           const yawDeg = norm180(look.lon - FRONT_LON);
+          // Launch/egress path keys can sit off-sheet (street/driveway, e.g.
+          // Castilla t=0 at y=72 on a 62-tall sheet): pin the dot to the map
+          // edge instead of letting it vanish off the viewBox.
+          const px = Math.min(Math.max(dispPose.x, 0), sheetNow?.width ?? dispPose.x);
+          const py = Math.min(Math.max(dispPose.y, 0), sheetNow?.height ?? dispPose.y);
           ind.setAttribute(
             "transform",
-            `translate(${dispPose.x} ${dispPose.y}) rotate(${dispPose.heading + yawDeg})`,
+            `translate(${px} ${py}) rotate(${dispPose.heading + yawDeg})`,
           );
           ind.style.display = "";
         } else {
