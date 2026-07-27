@@ -10,7 +10,7 @@ import { getTourLive } from "@/lib/store";
 export const dynamic = "force-dynamic";
 
 const splatUrl = (slug: string) =>
-  `https://media.lvxhomes.com/tours/${slug}/dollhouse.splat?v=2`;
+  `https://media.lvxhomes.com/tours/${slug}/dollhouse.splat?v=3`;
 
 export async function generateMetadata({
   params,

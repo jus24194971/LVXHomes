@@ -6624,7 +6624,7 @@ def export_dollhouse_v2(slug1: str, slug2: str, t_json: str, wallmask_key: str,
 
     # ---- synthesize crisp walls from the trace linework ----
     ys, xs = np.where(wmb > 0)
-    sub = (xs % 3 == 0) & (ys % 3 == 0)
+    sub = (xs % 2 == 0) & (ys % 2 == 0)
     xs, ys = xs[sub], ys[sub]
     gx = cv2.Sobel(wmb.astype(np.float32), cv2.CV_32F, 1, 0, ksize=5)
     gy = cv2.Sobel(wmb.astype(np.float32), cv2.CV_32F, 0, 1, ksize=5)
@@ -6646,12 +6646,14 @@ def export_dollhouse_v2(slug1: str, slug2: str, t_json: str, wallmask_key: str,
         qw = rot_to_quat(Rw)
         col = paint_at(x, y)
         base = e11 * eu[0] + e21 * eu[1]
-        for hf in np.arange(0.05, wall_top, 0.085):
-            sm.append(base + up1 * (f1v + hf * room))
-            sq.append(qw); ss.append([0.115, 0.062 * room / 4.0, 0.024]); so.append(0.95); sc_.append(col)
+        # ONE full-height column gaussian per cell — banding is impossible by
+        # construction (v2's stacked pancakes rendered as sausage rows).
+        wh = wall_top * room
+        sm.append(base + up1 * (f1v + wh / 2))
+        sq.append(qw); ss.append([0.10, wh / 2.4, 0.022]); so.append(0.96); sc_.append(col)
         # paper-white cut top (the plan-view line)
         sm.append(base + up1 * (f1v + wall_top * room))
-        sq.append(qw); ss.append([0.115, 0.014, 0.05]); so.append(0.99)
+        sq.append(qw); ss.append([0.10, 0.012, 0.045]); so.append(0.99)
         sc_.append(np.array([0.955, 0.945, 0.92]))
     sm = np.array(sm); sq = np.array(sq); ss = np.array(ss); so = np.array(so); sc_ = np.array(sc_)
     print(f"synthesized {len(sm)} wall gaussians from {len(xs)} trace cells")
