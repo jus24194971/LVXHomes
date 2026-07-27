@@ -6637,8 +6637,11 @@ def export_dollhouse_v2(slug1: str, slug2: str, t_json: str, wallmask_key: str,
     means, quats, scales, opas, cols = (means[~fog], quats[~fog], scales[~fog],
                                         opas[~fog], cols[~fog])
 
-    # ---- synthesize crisp walls from the trace linework ----
-    ys, xs = np.where(wmb > 0)
+    # ---- synthesize walls from the trace linework (RETIRED for gaussians:
+    # a gaussian is soft at +/-sigma by nature — columns rendered as ghost
+    # pillars. Walls ship as MESH in the viewer instead; synth kept behind a
+    # flag for experiments only.) ----
+    ys, xs = np.where(wmb > 0) if False else (np.array([], int), np.array([], int))
     sub = (xs % 2 == 0) & (ys % 2 == 0)
     xs, ys = xs[sub], ys[sub]
     gx = cv2.Sobel(wmb.astype(np.float32), cv2.CV_32F, 1, 0, ksize=5)
@@ -6670,15 +6673,17 @@ def export_dollhouse_v2(slug1: str, slug2: str, t_json: str, wallmask_key: str,
         sm.append(base + up1 * (f1v + wall_top * room))
         sq.append(qw); ss.append([0.10, 0.012, 0.045]); so.append(0.99)
         sc_.append(np.array([0.955, 0.945, 0.92]))
-    sm = np.array(sm); sq = np.array(sq); ss = np.array(ss); so = np.array(so); sc_ = np.array(sc_)
-    print(f"synthesized {len(sm)} wall gaussians from {len(xs)} trace cells")
-    means = np.vstack([means, sm]); quats = np.vstack([quats, sq])
-    scales = np.vstack([scales, ss]); opas = np.concatenate([opas, so]); cols = np.vstack([cols, sc_])
+    if len(sm):
+        sm = np.array(sm); sq = np.array(sq); ss = np.array(ss); so = np.array(so); sc_ = np.array(sc_)
+        print(f"synthesized {len(sm)} wall gaussians from {len(xs)} trace cells")
+        means = np.vstack([means, sm]); quats = np.vstack([quats, sq])
+        scales = np.vstack([scales, ss]); opas = np.concatenate([opas, so]); cols = np.vstack([cols, sc_])
 
     # ---- viewer frame + export (same as v1) ----
     Rv = np.stack([-e11, up1, e21], 0)
     pos = means @ Rv.T
-    pos[:, 0] -= pos[:, 0].mean(); pos[:, 2] -= pos[:, 2].mean(); pos[:, 1] -= f1v
+    cx, cz = float(pos[:, 0].mean()), float(pos[:, 2].mean())
+    pos[:, 0] -= cx; pos[:, 2] -= cz; pos[:, 1] -= f1v
     Rq = Rv if np.linalg.det(Rv) > 0 else Rv @ np.diag([1.0, 1.0, -1.0])
     quats = quat_mul(rot_to_quat(Rq), quats)
     imp = opas * scales.prod(1) ** (1 / 3)
@@ -6694,7 +6699,9 @@ def export_dollhouse_v2(slug1: str, slug2: str, t_json: str, wallmask_key: str,
     raw = buf.tobytes()
     s3.put_object(Bucket=R2_BUCKET, Key=out_key, Body=raw, ContentType="application/octet-stream")
     print(f"wrote {out_key}: {len(raw)/1e6:.1f} MB, {n} gaussians")
-    return {"key": out_key, "n": n, "mb": round(len(raw) / 1e6, 1)}
+    return {"key": out_key, "n": n, "mb": round(len(raw) / 1e6, 1),
+            "center_x": cx, "center_z": cz, "wall_h": float(wall_top * room),
+            "room": room, "floor": f1v}
 
 
 @app.local_entrypoint()

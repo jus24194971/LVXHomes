@@ -20,7 +20,10 @@ export function DollhouseViewer({ splatUrl }: { splatUrl: string }) {
     if (!host) return;
     (async () => {
       try {
-        const GS = await import("@mkkellogg/gaussian-splats-3d");
+        const [GS, THREE] = await Promise.all([
+          import("@mkkellogg/gaussian-splats-3d"),
+          import("three"),
+        ]);
         if (disposed) return;
         const v = new GS.Viewer({
           rootElement: host,
@@ -40,6 +43,58 @@ export function DollhouseViewer({ splatUrl }: { splatUrl: string }) {
         if (disposed) return;
         v.start();
         setState("ready");
+
+        // MESH WALLS — gaussians are soft at ±σ by nature; walls need knife
+        // edges, so they render as real extruded geometry from the verified
+        // structural linework (dollhouse-walls.json rides next to the splat).
+        try {
+          const wallsRes = await fetch(
+            splatUrl.replace(/dollhouse\.splat.*$/, "dollhouse-walls.json"),
+          );
+          if (wallsRes.ok) {
+            const walls = (await wallsRes.json()) as {
+              wallH: number;
+              polys: { o: [number, number][]; h: [number, number][][] }[];
+            };
+            const scene = (v as unknown as { threeScene?: import("three").Scene })
+              .threeScene;
+            if (scene) {
+              scene.add(new THREE.AmbientLight(0xfff6e8, 1.1));
+              const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+              sun.position.set(30, 60, 20);
+              scene.add(sun);
+              const capMat = new THREE.MeshStandardMaterial({
+                color: 0xf2eee4,
+                roughness: 0.95,
+              });
+              const sideMat = new THREE.MeshStandardMaterial({
+                color: 0xcfc8ba,
+                roughness: 0.9,
+              });
+              const group = new THREE.Group();
+              for (const p of walls.polys) {
+                const shape = new THREE.Shape(
+                  p.o.map(([x, z]) => new THREE.Vector2(x, -z)),
+                );
+                for (const hole of p.h) {
+                  shape.holes.push(
+                    new THREE.Path(hole.map(([x, z]) => new THREE.Vector2(x, -z))),
+                  );
+                }
+                const geo = new THREE.ExtrudeGeometry(shape, {
+                  depth: walls.wallH,
+                  bevelEnabled: false,
+                });
+                const mesh = new THREE.Mesh(geo, [capMat, sideMat]);
+                mesh.rotation.x = -Math.PI / 2;
+                group.add(mesh);
+              }
+              scene.add(group);
+            }
+          }
+        } catch (we) {
+          console.warn("mesh walls unavailable", we);
+        }
       } catch (e) {
         console.error("dollhouse viewer failed", e);
         if (!disposed) setState("failed");
