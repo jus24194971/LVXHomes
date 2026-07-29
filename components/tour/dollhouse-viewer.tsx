@@ -25,6 +25,62 @@ export function DollhouseViewer({ splatUrl }: { splatUrl: string }) {
           import("three"),
         ]);
         if (disposed) return;
+
+        // STITCHED DOLLHOUSE (known-data build): if a baked GLB exists it is the
+        // primary experience — measured room shells wearing the real hero
+        // photography, floor = the plansheet. Falls back to the splat below.
+        const glbUrl = splatUrl.replace("dollhouse.splat", "dollhouse.glb");
+        const glbHead = await fetch(glbUrl, { method: "HEAD" }).catch(() => null);
+        if (glbHead?.ok) {
+          const { GLTFLoader } = await import("three/examples/jsm/loaders/GLTFLoader.js");
+          const { OrbitControls } = await import("three/examples/jsm/controls/OrbitControls.js");
+          const scene = new THREE.Scene();
+          scene.background = new THREE.Color(0x171310);
+          scene.add(new THREE.AmbientLight(0xfff6e8, 1.35));
+          const sun = new THREE.DirectionalLight(0xffffff, 0.7);
+          sun.position.set(30, 60, 20);
+          scene.add(sun);
+          const cameraG = new THREE.PerspectiveCamera(55, host.clientWidth / host.clientHeight, 0.05, 500);
+          cameraG.position.set(14, 16, 14);
+          const rendererG = new THREE.WebGLRenderer({ antialias: true });
+          rendererG.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+          rendererG.setSize(host.clientWidth, host.clientHeight);
+          host.appendChild(rendererG.domElement);
+          const controls = new OrbitControls(cameraG, rendererG.domElement);
+          controls.target.set(0, 0.6, 0);
+          controls.maxPolarAngle = Math.PI * 0.495;
+          const gltf = await new GLTFLoader().loadAsync(glbUrl);
+          gltf.scene.traverse((o) => {
+            const mesh = o as import("three").Mesh;
+            if (mesh.isMesh && mesh.material) {
+              (mesh.material as import("three").Material).side = THREE.DoubleSide;
+            }
+          });
+          scene.add(gltf.scene);
+          let raf = 0;
+          const loop = () => {
+            raf = requestAnimationFrame(loop);
+            controls.update();
+            rendererG.render(scene, cameraG);
+          };
+          loop();
+          const onResize = () => {
+            cameraG.aspect = host.clientWidth / host.clientHeight;
+            cameraG.updateProjectionMatrix();
+            rendererG.setSize(host.clientWidth, host.clientHeight);
+          };
+          window.addEventListener("resize", onResize);
+          viewer = {
+            stop: () => cancelAnimationFrame(raf),
+            dispose: () => {
+              window.removeEventListener("resize", onResize);
+              rendererG.dispose();
+              host.removeChild(rendererG.domElement);
+            },
+          };
+          setState("ready");
+          return;
+        }
         const v = new GS.Viewer({
           rootElement: host,
           cameraUp: [0, 1, 0],
