@@ -6495,7 +6495,7 @@ def export_dollhouse_splat(slug1: str, slug2: str, t_json: str, out_key: str,
 @app.function(image=gsplat_image, volumes={"/scratch": vol}, secrets=[r2_secret], timeout=1800)
 def export_dollhouse_v2(slug1: str, slug2: str, t_json: str, wallmask_key: str,
                         out_key: str, ceil_frac: float = 0.78, wall_top: float = 0.64,
-                        opa_min: float = 0.25) -> dict:
+                        opa_min: float = 0.25, wall_delete: int = 0) -> dict:
     """Dollhouse v2 — MATTERPORT-CLEAN WALLS. Same merge as export_dollhouse_splat,
     then: delete the blurry splat wall band (trace-mask proximity), synthesize crisp
     pancake-gaussian wall slabs from the validated trace linework (paint color
@@ -6599,8 +6599,8 @@ def export_dollhouse_v2(slug1: str, slug2: str, t_json: str, wallmask_key: str,
     inb = (px >= 0) & (px < wm.shape[1]) & (py >= 0) & (py < wm.shape[0])
     onwall = np.zeros(len(means), bool)
     onwall[inb] = near[py[inb], px[inb]] > 0
-    kill = onwall & (h > f1v + 0.12 * room)                  # keep floors/baseboards
-    print(f"deleting {int(kill.sum())} blurry wall gaussians")
+    kill = onwall & (h > f1v + 0.12 * room) if wall_delete else np.zeros(len(means), bool)
+    print(f"deleting {int(kill.sum())} blurry wall gaussians (wall_delete={wall_delete})")
 
     # ---- paint colors: bin the DELETED wall gaussians (they ARE the paint) ----
     BIN = 12
