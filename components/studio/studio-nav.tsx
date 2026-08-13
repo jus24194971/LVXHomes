@@ -16,6 +16,7 @@ const LINKS: { href: string; label: string; exact?: boolean }[] = [
   { href: "/studio/tours", label: "Tours" },
   { href: "/studio/plan", label: "Floorplans" },
   { href: "/studio/measure", label: "Measure" },
+  { href: "/studio/embeds", label: "Embeds" },
   { href: "/studio/pins", label: "Pins" },
   { href: "/studio/render", label: "Render" },
   { href: "/studio/lab", label: "Lab" },
