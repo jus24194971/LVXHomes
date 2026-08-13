@@ -66,6 +66,17 @@ export async function listPlanSlugs(): Promise<string[]> {
   return (res.results ?? []).map((r) => r.id);
 }
 
+/** All live tour slugs (D1 "tour" rows) — cloud-published tours (make_tour_data /
+ *  Phase-B publishes) that have no baked entry, so the Studio can list them too. */
+export async function listTourSlugs(): Promise<string[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const res = await db
+    .prepare("SELECT id FROM doc WHERE kind = 'tour' ORDER BY updated_at DESC")
+    .all<{ id: string }>();
+  return (res.results ?? []).map((r) => r.id);
+}
+
 /** Generic load used by the author API — live row or baked fallback, or null. */
 export async function getDocLive(kind: Kind, id: string): Promise<unknown> {
   if (kind === "tour") return (await getTourLive(id)) ?? null;
